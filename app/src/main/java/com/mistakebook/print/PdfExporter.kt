@@ -28,6 +28,29 @@ import java.time.format.DateTimeFormatter
 import java.util.Locale
 
 /**
+ * 含行内公式的一行，至少要多高才装得下。
+ *
+ * ## 为什么要单独抽出来
+ * 这个算式写错过一次，而且错得很隐蔽：原来按 `mathHeight * 1.25` 给行高，
+ * 那是**从行顶**量的。公式实际画在
+ * `[baseline - h*0.18, baseline + h*0.82]`，基线又在 `lineTop + ascentUp`，
+ * 所以公式底边落在 `lineTop + ascentUp + 0.82*h`——**差了一整个 ascent**。
+ * h=20pt、ascentUp=13 时只给到 25pt，公式底边却在 29.4pt，照样压下一行。
+ *
+ * 抽成顶层函数是为了能直接写单测锁住这条不变量：
+ * 返回值必须 >= 公式底边相对行顶的位置。
+ *
+ * @param ascentUp 基线以上高度，**正数**（Android 的 `fontMetrics.ascent` 是负数，要取反）
+ * @param mathHeightPt 公式位图按目标字号缩放后的高度
+ * @param padding 行内留白比例
+ */
+internal fun requiredLineHeightForMath(
+    ascentUp: Float,
+    mathHeightPt: Float,
+    padding: Float
+): Float = ascentUp + mathHeightPt * (1f - PdfExporter.MATH_BOTTOM_RATIO + padding)
+
+/**
  * A4 打印 PDF 引擎（PRD 第 8 节）：零依赖，系统 PdfDocument + StaticLayout。
  *
  * 版面常量：A4 纵向 595×842pt，页边距 42pt，可用宽 511pt；
@@ -271,8 +294,23 @@ class PdfExporter(
             isFilterBitmap = true
         }
 
-        /** 文字度量。基线位置必须由它算出，见 draw 里的注释。 */
+        /**
+         * 文字度量。
+         *
+         * ## 注意 Android 的符号约定
+         * `Paint.FontMetrics` 的文档原文是：
+         * > Remember, Y values increase going down, so those values will be positive,
+         * > and values that measure distances going up will be negative.
+         *
+         * 也就是说 **`ascent` 是负数**（基线以上为负），`descent` 才是正数。
+         * 之前这里写 `baseline = lineTop + metrics.ascent`，等于把基线放到了
+         * 行框顶边**之上** |ascent| 处，于是每一行都画在自己行框的上方、
+         * 逐行向上累积——打印出来就是**整篇文字行行重叠**。
+         *
+         * [ascentUp] 取相反数得到正的「基线以上高度」，用它定位才是对的。
+         */
         private val metrics = textPaint.fontMetrics
+        private val ascentUp = -metrics.ascent
 
         override fun draw(canvas: Canvas, top: Float, drawHeight: Float) {
             val save = canvas.save()
@@ -282,11 +320,8 @@ class PdfExporter(
                 val lineBottom = y + line.height
                 // 只画落在可见区间内的行
                 if (lineBottom > top - sliced && lineTop < top - sliced + drawHeight) {
-                    // 文字基线必须用 **TextPaint 实测的 ascent**，不能写死比例。
-                    // 写死 0.8 的话：字号 12 / 行高 1.3 时基线落在 15.6pt 处，
-                    // 而实际 ascent 约 11.3pt，公式就会明显压到下一行文字上——
-                    // 这正是打印出来「公式和文字咬在一起」的根因。
-                    val baseline = lineTop + metrics.ascent
+                    // 基线 = 行顶 + 基线以上高度（ascentUp 是正数）
+                    val baseline = lineTop + ascentUp
                     line.pieces.forEach { piece ->
                         when (piece) {
                             is MathPiece.Text ->
@@ -495,9 +530,12 @@ class PdfExporter(
         preRendered: Map<String, RenderedMath?>
     ): List<MathLine> {
         val paint = textPaintFor(sizePt, color)
+        // Android 的 ascent 是**负数**（基线以上为负），取反得到正的「基线以上高度」。
+        // 定位基线、算行高下限都要用它，写错符号会让整篇文字行行重叠。
+        val ascentUp = -paint.fontMetrics.ascent
         // 行高下限：必须容得下带分式的公式，否则分式被压扁、分数线糊成一条。
-        // sizePt * lineSpacing 是用户要的节奏，但带公式的行会自动用两者中更大的。
-        val baseLineHeight = sizePt * lineSpacing
+        // 同时不能小于文字自身的 ascent+descent——否则纯文字行自己就压线。
+        val baseLineHeight = maxOf(sizePt * lineSpacing, ascentUp + paint.fontMetrics.descent)
         val lines = mutableListOf<MathLine>()
         var pieces = mutableListOf<MathPiece>()
         var x = 0f
@@ -547,9 +585,10 @@ class PdfExporter(
                         pieces += MathPiece.Image(image, x, w, h)
                         x += w
                         lineHasContent = true
-                        // 本行要容得下这个公式：行高取「行框高」和「公式高 + 留白」中更大者。
-                        // 写死 lineSpacing 时带分式的行会被压扁，分子分母糊在一起。
-                        val needed = h + h * MATH_LINE_PADDING
+                        // 本行要容得下这个公式，而且**必须从基线往下量**。
+                        // 原来用 `h * 1.25` 是从**行顶**量的，差了一整个 ascent，
+                        // 公式照样压到下一行。见 requiredLineHeightForMath 的注释。
+                        val needed = requiredLineHeightForMath(ascentUp, h, MATH_LINE_PADDING)
                         if (needed > currentHeight) currentHeight = needed
                     }
                 }
@@ -772,7 +811,7 @@ class PdfExporter(
         )
     }
 
-    private companion object {
+    internal companion object {
         const val PAGE_WIDTH = 595
         const val PAGE_HEIGHT = 842
         const val MARGIN = 42f

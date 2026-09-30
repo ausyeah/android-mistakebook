@@ -56,7 +56,6 @@
     <string name="print_item_index">#%1$d</string>
     <string name="print_unclassified">未分类</string>
     <string name="home_subject_all">全部学科</string>
-    <string name="home_count_format">共 %1$d 题</string>
     <string name="home_deleted_toast">已删除</string>
     <string name="home_undo">撤销</string>
     <string name="home_due_badge">待复习</string>

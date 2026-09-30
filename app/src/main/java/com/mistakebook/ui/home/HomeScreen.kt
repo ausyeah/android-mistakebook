@@ -229,26 +229,10 @@ fun HomeScreen(
                 },
                 actions = {
                     // 原先这里有个红色「待复习」文字角标。它不成图标、颜色又跳，
-                    // 在两个图标按钮旁边显得很突兀（用户反馈影响美观），已删。
-                    // 待复习功能没丢：下面「掌握」筛选菜单里还有「待复习」这一项。
-                    // 这里改成中性的题数徽标——筛选时显示筛选结果数，
-                    // 不筛选时显示总数，比原来的红色角标安静且更有用。
-                    if (state.totalCount > 0) {
-                        val showFiltered = state.subjectId != null ||
-                            state.notebookId != null ||
-                            state.status != null ||
-                            state.dueOnly ||
-                            state.keyword.isNotBlank()
-                        Text(
-                            text = stringResource(
-                                R.string.home_count_format,
-                                if (showFiltered) state.filteredCount else state.totalCount
-                            ),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(end = 4.dp)
-                        )
-                    }
+                    // 顶部一律不显示任何文字标记。
+                    // 这里先后出现过两种：红色「待复习」角标、中性的「共 N 题」徽标，
+                    // 用户两次都要求删掉——搜索栏右边紧挨着图标按钮，
+                    // 塞一段文字在中间既突兀又抢注意力，题数在筛选菜单里已经能看到。
                     IconButton(onClick = onOpenPrint) {
                         Icon(Icons.Default.Print, contentDescription = stringResource(R.string.home_action_print))
                     }

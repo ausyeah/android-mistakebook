@@ -58,6 +58,13 @@
 
   function render(latex, displayMode, maxDevicePx) {
     var out = document.getElementById('out');
+    // 单条路径只抠 #out，所以必须先把 #sheet 藏起来：
+    // 两者都是 position:absolute 贴在 (0,0)，不藏会盖在 #out 上，
+    // 抠出来的是上一次批量渲染的残留而不是本次公式。
+    // （原来是在 renderBatch 结尾设 display:none，但那等于让批量路径抠到空白，
+    //   正确做法是在**每条路径的入口**各管各的。）
+    var sheet = document.getElementById('sheet');
+    sheet.style.display = 'none';
     // getBoundingClientRect() 是 CSS 像素，而 Android 的 view.draw 画的是设备像素，
     // 高分屏上差一个 devicePixelRatio。必须乘 dpr 再返回，否则抠出来的是公式的一小块。
     var dpr = window.devicePixelRatio || 1;
@@ -168,9 +175,12 @@
       h: Math.max(1, Math.ceil(h) + Math.round(14 * dpr)),
       items: out
     });
-    // 隐藏但**不销毁**：display:none 会让 getBoundingClientRect 全部归零，
-    // 而下一次 renderBatch 之前 Android 侧要按这张长卷抠图。
-    sheet.style.display = 'none';
+    // **不要在这里把 #sheet 设成 display:none。**
+    // Android 侧拿到返回值之后立刻 relayoutForBatch() + view.draw() 抠这张长卷，
+    // 而 display:none 的元素不生成盒子、什么都不画 —— 抠出来必然是空白，
+    // 再按各公式的偏移去切就全是空图（症状：公式不显示，回退成 LaTeX 源码）。
+    // 藏 #sheet 的职责交给单条 render()，它在入口处把 #sheet 藏起来，
+    // 避免它盖在 #out 上影响单条抠图。两条路径互斥，各自管各自的。
     return result;
   }
 </script>
