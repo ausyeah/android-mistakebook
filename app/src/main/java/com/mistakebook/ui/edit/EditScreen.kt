@@ -48,6 +48,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
@@ -60,6 +62,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -73,6 +76,7 @@ import com.mistakebook.di.AppContainer
 import com.mistakebook.domain.ErrorReason
 import com.mistakebook.ui.common.DifficultyPicker
 import com.mistakebook.ui.common.FullScreenImageDialog
+import kotlinx.coroutines.launch
 import com.mistakebook.ui.common.RichText
 import com.mistakebook.ui.common.SectionLabel
 import com.mistakebook.ui.common.containerViewModel
@@ -98,6 +102,14 @@ fun EditScreen(
         containerViewModel(container) { EditViewModel(it, taskId, initialIndex) }
     val state by viewModel.uiState.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+
+    // 文本体检：KaTeX 渲染失败的公式由 RichText 回传。
+    // 那是 KaTeX 自己的判定，比正则猜准得多，也不用额外渲染一遍。
+    var mathFailures by remember { mutableStateOf(emptySet<String>()) }
+    var showAuditSheet by remember { mutableStateOf(false) }
+    // 修正前的快照：没有它，启发式判错就等于逼用户手工逐字改回来。
+    var auditSnapshot by remember { mutableStateOf<EditableDraft?>(null) }
     val context = LocalContext.current
     var showRawSheet by remember { mutableStateOf(false) }
     var showFullImage by remember { mutableStateOf(false) }
@@ -157,6 +169,12 @@ fun EditScreen(
                             Text(stringResource(R.string.edit_view_raw))
                         }
                     }
+                    // 文本体检入口。放在原始文本旁边——两者都是「看一眼内容对不对」。
+                    TextButton(
+                        onClick = { showAuditSheet = true }
+                    ) {
+                        Text(stringResource(R.string.edit_audit))
+                    }
                 }
             )
         },
@@ -189,6 +207,7 @@ fun EditScreen(
             }
         },
         snackbarHost = { SnackbarHost(snackbarHostState) }
+
     ) { padding ->
         Box(modifier = Modifier.padding(padding).fillMaxSize()) {
             when {
@@ -202,6 +221,35 @@ fun EditScreen(
 
                 else -> {
                     val draft = state.current ?: return@Scaffold
+
+    // stringResource 只能在组合期调用，先取出来给协程里的 Snackbar 用
+    val undoLabel = stringResource(R.string.action_undo)
+    val currentDraft = state.current
+
+    if (showAuditSheet && currentDraft != null) {
+        val issues = runAudit(currentDraft, mathFailures)
+        AuditSheet(
+            issues = issues,
+            onDismiss = { showAuditSheet = false },
+            onApply = { toFix ->
+                auditSnapshot = currentDraft
+                viewModel.updateCurrent { draft -> applyAuditFixes(draft, toFix) }
+                showAuditSheet = false
+                scope.launch {
+                    val result = snackbarHostState.showSnackbar(
+                        message = "已还原 ${toFix.size} 处",
+                        actionLabel = undoLabel,
+                        duration = SnackbarDuration.Long
+                    )
+                    if (result == SnackbarResult.ActionPerformed) {
+                        val snap = auditSnapshot
+                        if (snap != null) viewModel.updateCurrent { snap }
+                        auditSnapshot = null
+                    }
+                }
+            }
+        )
+    }
                     val hasImage = draft.imagePath.endsWith(".jpg", true) ||
                         draft.imagePath.endsWith(".jpeg", true) ||
                         draft.imagePath.endsWith(".png", true)

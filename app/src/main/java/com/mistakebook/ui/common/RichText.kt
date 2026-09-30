@@ -32,6 +32,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -74,7 +75,17 @@ fun RichText(
     mathRenderer: MathRenderer,
     modifier: Modifier = Modifier,
     style: androidx.compose.ui.text.TextStyle = LocalTextStyle.current,
-    color: Color = MaterialTheme.colorScheme.onSurface
+    color: Color = MaterialTheme.colorScheme.onSurface,
+    /**
+     * 回调：**KaTeX 渲染失败**的公式原文集合。
+     *
+     * 渲染失败时 `mathCache` 里对应项是 `null`，等于是白捡一份权威判定——
+     * 比我们自己用正则猜「这条公式大概会失败」准得多。
+     * 文本体检（`TextAudit`）拿它来报「KaTeX 解析失败」这类问题。
+     *
+     * 默认空实现，调用方不关心就不必传。
+     */
+    onMathFailures: (Set<String>) -> Unit = {}
 ) {
     val blocks = remember(text) { MarkdownParser.parse(text) }
     val density = LocalDensity.current
@@ -104,6 +115,16 @@ fun RichText(
         }
         value = mathRenderer.renderAll(requests)
     }
+
+    // 把渲染失败的公式回传给调用方，供文本体检（TextAudit）使用。
+    // 失败时 cache 里对应项是 `null` —— 这是 **KaTeX 自己的判定**，
+    // 比用正则猜「这条公式大概会失败」准得多，也省掉一次额外渲染。
+    val mathFailures = remember(mathCache) {
+        mathCache.filterValues { it == null }.keys
+            .mapNotNull { key -> if (key.length > 2) key.substring(2) else null }
+            .toSet()
+    }
+    LaunchedEffect(mathFailures) { onMathFailures(mathFailures) }
 
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
         blocks.forEach { block ->
