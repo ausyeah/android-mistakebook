@@ -126,15 +126,38 @@ class CropRotationTest {
         }
     }
 
-    /** 负圈数与超范围圈数都要被规整到 0..3，避免出现负数分支。 */
+    /**
+     * 圈数必须规整到 0..3：`q` 与 `q + 4` 必须完全等价。
+     *
+     * 这是「连转四圈回到原样」能成立的前提。`rotationQuarter` 在按钮里
+     * 按 `+1 % 4` 自增，如果规整写错（比如负数不处理），
+     * 恢复到 0 圈那一步就会算成 -1 或 5，遮罩跟着转飞。
+     *
+     * 负数**向前**绕而不是向后：`(-1 + 4) % 4 == 3`，即「-1 圈」等于
+     * 「3 圈」。这一条最早写错过——当时断言 `-1` 圈等价于不旋转，
+     * 本地跑 Java 等价验证时又恰好没覆盖负圈数，于是本地全绿、CI 才炸。
+     */
     @Test
     fun `quartersAreNormalized`() {
-        val canonical = rotateNormalized(0.3f, 0.7f, 0)
-        for (q in listOf(-4, -1, 4, 8)) {
-            val p = rotateNormalized(0.3f, 0.7f, q)
-            assertClose(canonical.x, p.x, "圈数 $q 的 X")
-            assertClose(canonical.y, p.y, "圈数 $q 的 Y")
+        // 取点必须让四个象限两两不同，否则检查会退化成恒真：
+        // (0.3, 0.7) 在 q=0 与 q=3 下 x 恰好都是 0.3。
+        // (0.2, 0.6)：q=0->(0.2,0.6) q=1->(0.6,0.8) q=2->(0.8,0.4) q=3->(0.4,0.2)
+        val zero = rotateNormalized(0.2f, 0.6f, 0)
+        val three = rotateNormalized(0.2f, 0.6f, 3)
+        for (q in listOf(0, 4, 8, -4, -8)) {
+            val p = rotateNormalized(0.2f, 0.6f, q)
+            assertClose(zero.x, p.x, "圈数 $q 应等价于 0 圈")
+            assertClose(zero.y, p.y, "圈数 $q 应等价于 0 圈")
         }
+        for (q in listOf(3, 7, -1, -5)) {
+            val p = rotateNormalized(0.2f, 0.6f, q)
+            assertClose(three.x, p.x, "圈数 $q 应等价于 3 圈")
+            assertClose(three.y, p.y, "圈数 $q 应等价于 3 圈")
+        }
+        // 负数向前绕，不是向后：-1 圈 = 3 圈（真转了 270 度）
+        val minusOne = rotateNormalized(0.2f, 0.6f, -1)
+        assertTrue("负圈数应向前绕到 3 圈，不能退化成 0 圈", abs(minusOne.x - zero.x) > eps)
+        assertTrue("负圈数应向前绕到 3 圈，不能退化成 0 圈", abs(minusOne.y - zero.y) > eps)
     }
 
     /**
