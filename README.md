@@ -78,27 +78,31 @@
 
 ## 数据与密钥
 
-- 本机 `local.properties` 放置真实 Key（已在 `.gitignore`），模板见 `local.properties.template`
-- 仓库 Secrets 与本地 `local.properties` **分开维护**，改 Key 后两边都要更新
-- **大模型接入以设置页为准**：换成任何 OpenAI 兼容服务都只需在设置页改 Base URL / Key / 模型，
-  或切换已保存的多套配置
-- release 包解包检查：`BuildConfig.MINERU_API_KEY` 与 `LLM_API_KEY` 均为空字符串
+> **公开安装包不预置任何 API Key。** 首次启动后请在设置页自行填写。
+> 这是刻意的设计：`buildConfigField` 注入的字符串会明文落在 DEX 里，
+> 任何人下载 APK 都能提取。详见 [`docs/RELEASE.md`](docs/RELEASE.md)。
 
-```powershell
-# 更新仓库 Secret
-$env:SECRET_NAME="MINERU_API_KEY"; $env:SECRET_VALUE="新key"
-python tools\set_github_secret.py ausyeah/android-mistakebook
-```
+- **使用者**：安装后进设置页填 MinerU API Key 与大模型接入配置。
+  Key 只存本机 `EncryptedSharedPreferences`，不进日志、不随应用上传。
+- **本地开发者**：`local.properties` 放真实 Key（已在 `.gitignore`），
+  模板见 `local.properties.template`。本地构建（默认）会预填进 APK 省去手填。
+- **公开分发**：用 `-PprefillKeys=false` 构建，注入占位符而非真实 Key。
+  CI 固定使用该参数，并在上传前扫描 APK 拦截疑似密钥。
+
+**大模型接入以设置页为准**：任何 OpenAI 兼容服务都只需改 Base URL / Key / 模型，
+或切换已保存的多套配置。
 
 ## CI 打包
 
-`.github/workflows/android.yml` 推送即触发：从 GitHub Secrets 读 `MINERU_API_KEY` / `LLM_API_KEY`，
-生成 `local.properties`，编译 `assembleDebug` 并跑单元测试。APK 命名为 `mistakebook-<分支或tag>-debug.apk`：
+`.github/workflows/android.yml` 推送即触发。**不读取任何 Secrets**，
+只生成不含密钥的 `local.properties`，以 `-PprefillKeys=false` 编译 `assembleDebug`，
+跑单元测试，**再扫描 APK 内所有 dex 拦截疑似密钥**，最后产物命名为
+`mistakebook-<分支或tag>-android.apk`：
 
 - push 到 `main` → 产物在 Actions 运行页（Artifacts）下载
 - push `v*` tag → 自动创建 Release 并附带 APK
 
-Secrets 为空时打包出的 APK 不带任何 Key，首次使用在 App 设置页手填。
+发版流程与检查清单见 [`docs/RELEASE.md`](docs/RELEASE.md)。
 
 日常脚本：
 

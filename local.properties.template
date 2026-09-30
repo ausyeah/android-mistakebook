@@ -3,9 +3,10 @@
 
 sdk.dir=C\:\\Users\\<你的用户名>\\AppData\\Local\\Android\\Sdk
 
-# debug 构建预填的 Key（release 构建永远为空，使用者自行填写）
-MINERU_API_KEY=sk-你的mineru-key
+# 仅本地开发时用于预填。公开分发包（-PprefillKeys=false）会注入占位符，
+# 安装包里不含任何密钥，使用者需在 App 设置页自行填写。
+MINERU_API_KEY=sk-在MinerU开放平台申请后填入
 # 大模型接入：任何 OpenAI 兼容服务都行；只填根域名时客户端会自动补 /v1
-LLM_API_KEY=sk-你的大模型key
-LLM_BASE_URL=https://cf.a-piko.top
-LLM_MODEL=deepseek-v4.1-flash
+LLM_API_KEY=sk-在服务商后台申请后填入
+LLM_BASE_URL=https://api.deepseek.com
+LLM_MODEL=deepseek-chat
