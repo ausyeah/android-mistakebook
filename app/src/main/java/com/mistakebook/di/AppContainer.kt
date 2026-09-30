@@ -1,0 +1,180 @@
+package com.mistakebook.di
+
+import android.content.Context
+import com.mistakebook.data.AppFiles
+import com.mistakebook.data.ImageImporter
+import com.mistakebook.data.backup.BackupManager
+import com.mistakebook.data.local.MistakeBookDatabase
+import com.mistakebook.data.prefs.SettingsStore
+import com.mistakebook.data.repos.CaptureTaskRepository
+import com.mistakebook.data.repos.NotebookRepository
+import com.mistakebook.data.repos.QuestionRepository
+import com.mistakebook.data.repos.SubjectRepository
+import com.mistakebook.data.repos.TagRepository
+import com.mistakebook.net.HttpFactory
+import com.mistakebook.net.llm.LlmApi
+import com.mistakebook.net.mineru.MineruApi
+import com.mistakebook.pipeline.LlmClient
+import com.mistakebook.pipeline.MineruClient
+import com.mistakebook.pipeline.RecognitionEngine
+import com.mistakebook.pipeline.RecognitionSubmitter
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
+import okhttp3.MediaType.Companion.toMediaType
+import retrofit2.Retrofit
+import retrofit2.converter.kotlinx.serialization.asConverterFactory
+
+/**
+ * 手写依赖容器：单 Activity + Repository 架构下足够使用，避免引入 DI 框架依赖。
+ */
+class AppContainer(context: Context) {
+
+    val appContext = context.applicationContext
+
+    val appScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    val files: AppFiles = AppFiles(appContext)
+
+    val settingsStore: SettingsStore = SettingsStore(appContext)
+
+    private val httpClient = HttpFactory.createClient()
+
+    private val json = Json {
+        ignoreUnknownKeys = true
+        encodeDefaults = true
+        explicitNulls = false
+    }
+
+    private val mineruRetrofit: Retrofit = Retrofit.Builder()
+        .baseUrl(MineruApi.BASE_URL)
+        .client(httpClient)
+        .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
+        .build()
+
+    // 大模型的 Base URL 由用户在设置里配置，所有请求走 @Url，这里只需要一个合法占位地址。
+    private val llmRetrofit: Retrofit = Retrofit.Builder()
+        .baseUrl(LLM_PLACEHOLDER_BASE_URL)
+        .client(httpClient)
+        .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
+        .build()
+
+    private val mineruApi: MineruApi = mineruRetrofit.create(MineruApi::class.java)
+
+    private val llmApi: LlmApi = llmRetrofit.create(LlmApi::class.java)
+
+    val database: MistakeBookDatabase by lazy { MistakeBookDatabase.build(appContext) }
+
+    val subjectRepository: SubjectRepository by lazy {
+        SubjectRepository(database.subjectDao())
+    }
+
+    init {
+        // 预置学科（数学 / 通信原理）保证下拉框一进来就有得选
+        appScope.launch { subjectRepository.seedPresets() }
+        // 默认错题本 + 把历史题目归入其中。必须在任何写入之前跑完，
+        // 否则新题会以「未归类」入库，首页按默认本筛选时就看不到它们。
+        appScope.launch { notebookRepository.seedDefault() }
+        // 缓存增强开关，供 ImageImporter 的同步回调读取
+        appScope.launch {
+            enhancePhotosCache.set(
+                runCatching { settingsStore.snapshotNow().enhancePhotos }.getOrDefault(true)
+            )
+        }
+    }
+
+    val tagRepository: TagRepository by lazy {
+        TagRepository(database.tagDao(), database.subjectDao())
+    }
+
+    val questionRepository: QuestionRepository by lazy {
+        QuestionRepository(
+            questionDao = database.questionDao(),
+            reviewLogDao = database.reviewLogDao(),
+            subjectDao = database.subjectDao(),
+            tagRepository = tagRepository
+        )
+    }
+
+    val captureTaskRepository: CaptureTaskRepository by lazy {
+        CaptureTaskRepository(database.captureTaskDao())
+    }
+
+    val notebookRepository: NotebookRepository by lazy {
+        NotebookRepository(database.notebookDao())
+    }
+
+    val mineruClient: MineruClient by lazy { MineruClient(mineruApi, files) }
+
+    val llmClient: LlmClient by lazy { LlmClient(llmApi) }
+
+    val recognitionEngine: RecognitionEngine by lazy {
+        RecognitionEngine(
+            taskRepository = captureTaskRepository,
+            mineruClient = mineruClient,
+            llmClient = llmClient,
+            settingsStore = settingsStore
+        )
+    }
+
+    val imageImporter: ImageImporter by lazy {
+        // 增强开关每次导入时读一次当前设置，改设置后无需重启即可生效。
+        // snapshotNow() 是挂起函数，这里在 appScope 里起个协程取值。
+        ImageImporter(appContext, files) { enhancePhotosCache.get() }
+    }
+
+    /** 缓存的增强开关，供非挂起上下文（ImageImporter 的同步回调）读取。 */
+    private val enhancePhotosCache = java.util.concurrent.atomic.AtomicBoolean(true)
+
+    val recognitionSubmitter: RecognitionSubmitter by lazy {
+        RecognitionSubmitter(captureTaskRepository, recognitionEngine)
+    }
+
+    val backupManager: BackupManager by lazy { BackupManager(appContext, files) }
+
+    // LaTeX 公式渲染（WebView + KaTeX，资源在 assets/katex）
+    val mathRenderer: com.mistakebook.math.MathRenderer by lazy {
+        com.mistakebook.math.MathRenderer(appContext)
+    }
+
+    val pdfPublisher: com.mistakebook.print.PdfPublisher by lazy {
+        com.mistakebook.print.PdfPublisher(appContext, files)
+    }
+
+    /** PDF 导入的中间状态：选中的文件与刚创建的任务 id。 */
+    @Volatile
+    var pendingPdfFile: java.io.File? = null
+
+
+    @Volatile
+    var lastImportTaskIds: List<Long> = emptyList()
+
+    /**
+     * 重裁剪：编辑页点「重新裁剪」时置 true，裁剪页据此进入重裁剪模式
+     * （只回填原图路径，不创建识别任务、不需要 API Key）。
+     */
+    var recropping: Boolean by mutableStateOf(false)
+
+    /**
+     * 当前裁剪页的图片来源。相册进来的图要标成「相册导入」而不是「拍照识别」——
+     * 进度页按组浏览时，组标题是用户判断这批题从哪来的唯一线索。
+     * 提交后立即清空，避免污染下一次。
+     */
+    var cropSourceIsGallery: Boolean = false
+
+    /**
+     * 重裁剪产生的新原图路径。
+     * 必须是快照状态：普通 @Volatile 字段不会触发 Compose 重组，
+     * 编辑页读不到变化，原图看起来就没被替换。
+     */
+    var recroppedImagePath: String? by mutableStateOf(null)
+
+    private companion object {
+        const val LLM_PLACEHOLDER_BASE_URL = "https://placeholder.invalid/"
+    }
+}

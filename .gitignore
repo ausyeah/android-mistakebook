@@ -1,0 +1,26 @@
+# ===== Android / Gradle =====
+*.iml
+.gradle/
+.kotlin/
+local.properties
+.idea/
+.DS_Store
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+*.apk.idsig
+
+# ===== 密钥与签名（严禁提交） =====
+local.properties
+*.jks
+*.keystore
+keystore.properties
+signing.properties
+
+# ===== 系统/编辑器 =====
+Thumbs.db
+desktop.ini
+*.log

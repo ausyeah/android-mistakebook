@@ -1,0 +1,288 @@
+package com.mistakebook.pipeline
+
+import com.mistakebook.data.AppFiles
+import com.mistakebook.net.ApiError
+import com.mistakebook.net.ApiErrorKind
+import com.mistakebook.net.ApiResult
+import com.mistakebook.net.HttpFactory
+import com.mistakebook.net.mineru.FileUrlsData
+import com.mistakebook.net.mineru.FileUrlsItem
+import com.mistakebook.net.mineru.FileUrlsRequest
+import com.mistakebook.net.mineru.ExtractResultItem
+import com.mistakebook.net.mineru.MineruApi
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.asRequestBody
+import java.io.File
+import java.io.FileOutputStream
+import java.util.zip.ZipInputStream
+
+// 识别产物：Markdown 主结果（图片路径已改写为绝对路径）+ 附带的图片文件。
+data class MineruOutcome(
+    val batchId: String,
+    val markdown: String,
+    val imagePaths: List<String>,
+    val rawDir: File
+)
+
+/**
+ * MinerU v4 本地文件上传链路（PRD 4.1）：
+ * 申请上传地址 -> PUT 上传 -> 轮询 -> 下载 zip -> 解压 -> 图片与路径整理。
+ *
+ * 轮询策略：首延迟 2s，之后每 3s；连续 5 次 running 后按 3/5/8/10s 退避；总超时 300s。
+ */
+class MineruClient(
+    private val api: MineruApi,
+    private val files: AppFiles
+) {
+
+    suspend fun recognize(
+        taskId: Long,
+        file: File,
+        fileName: String,
+        mineruKey: String,
+        modelVersion: String,
+        language: String,
+        forceOcr: Boolean,
+        onStage: suspend (String) -> Unit
+    ): ApiResult<MineruOutcome> = withContext(Dispatchers.IO) {
+        if (mineruKey.isBlank()) {
+            return@withContext fail(ApiErrorKind.NO_KEY)
+        }
+        val auth = "Bearer $mineruKey"
+
+        onStage("上传识别请求…")
+        val batch = when (val r = requestUploadUrl(auth, fileName, modelVersion, language, forceOcr)) {
+            is ApiResult.Success -> r.data
+            is ApiResult.Failure -> return@withContext r
+        }
+        val uploadUrl = batch.file_urls.firstOrNull()
+            ?: return@withContext fail(ApiErrorKind.BAD_RESPONSE, "未获得上传地址")
+
+        // 关键：OSS 签名不允许带 Content-Type 头，带了会 SignatureDoesNotMatch(403)
+        onStage("上传文件 ${formatSize(file.length())}…")
+        val uploaded = runCatching {
+            api.uploadFile(
+                uploadUrl = uploadUrl,
+                body = file.asRequestBody()
+            )
+        }.getOrElse { return@withContext ApiResult.Failure(HttpFactory.throwableError(it)) }
+        if (!uploaded.isSuccessful) {
+            return@withContext fail(
+                HttpFactory.httpError(uploaded.code(), uploaded.errorBody()?.string().orEmpty())
+            )
+        }
+
+        pollResults(auth, batch.batch_id, fileName, taskId, onStage)
+    }
+
+    private suspend fun requestUploadUrl(
+        auth: String,
+        fileName: String,
+        modelVersion: String,
+        language: String,
+        forceOcr: Boolean
+    ): ApiResult<FileUrlsData> {
+        val response = runCatching {
+            api.fileUrlsBatch(
+                authorization = auth,
+                request = FileUrlsRequest(
+                    files = listOf(FileUrlsItem(name = fileName, is_ocr = forceOcr)),
+                    model_version = modelVersion,
+                    language = language
+                )
+            )
+        }.getOrElse { return ApiResult.Failure(HttpFactory.throwableError(it)) }
+        val body = response.body()
+        if (!response.isSuccessful || body == null) {
+            return fail(HttpFactory.httpError(response.code(), response.errorBody()?.string().orEmpty()))
+        }
+        if (!body.isOk() || body.data == null) {
+            return fail(ApiError(kind = ApiErrorKind.AUTH, serverMessage = body.msg))
+        }
+        return ApiResult.Success(body.data)
+    }
+
+    private suspend fun pollResults(
+        auth: String,
+        batchId: String,
+        fileName: String,
+        taskId: Long,
+        onStage: suspend (String) -> Unit
+    ): ApiResult<MineruOutcome> {
+        val startedAt = System.currentTimeMillis()
+        var runningCount = 0
+        var first = true
+        while (System.currentTimeMillis() - startedAt < TOTAL_TIMEOUT_MS) {
+            val waitMs = when {
+                first -> {
+                    first = false
+                    FIRST_DELAY_MS
+                }
+                runningCount >= 5 -> {
+                    val step = (runningCount - 5).coerceAtMost(BACKOFF.size - 1)
+                    BACKOFF[step]
+                }
+                else -> POLL_INTERVAL_MS
+            }
+            delay(waitMs)
+
+            val response = runCatching { api.extractResults(auth, batchId) }
+                .getOrElse { return ApiResult.Failure(HttpFactory.throwableError(it)) }
+            val body = response.body()
+            if (!response.isSuccessful || body == null) {
+                return fail(HttpFactory.httpError(response.code(), response.errorBody()?.string().orEmpty()))
+            }
+            if (!body.isOk()) {
+                // -60012 task not found 结合 ping 语义即可判断 Key 有效性，这里一律按错误处理
+                return fail(ApiError(kind = ApiErrorKind.AUTH, serverMessage = body.msg))
+            }
+            val item = matchItem(body.data?.extract_result.orEmpty(), fileName)
+                ?: return fail(ApiErrorKind.BAD_RESPONSE, "未找到本次文件的解析结果")
+
+            item.extractProgress?.let { progress ->
+                item.progressPercent()?.let { percent ->
+                    if (percent in 0..99) onStage("MinerU 解析中 ${percent}%")
+                }
+            }
+
+            when (item.state) {
+                "done" -> {
+                    val zipUrl = item.fullZipUrl
+                        ?: return fail(ApiErrorKind.BAD_RESPONSE, "解析完成但未返回结果包地址")
+                    return downloadAndExtract(zipUrl, taskId, batchId)
+                }
+                "failed" -> {
+                    return fail(ApiErrorKind.SERVER, item.errMsg.orEmpty().ifBlank { "MinerU 解析失败" })
+                }
+                else -> runningCount++
+            }
+        }
+        return fail(ApiErrorKind.TIMEOUT, "MinerU 解析超时")
+    }
+
+    private suspend fun downloadAndExtract(
+        zipUrl: String,
+        taskId: Long,
+        batchId: String
+    ): ApiResult<MineruOutcome> {
+        val response = runCatching { api.downloadZip(zipUrl) }
+            .getOrElse { return ApiResult.Failure(HttpFactory.throwableError(it)) }
+        val body = response.body()
+        if (!response.isSuccessful || body == null) {
+            return fail(HttpFactory.httpError(response.code(), response.errorBody()?.string().orEmpty()))
+        }
+        val mineruDir = files.mineruDir(taskId).apply { mkdirs() }
+        val zipFile = File(mineruDir, "result.zip")
+        body.byteStream().use { input ->
+            FileOutputStream(zipFile).use { output -> input.copyTo(output) }
+        }
+        val markdownFile = unzip(zipFile, mineruDir)
+            ?: return fail(ApiErrorKind.BAD_RESPONSE, "结果包中未找到 full.md")
+        var markdown = markdownFile.readText()
+        val imageDir = files.questionImageDir(taskId)
+        imageDir.mkdirs()
+        val referenced = collectImageRefs(markdown)
+        val absolutePaths = mutableListOf<String>()
+        referenced.forEach { ref ->
+            val source = resolveRef(mineruDir, ref) ?: return@forEach
+            val target = File(imageDir, source.name)
+            runCatching { source.copyTo(target, overwrite = true) }
+            if (target.exists()) {
+                absolutePaths.add(target.absolutePath)
+                markdown = markdown.replace(ref, target.absolutePath)
+            }
+        }
+        return ApiResult.Success(
+            MineruOutcome(
+                batchId = batchId,
+                markdown = markdown,
+                imagePaths = absolutePaths,
+                rawDir = mineruDir
+            )
+        )
+    }
+
+    private fun unzip(zipFile: File, targetDir: File): File? {
+        var markdown: File? = null
+        ZipInputStream(zipFile.inputStream().buffered()).use { zip ->
+            var entry = zip.nextEntry
+            while (entry != null) {
+                if (!entry.isDirectory) {
+                    val out = File(targetDir, entry.name)
+                    // 防 zip slip
+                    if (out.canonicalPath.startsWith(targetDir.canonicalPath)) {
+                        out.parentFile?.mkdirs()
+                        out.outputStream().use { zip.copyTo(it) }
+                        if (entry.name.substringAfterLast('/') == "full.md") markdown = out
+                    }
+                }
+                zip.closeEntry()
+                entry = zip.nextEntry
+            }
+        }
+        return markdown
+    }
+
+    private fun matchItem(items: List<ExtractResultItem>, fileName: String): ExtractResultItem? {
+        items.firstOrNull { it.fileName == fileName }?.let { return it }
+        items.firstOrNull { it.name == fileName }?.let { return it }
+        items.firstOrNull {
+            it.fileName.substringAfterLast('/') == fileName.substringAfterLast('/')
+        }?.let { return it }
+        return items.firstOrNull()
+    }
+
+    private fun collectImageRefs(markdown: String): List<String> =
+        Regex("!\\[[^\\]]*\\]\\(([^)]+)\\)").findAll(markdown)
+            .map { it.groupValues[1].trim() }
+            .filter { it.isNotBlank() && !it.startsWith("http") }
+            .distinct()
+            .toList()
+
+    private fun resolveRef(root: File, ref: String): File? {
+        val cleaned = ref.substringBefore('#').substringBefore('?')
+        val direct = File(root, cleaned)
+        if (direct.exists()) return direct
+        return root.walkTopDown().firstOrNull {
+            it.isFile && (it.name == cleaned.substringAfterLast('/') || it.path.endsWith(cleaned))
+        }
+    }
+
+    private fun fail(kind: ApiErrorKind, message: String = ""): ApiResult.Failure =
+        ApiResult.Failure(ApiError(kind = kind, serverMessage = message))
+
+    private fun fail(error: ApiError): ApiResult.Failure = ApiResult.Failure(error)
+
+    /** 设置页「测试连接」：ping 返回 -60012(task not found) 即视为 Key 有效。 */
+    suspend fun testConnection(mineruKey: String): ApiResult<Boolean> {
+        if (mineruKey.isBlank()) return fail(ApiErrorKind.NO_KEY)
+        val response = runCatching { api.extractResults("Bearer $mineruKey", "ping") }
+            .getOrElse { return ApiResult.Failure(HttpFactory.throwableError(it)) }
+        if (!response.isSuccessful) {
+            return fail(HttpFactory.httpError(response.code(), response.errorBody()?.string().orEmpty()))
+        }
+        val body = response.body() ?: return fail(ApiErrorKind.BAD_RESPONSE)
+        if (body.isOk()) return ApiResult.Success(true)
+        return if (body.code == PING_TASK_NOT_FOUND || body.msg.contains("not found", ignoreCase = true)) {
+            ApiResult.Success(true)
+        } else {
+            fail(ApiError(kind = ApiErrorKind.AUTH, serverMessage = body.msg))
+        }
+    }
+
+    private fun formatSize(bytes: Long): String =
+        if (bytes < 1024 * 1024) "${bytes / 1024} KB" else "${bytes / 1024 / 1024} MB"
+
+    companion object {
+        const val PING_TASK_NOT_FOUND = -60012
+        const val TOTAL_TIMEOUT_MS = 300_000L
+        const val FIRST_DELAY_MS = 2_000L
+        const val POLL_INTERVAL_MS = 3_000L
+        val BACKOFF = longArrayOf(3_000L, 5_000L, 8_000L, 10_000L)
+    }
+}
+
+class MineruException(message: String) : Exception(message)

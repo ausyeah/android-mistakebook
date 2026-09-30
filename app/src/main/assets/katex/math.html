@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<link rel="stylesheet" href="katex.min.css"/>
+<script src="katex.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; }
+  /*
+   * 绝对定位到页面原点：Android 侧按返回的宽高开一张位图，再 view.draw(canvas)
+   * 把 WebView 左上角那一块抠出来。必须让 #out 贴住 (0,0)，否则量到的尺寸和位图对不上。
+   */
+  #out {
+    position: absolute;
+    top: 0;
+    left: 0;
+    font-size: 32px;
+    color: #1B1F26;
+    white-space: nowrap;
+    /*
+     * 右边/下边留一点余量：getBoundingClientRect() 返回的是排版盒，
+     * 而斜体修正、分式横线等的实际墨水会略微溢出盒外，不留边就会把最右侧切掉一点。
+     * 只加右/下 padding，内容仍然贴住 (0,0)，Android 侧按 (0,0) 起抠图才对得���。
+     */
+    padding-right: 10px;
+    padding-bottom: 6px;
+  }
+
+  /*
+   * 批量长卷：每行一个公式，行间留白是刻意加的——
+   * 相邻两行的墨水溢出（分式下标、根号的钩）不能碰到下一行。
+   * 切图时按 rect 取，行间白边不会混进位图。
+   */
+  #sheet {
+    position: absolute;
+    top: 0;
+    left: 0;
+    display: none;
+    font-size: 32px;
+    color: #1B1F26;
+  }
+  #sheet .cell {
+    padding: 12px 10px 14px 0;
+    /* 不换行：行盒高度完全由本行公式决定，量到的 rect 就是它的实际墨水范围 */
+    white-space: nowrap;
+  }
+  #sheet .body {
+    display: inline-block;
+  }
+</style>
+</head>
+<body>
+<div id="out"></div>
+<div id="sheet"></div>
+<script>
+  var BASE_PX = 32;
+
+  function render(latex, displayMode, maxDevicePx) {
+    var out = document.getElementById('out');
+    // getBoundingClientRect() 是 CSS 像素，而 Android 的 view.draw 画的是设备像素，
+    // 高分屏上差一个 devicePixelRatio。必须乘 dpr 再返回，否则抠出来的是公式的一小块。
+    var dpr = window.devicePixelRatio || 1;
+    // 同时受两个上限约束：WebView 视口宽度、以及 Android 侧位图边长上限。
+    // 必须在**渲染阶段**把字号缩到位；等抓到图再裁会把公式右边切掉一半。
+    var limit = Math.min((window.innerWidth || 700), (maxDevicePx || 2048) / dpr);
+    var maxW = Math.max(120, limit - 8);
+
+    out.style.fontSize = BASE_PX + 'px';
+    out.innerHTML = '';
+    try {
+      katex.render(latex, out, {
+        displayMode: displayMode,
+        throwOnError: false,
+        strict: false,
+        output: 'html'
+      });
+    } catch (e) {
+      out.textContent = latex;
+    }
+
+    var rect = out.getBoundingClientRect();
+    // 超宽公式整体缩字号，保证完整落在上限内
+    if (rect.width > maxW) {
+      out.style.fontSize = Math.max(8, Math.floor(BASE_PX * maxW / rect.width)) + 'px';
+      rect = out.getBoundingClientRect();
+    }
+
+    // fs 是本张位图实际用的字号（设备像素）。Android 侧按「目标字号 / fs」等比缩放，
+    // 这样公式之间的相对大小才会一致；只按包围盒高度缩放会把单个字母撑得巨大。
+    return JSON.stringify({
+      w: Math.round(rect.width * dpr),
+      h: Math.round(rect.height * dpr),
+      fs: Math.round(parseFloat(out.style.fontSize) * dpr)
+    });
+  }
+
+  /**
+   * 批量渲染：把多个公式**纵向排进同一条长卷**，一次光栅化后由 Android 侧按偏移切图。
+   *
+   * 单条路径每渲染一个公式要等 2 帧、draw 两次、开一张全尺寸位图。
+   * 10 个公式就是 20 次 Choreographer 帧等待 + 10 次全量 draw —— 这就是「打开详情页很卡」的来源。
+   * 批量把帧等待从 O(N) 降到 O(1)，是唯一量级上的改进。
+   *
+   * 每个公式包在自己的容器里，容器是 inline-block 且不换行，
+   * 因此行盒高度由每个公式自己的高度决定，互不干扰。
+   */
+  function renderBatch(items, maxDevicePx) {
+    var dpr = window.devicePixelRatio || 1;
+    var limit = Math.min((window.innerWidth || 700), (maxDevicePx || 2048) / dpr);
+    var maxW = Math.max(120, limit - 8);
+
+    var sheet = document.getElementById('sheet');
+    sheet.innerHTML = '';
+    sheet.style.display = 'block';
+
+    // 排 + 量。偏移和尺寸都从 holder 自己的 rect 取，不受相邻行影响。
+    var out = [];
+    for (var i = 0; i < items.length; i++) {
+      var cell = document.createElement('div');
+      cell.className = 'cell';
+      var holder = document.createElement('div');
+      holder.className = 'body';
+      cell.appendChild(holder);
+      sheet.appendChild(cell);
+
+      var fontSize = BASE_PX;
+      try {
+        katex.render(items[i].t, holder, {
+          displayMode: !!items[i].d,
+          throwOnError: false,
+          strict: false,
+          output: 'html'
+        });
+      } catch (e) {
+        holder.textContent = items[i].t;
+      }
+
+      // 超宽公式在**渲染阶段**缩字号，保证完整落在上限内。
+      // 事后裁剪会把公式右边切掉一半。
+      var rect = holder.getBoundingClientRect();
+      if (rect.width > maxW) {
+        fontSize = Math.max(8, Math.floor(BASE_PX * maxW / rect.width));
+        holder.style.fontSize = fontSize + 'px';
+        rect = holder.getBoundingClientRect();
+      }
+
+      out.push({
+        k: items[i].k,
+        x: Math.round(rect.left * dpr),
+        y: Math.round(rect.top * dpr),
+        w: Math.round(rect.width * dpr),
+        h: Math.round(rect.height * dpr),
+        fs: Math.round(fontSize * dpr)
+      });
+    }
+
+    // Android 侧会按这个高度重新撑大视口再抠图，
+    // 所以这里返回的是**内容**高度，不是当前视口高度。
+    var h = 0;
+    for (var j = 0; j < out.length; j++) {
+      var bottom = out[j].y + out[j].h;
+      if (bottom > h) h = bottom;
+    }
+    // 多留一点行间距余量：最后一个公式的下伸部（分母、根号钩）会略微溢出 rect
+    var result = JSON.stringify({
+      w: Math.max(1, Math.ceil(limit * dpr)),
+      h: Math.max(1, Math.ceil(h) + Math.round(14 * dpr)),
+      items: out
+    });
+    // 隐藏但**不销毁**：display:none 会让 getBoundingClientRect 全部归零，
+    // 而下一次 renderBatch 之前 Android 侧要按这张长卷抠图。
+    sheet.style.display = 'none';
+    return result;
+  }
+</script>
+</body>
+</html>
