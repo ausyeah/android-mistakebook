@@ -38,13 +38,14 @@
 
 | | |
 |---|---|
-| **三种录入入口** | 拍照（3×3 网格取景 + 自研裁剪页）/ 相册批量（一次最多 20 张）/ PDF（文本 PDF 直接抽文字，图片 PDF 逐页走 MinerU，可指定页码范围） |
-| **噪声排除** | 裁剪页拖手柄框住题目，框外压暗；识别完成后，Markdown 里的 `![]()` 插图引用做成可删 chip，一键剔除并回写 |
+| **三种录入入口** | 拍照（3×3 网格取景 + 自研裁剪页）/ 相册选图（单选，每张都走完整裁剪流程）/ PDF（文本 PDF 直接抽文字，图片 PDF 逐页走 MinerU，可指定页码范围如 `1-5,8,11-12`） |
+| **噪声排除** | 裁剪页拖手柄框住题目，框外压暗；还能**涂鸦遮蔽**把红笔批注、旁边的题直接涂白——用不透明纯白而非半透明，半透明会被 OCR 当成淡淡的字照样识别 |
 | **进度可见** | 上传 → MinerU 解析 → AI 整理，阶段来自数据库；失败可重试，或「跳过 AI 直接用原始文本」 |
 | **一题多识别** | 一次识别可能整理出多道题，编辑页顶部左右箭头翻页；带原始识别文本对照 |
-| **复习打卡** | 详情页复习打卡（会 / 模糊 / 不会）、标记已掌握；艾宾浩斯 1/2/4/7/15 天五轮提醒，`WorkManager` 每日推送 |
+| **掌握状态** | 详情页一键切换「已掌握」，难度点星直接改。状态筛选收敛为未掌握 / 已掌握两档 |
+| **错题本分类** | 错题本与学科**正交**——同一道题只有一个学科，但可归入多个错题本；支持新建、重命名、删除、归档 |
 | **筛选与撤销** | 列表筛选、搜索，左滑删除可撤销 |
-| **打印** | 勾选题目后可选「含原图 / 显示答案解析 / 留白重做」，生成 A4 PDF 到 `Download/错题本/`，可分享或打开 |
+| **打印** | 勾选题目后可选「含原图 / 显示答案解析 / 留白重做」，生成 A4 PDF 到 `Download/错题本/`，可分享或打开。**默认不带原图**——打印错题本是给手写重做用的，贴照片反而挤掉作答空间 |
 | **备份恢复** | zip = 数据库 + 全部文件，覆盖式恢复 |
 
 ## 技术栈与工程规模
@@ -111,8 +112,10 @@
 powershell -ExecutionPolicy Bypass -File scripts\sync.ps1 -Message "feat: 首页列表"
 
 # 出手机测试包：打 tag → CI 编译 → 自动挂 Release → 脚本轮询直到可下载
-powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -Tag "v0.1.0"
+powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -Tag "v0.0.1"
 ```
+
+发版流程、版本号规则与**公开前的检查清单**见 **[docs/RELEASE.md](docs/RELEASE.md)**。
 
 ## 工程记录
 
@@ -133,3 +136,10 @@ CSS 像素与设备像素差 3 倍、PowerShell 5.1 对无 BOM `.ps1` 按 GBK �
 > 工程路径含中文时 AGP 会拒绝，`gradle.properties` 里已加 `android.overridePathCheck=true` 绕过。
 > 本机跑单测会 `ClassNotFoundException`（Gradle test worker 从非 ASCII 路径加载测试类失败），
 > 与代码无关；CI 侧是 ASCII 路径故为绿。
+
+## 许可证
+
+本项目代码以 **[MIT](LICENSE)** 授权。
+
+随包分发的第三方组件（KaTeX 及其字体，MIT）另见
+**[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)**。

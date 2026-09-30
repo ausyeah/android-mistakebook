@@ -403,8 +403,6 @@ fun HomeScreen(
     }
 }
 
-private const val GALLERY_MAX_PICK = 20
-
 private fun isDue(question: Question): Boolean {
     val next = question.nextReviewAt ?: return false
     return question.status != com.mistakebook.domain.MasteryStatus.MASTERED &&

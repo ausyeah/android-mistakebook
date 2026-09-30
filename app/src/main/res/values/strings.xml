@@ -153,11 +153,6 @@
     <string name="detail_mark_mastered">标记已掌握</string>
     <string name="detail_mastered_hint">已掌握 🎉</string>
     <string name="detail_add_to_print">加入打印清单</string>
-    <string name="detail_review_section">复习打卡</string>
-    <string name="detail_review_correct">会</string>
-    <string name="detail_review_vague">模糊</string>
-    <string name="detail_review_wrong">不会</string>
-    <string name="detail_review_recorded">已记录本次复习</string>
     <string name="detail_review_history">复习记录</string>
     <string name="detail_review_empty">还没有复习记录</string>
     <string name="detail_review_stage_format">第 %1$d 轮</string>

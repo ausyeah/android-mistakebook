@@ -87,9 +87,9 @@ app/src/main/java/com/mistakebook/
 | 字段 | 存储 | 默认值 | 说明 |
 |---|---|---|---|
 | MinerU API Key | EncryptedSharedPreferences | 空（debug 从 local.properties 预填） | 密码式输入，可切显隐 |
-| 大模型 Base URL | DataStore | `https://token.sensenova.cn/v1` | 任何 OpenAI 兼容服务可用 |
+| 大模型 Base URL | DataStore | `https://api.deepseek.com` | 任何 OpenAI 兼容服务可用 |
 | 大模型 API Key | EncryptedSharedPreferences | 空（同上） | 密码式输入 |
-| 模型名称 | DataStore | `deepseek-v4-flash` | 可改为 `glm-5.2` / `kimi-k3` / `deepseek-v4-pro` 等 |
+| 模型名称 | DataStore | `deepseek-chat` | 点「获取模型列表」可从服务端自动选 |
 | MinerU 模型版本 | DataStore | `vlm` | 备选 `pipeline` |
 | 识别语言 | DataStore | `ch` | |
 | 强制 OCR | DataStore | `true` | 拍照场景确保走 OCR |
@@ -128,16 +128,16 @@ android {
             buildConfigField("String", "LLM_API_KEY",
                 "\"${localProperty("LLM_API_KEY")}\"")
             buildConfigField("String", "LLM_BASE_URL",
-                "\"${localProperty("LLM_BASE_URL", "https://token.sensenova.cn/v1")}\"")
+                "\"${localProperty("LLM_BASE_URL", "https://api.deepseek.com")}\"")
             buildConfigField("String", "LLM_MODEL",
-                "\"${localProperty("LLM_MODEL", "deepseek-v4-flash")}\"")
+                "\"${localProperty("LLM_MODEL", "deepseek-chat")}\"")
         }
         release {
             // 正式打包的 APK 一律为空，使用者必须自行填写，即使 local.properties 有值也不注入
             buildConfigField("String", "MINERU_API_KEY", "\"\"")
             buildConfigField("String", "LLM_API_KEY", "\"\"")
-            buildConfigField("String", "LLM_BASE_URL", "\"https://token.sensenova.cn/v1\"")
-            buildConfigField("String", "LLM_MODEL", "\"deepseek-v4-flash\"")
+            buildConfigField("String", "LLM_BASE_URL", "\"https://api.deepseek.com\"")
+            buildConfigField("String", "LLM_MODEL", "\"deepseek-chat\"")
         }
     }
 }

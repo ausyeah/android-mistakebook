@@ -23,8 +23,8 @@
 ## 2026-09-29 功能侧（用户新需求）
 
 - **大模型接入支持多套配置**：设置页可保存多套「名称 + Base URL + Key + 模型」并在列表里单选切换；整套 JSON 存 `EncryptedSharedPreferences`，活跃配置 id 存 DataStore。PRD 只有单套配置，用户要求「方便修改和切换」。
-- **改用第三方中转大模型**：`https://cf.a-piko.top`，模型 `deepseek-v4.1-flash`。实测该端点 `GET /v1/models` 与带 `image_url` data URL 的 chat/completions 均返回 200，因此新增「识别时附带原图」开关（默认开）：长边压到 1280px、JPEG q80、base64 内联；仅支持文本的服务可在设置页关掉。
-- **Base URL 容错**：只填根域名（如 `https://cf.a-piko.top`）保存时自动补 `/v1`；已带路径的保持原样。提示词在多题/带图模式下只在 PRD 原文末尾追加说明，原文本体一字未改。
+- **改用第三方中转大模型**（端点已随仓库公开，此处不记录具体域名）：实测该端点 `GET /v1/models` 与带 `image_url` data URL 的 chat/completions 均返回 200，因此新增「识别时附带原图」开关（默认开）：长边压到 1280px、JPEG q80、base64 内联；仅支持文本的服务可在设置页关掉。
+- **Base URL 容错**：只填根域名（如 `https://api.example.com`）保存时自动补 `/v1`；已带路径的保持原样。提示词在多题/带图模式下只在 PRD 原文末尾追加说明，原文本体一字未改。
 - **批量导入**：相册多选（一次最多 20 张）与 PDF 多页都按「导入组」提交，`capture_tasks` 增加 `groupId` / `orderInGroup` / `groupSize` / `groupTitle` / `sourceType` / `questionIdsJson` / `errorKind`（v1 schema 尚未发布，加字段无迁移成本）。引擎按组顺序单线程执行，进度页显示「第 n / m 张」。
 - **一次识别可产出多道题**：LLM 在多题模式下输出 `{"items":[...]}`，`JsonExtractor` 同时兼容单对象与 items 数组；`refinedJson` 存 `DraftBundle`（含多题与降级标记）。编辑页顶部翻页逐题保存，保存 N 题后任务置 DONE，`capture_tasks.questionId` 记首题 id。
 - **PDF 入口（用户新需求）**：先判断是否为文本 PDF——自写零依赖抽取器（对象表解析 + FlateDecode + ToUnicode CMap + Tj/TJ 文本算子）；可抽出文字的页直接送大模型（跳过 MinerU），纯图片 PDF 用系统 `PdfRenderer` 按 150 DPI 逐页栅格化后走 MinerU。可指定页码范围，超过 60 页提示分段。
@@ -52,7 +52,7 @@
 - **`pageLoaded.await()` 必须加超时**：原先直接在 `mutex.withLock()` 内 await，WebView 加载不起来时会永久持有 Mutex，之后**所有**公式渲染一起卡死。改用 `withTimeoutOrNull(8s)`，并把 deferred 改为 var，每次重建 WebView 重新赋值。
 - **渲染结果要做空白检测**：抓到的位图若全透明就返回 null，宁可回退成 LaTeX 源码也不给用户一片空白。
 - **`evaluateJavascript` 的返回值可能多一层 JSON 编码**：脚本返回字符串时回调收到的是 JSON 字符串字面量（形如 `"{\"w\":1}"`），`parseSize` 先尝试剥外层引号再按对象解析，两种形态都兼容。
-- **本机本地跑单测会 `ClassNotFoundException`**：仓库位于 `E:\错题本`，Gradle test worker 从非 ASCII 路径加载测试类失败。已确认与代码无关（干净树同样失败），CI 为 ASCII 路径故为绿。本机 SDK 在 `C:\Users\26315\android-sdk`，`local.properties` 的 `sdk.dir` 原先指向不存在的 `AppData\Local\Android\Sdk`，已修正（该文件已 gitignore）。
+- **仓库路径含非 ASCII 字符时，本地跑单测会 `ClassNotFoundException`**：Gradle test worker 从非 ASCII 路径加载测试类失败。已确认与代码无关（干净树同样失败），CI 为 ASCII 路径故为绿。**复现条件：仓库 clone 到含中文/非 ASCII 字符的目录。** 纯逻辑改动可用「把公式改写成等价实现再跑」的方式在本地验证。
 ## 2026-09-29 Key 门禁误报 / 公式仍空白 / 相册多余页 / 打印默认值不同步
 
 - **Key 门禁对话框必须说真话**：ApiKeyRequiredDialog 原先写死显示「MinerU API Key」，而实际触发条件是 `!mineruConfigured || !llmConfigured`。用户反复去检查一个早就填好的 MinerU Key。改为按实际缺失项分别列出。

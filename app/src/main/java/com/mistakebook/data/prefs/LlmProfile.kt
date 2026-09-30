@@ -22,7 +22,7 @@ data class LlmProfile(
         baseUrl.isNotBlank() && apiKey.isNotBlank() && model.isNotBlank()
 
     /**
-     * 保存前规范化：只填了根域名（如 https://cf.a-piko.top）时自动补 /v1，
+     * 保存前规范化：只填了根域名（如 https://api.example.com）时自动补 /v1，
      * 已经带路径的（如 https://host/api）保持原样。
      */
     fun normalized(): LlmProfile {
