@@ -56,6 +56,35 @@
 <script>
   var BASE_PX = 32;
 
+  /**
+   * KaTeX 在 throwOnError:false 时**不抛异常**，而是把无法解析的部分渲染成
+   * **红色**的源码（外层 .katex-error，title 里是错误信息）。
+   * 用户看到的「一坨红色的字」不是排版效果，是失败现场。
+   *
+   * 主动检出并回传失败标记，Android 侧就能回退成显示源码，而不是给用户看红色垃圾。
+   */
+  function hasRenderError(node) {
+    if (!node) return false;
+    if (node.classList && node.classList.contains('katex-error')) return true;
+    for (var i = 0; i < node.childNodes.length; i++) {
+      var child = node.childNodes[i];
+      if (child.nodeType === 1 && hasRenderError(child)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * 渲染前先做一次「损坏自检」。
+   *
+   * KaTeX 不会因为 `x<TAB>o0` 报错——那是个完全合法的数学式，
+   * 只是排出来是错的。所以光靠 .katex-error 检测**抓不到 JSON 转义吃掉的命令**，
+   * 必须单独扫一遍控制字符。命中就说明公式已被破坏，直接判失败。
+   */
+  function looksCorrupted(latex) {
+    // LaTeX 数学里不可能出现这些裸控制字符；出现即说明反斜杠被 JSON 转义吃掉了
+    return /[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(latex) || /\t[a-zA-Z]/.test(latex);
+  }
+
   function render(latex, displayMode, maxDevicePx) {
     var out = document.getElementById('out');
     // 单条路径只抠 #out，所以必须先把 #sheet 藏起来：
@@ -95,10 +124,14 @@
 
     // fs 是本张位图实际用的字号（设备像素）。Android 侧按「目标字号 / fs」等比缩放，
     // 这样公式之间的相对大小才会一致；只按包围盒高度缩放会把单个字母撑得巨大。
+    // err: 1 = 已被 JSON 转义破坏 / 2 = KaTeX 解析失败（红色错误）。
+    // Android 侧据此回退成显示源码，而不是给用户看红色的乱码。
+    var err = looksCorrupted(latex) ? 1 : (hasRenderError(out) ? 2 : 0);
     return JSON.stringify({
       w: Math.round(rect.width * dpr),
       h: Math.round(rect.height * dpr),
-      fs: Math.round(parseFloat(out.style.fontSize) * dpr)
+      fs: Math.round(parseFloat(out.style.fontSize) * dpr),
+      err: err
     });
   }
 
@@ -158,7 +191,10 @@
         y: Math.round(rect.top * dpr),
         w: Math.round(rect.width * dpr),
         h: Math.round(rect.height * dpr),
-        fs: Math.round(fontSize * dpr)
+        fs: Math.round(fontSize * dpr),
+        // 与单条路径同一套判定；PDF 导出走的是批量路径，
+        // 漏了这里就会把红色错误原样印到纸上
+        err: looksCorrupted(items[i].t) ? 1 : (hasRenderError(holder) ? 2 : 0)
       });
     }
 

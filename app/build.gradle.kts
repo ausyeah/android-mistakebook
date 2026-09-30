@@ -84,12 +84,12 @@ android {
         // versionCode 必须单调递增，否则手机上已装的同 versionCode 包
         // 无法被覆盖安装（安装器报「已安装相同版本」），用户就永远拿不到修复版。
         // 2 = 首个可用的 v0.0.1（设置页无法输入密钥那版不可用，重新发布时占用 2）
-        // 3 = v0.0.2   4 = v0.0.3
-        versionCode = 4
+        // 3 = v0.0.2   4 = v0.0.3   5 = v0.0.4（LaTeX 修复）
+        versionCode = 5
         // 版本号从 v0.0.1 重新开始。
         // 之前 v0.1.0~v0.1.17 的公开 Release 里带着真实的 API Key（明文躺在 DEX 中），
         // 那批产物与 tag 已全部删除，这个编号视为作废、不再复用。
-        versionName = "0.0.3"
+        versionName = "0.0.4"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -131,6 +131,17 @@ android {
             // 用上面那个固定密钥签名；没配置 keystore.properties 时保持未签名，
             // 这样 clone 仓库的人不会因为拿不到密钥而构建失败。
             signingConfigs.findByName("release")?.let { signingConfig = it }
+
+            // **仅用于本地排障**：`-PenforceDebuggable=true` 会让 release 包
+            // 也带上 android:debuggable，从而能用 `run-as` 读数据库、
+            // 把设备上的真实数据拉下来比对。
+            //
+            // 之所以做成开关而不是直接改：debuggable 的包能被任意工具附加调试，
+            // 一旦手滑流进正式发布就是安全事故。默认永远是关的，
+            // CI 也不传这个参数（scripts/CI 里可 grep 确认）。
+            if ((project.findProperty("enforceDebuggable") as String?) == "true") {
+                isDebuggable = true
+            }
 
             // 正式打包的 APK 一律不含密钥，使用者必须自行填写，
             // 即使 local.properties 有值也不注入。

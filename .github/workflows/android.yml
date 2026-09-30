@@ -117,6 +117,15 @@ jobs:
             echo "::error::APK 未报出签名者，拒绝上传"
             exit 1
           }
+          # 闸门 1b：**发布包绝不能是 debuggable 的。**
+          # `enforceDebuggable` 是本地排障用的开关（用来 run-as 读数据库），
+          # 一旦被人顺手带进发版流程，任何人都能附加调试并读取用户数据。
+          # 这是安全项，所以在这里硬拦，而不是靠"记得别加"。
+          if "$BT/aapt2" dump badging "$APK" | grep -q "application-debuggable"; then
+            echo "::error::发布包带上了 android:debuggable，拒绝上传"
+            echo "::error::本地排障开关 enforceDebuggable 绝不能进入发版流程"
+            exit 1
+          fi
           echo "签名校验通过"
           grep -E "certificate SHA-256" /tmp/sig.txt || true
 

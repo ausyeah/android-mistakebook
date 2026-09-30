@@ -652,3 +652,164 @@ CI 用 ASCII 路径，会正常执行，由 CI 验证。
 绕行：把纯逻辑代码改写成**等价的 Java**，用 `javac` + `java` 在
 ASCII 临时目录里跑。这样能在提交前验证算法行为，不依赖 Android 工程。
 Android 相关的部分仍由 CI 验证。
+---
+
+## 2026-09-30 LaTeX 渲染修复（v0.0.4）
+
+### 公式变成「一坨狗屎」的真凶
+
+用户报详情页公式渲染成 `x∈0`、`ight]`。**我最初的诊断是错的**，两次都错：
+
+**第一次猜「JSON 转义吃掉了反斜杠」。** 方向对了一半：模型在 JSON 字符串里写
+LaTeX，`\t` `\r` `\n` `\b` `\f` 恰好都是**合法 JSON 转义**，
+解析器会把它们变成控制字符。这是个真实且隐蔽的问题（业界几乎所有方案都用
+`\\(?![/"\\/bfnrtu])` 这个正则，**按构造就修不了它**——`\t` 本身合法）。
+
+**第二次才找到真凶：v0.0.3 的 `JsonExtractor.normalizeBreaks()`。**
+它无条件把字面 `\t` 变制表符、把 `\r` 整段删除：
+
+```kotlin
+'t' -> { out.append('\t'); i += 2 }   // 毁掉 \to \text \theta \times
+'r' -> { i += 2 }                     // 毁掉 \right \rho \rangle
+```
+
+讽刺的是，该函数自己的 KDoc 就写着「那会把 LaTeX 里的 `\nabla`、`\neq`
+之类命令毁掉」——**然后代码正是这么干的**。
+
+### 教训 1：注释里写了风险，不等于代码避开了风险
+
+`normalizeBreaks` 的注释明确警告过这个坑，代码却原样实现了它。
+**注释不是证据，测试才是。** 这个坑存在了多个版本而没被发现，
+正因为「看着有注释说明」就默认它处理过了。
+
+### 教训 2：拿到设备上的真实数据，而不是继续推理
+
+我读代码改了 `normalizeBreaks` 后，在真机上 `\to` 修好了、`\right` 没修好。
+于是做了件本该一开始就做的事：**把 release 包临时标记为 debuggable，
+用 `run-as` 把数据库拉下来看**。
+
+真实数据（控制字符可见化后）：
+
+```
+stem: 求极限 $\lim_{x<TAB>o 0}\left[\frac{\ln(1 + x)}{x}ight]^{\frac{1}{e^x - 1}}.$
+```
+
+`\right` 的反斜杠**和字母 r 一起消失了**，不是变成控制字符。
+信息已经不可逆丢失，靠通用规则救不回来。
+
+而 `capture_tasks.refinedJson` 里模型输出是**正确的双反斜杠**：
+`"则 $R \\to 0^{+}$ 时"`。说明损坏 100% 出在 `normalizeBreaks`，与模型无关。
+
+**如果一开始就把数据库拉下来看，能省掉两轮错误诊断。**
+
+### 修复分三层，各管一段
+
+1. **解析前保护**（`LatexEscapes.protectLatexEscapes`）
+   只在 JSON 字符串字面量内部，把「后接已知 LaTeX 命令名」的单反斜杠补成双反斜杠。
+   信息完整保留，JSON 解析后正好还原。模型正确双写的不受影响。
+
+2. **解析后兜底**（`restoreLatexControlChars`）
+   控制字符后面紧跟 ASCII 字母时还原成命令——`\to` 吃掉反斜杠后 `o` 还在。
+   换行 LF **不还原**：与公式里的真实换行无法区分，猜错会把好公式改坏。
+
+3. **孤儿定界符还原**（`restoreOrphanedRight`）
+   `\right` 被删干净后只剩 `ight`，靠上下文还原：`ight` 不是合法 LaTeX，
+   紧跟定界符且前面不是字母时补回 `\right`。同类残留（`imes`→`\times` 等）
+   **有意不救**——判据不可靠，宁可漏修也不改坏好公式。
+
+第 3 层只救 `ight`，是为了救回**已经损坏的历史数据**；
+真正的修复在第 1 层和不再破坏的 `normalizeBreaks`。
+
+### 教训 3：我的修复里有两个「静默失效」，都是测试逮到的
+
+- `mathOnly=true` 让 `restoreLatexControlChars` 只在 `$...$` 里生效，
+  但 `RichText` 传给 `MathRenderer` 的是**剥掉 `$` 之后的公式内部内容**，
+  `inMath` 永远是 false —— 修复一次都不触发，**且不报错**。
+- `$$...$$` 显示公式下 `$` 开关两次，中间被判成「正文」——同样静默失效。
+
+两者都是**写了、编译过、单测全绿，但在真实链路上是死的**。
+只有把「真实数据 → 真实管线」的完整路径写成测试才暴露出来
+（`FullRenderPipelineTest`）。
+
+### 教训 4：顺序不能反，而且「修复生效」≠「能正常渲染`
+
+先 `clean` 后修复时：`LatexSanitizer.balanceDelimiters` 面对的还是 `ight]`，
+认为少一个 `\right`，补上 `\right.`；随后修复把 `\right]` 补回来，
+变成 1 个 `\left` 配 2 个 `\right` —— KaTeX 报错，退化成红色源码。
+
+真机上表现就是「修复看起来成功了，但变成一坨红字」。
+`delimitersAreBalancedAfterPairing` 这条测试专门守这个顺序。
+
+### 排版：屏幕与 PDF 必须共用一套规则
+
+用户报：字号忽大忽小、公式被裁切、会溢出屏幕、行间互相重合，**PDF 也一样**。
+
+排查发现屏幕（`RichText`）和打印（`PdfExporter`）**各自写了一套缩放逻辑**，
+而且规则不一致：屏幕会等比缩小，PDF 只判断换行**从不缩小**，
+所以长公式在纸上直接冲出可打印区。
+
+抽出 `MathLayout`（纯函数，可在 JVM 单测）作为唯一判据，两边共用。
+结构性好处：想改排版规则只改一处，不可能再漂移。
+
+### 教训 5：排版取舍要问清楚，不要自己猜
+
+这一轮在「压公式」和「不压公式」之间来回错了两次：
+
+1. 先按固定行高卡公式 → 分式被压小、段内字号不齐（用户报「忽大忽小」）
+2. 改成「行高迁就公式」→ 分式全尺寸渲染，一行占掉半屏（用户报「latex 太大」）
+
+用户最终明确定调：**「正常字母和汉字的大小一致是最佳的，
+分数或者明显需要多行的适当小一点就可以了」**。
+
+落地为三条常量，全在 `MathLayout`：
+
+- `MATH_LETTER_RATIO = 1.0` —— 字母与正文同大
+- `INLINE_MATH_MAX_HEIGHT_RATIO = 2.3` —— 总高度封顶，天生高的整体等比缩小；
+  `x\to0`（约 1.3 倍）**完全不受影响**
+- `INLINE_LINE_BOX_RATIO = 2.45` —— 行高略大于上限，保证不压行
+
+**写死的教训：排版参数不要凭感觉定，要给出取舍依据并让用户确认。**
+
+### 附带修掉的启动崩溃
+
+真机 logcat 抓到：
+
+```
+NullPointerException: kotlin.Lazy.getValue() on a null object reference
+    at AppContainer.getNotebookRepository(AppContainer.kt:108)
+```
+
+`AppContainer` 的 `init { }` 块在类的中部，它启动的协程引用了**声明在它下面**的
+`notebookRepository` 和 `enhancePhotosCache`。Kotlin 按声明顺序初始化，
+此时 `by lazy` 的委托字段还是 `null`；协程一旦在构造函数跑完前被调度
+到别的线程就炸。表现为**启动即崩溃**，触发概率与数据库打开速度相关
+（装包后首次启动必现）。把 `init` 移到类末尾即解决。
+
+这个崩溃和排版改动无关，是被反复 force-stop 触发出来的**既有缺陷**，
+真实用户同样会遇到。
+
+### 发布密钥丢过一次
+
+本地发布密钥原本放在 `%TEMP%\opencode\release-signing\`，
+**被系统清理掉了**。后果是本地再也无法构建可覆盖安装的包。
+
+- 密钥已迁到持久位置 `<用户主目录>\.android\mistakebook\mistakebook-release.jks`
+- 重新生成，并**同步更新了 4 个 GitHub Actions Secrets**
+  （GitHub 要求 libsodium sealed-box 加密，用 Python `nacl.public.SealedBox`）
+- `signing/expected-cert-sha256.txt` 已换成新指纹
+
+**教训：密钥绝不能放在临时目录，也绝不能只存在于本机。**
+本轮多亏 CI 的 Secret 里还有旧密钥，否则整个发布链路直接断掉。
+
+### 新增闸门：发布包不得是 debuggable
+
+`-PenforceDebuggable=true` 是本地排障用的（为了 `run-as` 读数据库比对数据）。
+但带 `android:debuggable` 的发布包能被任意工具附加调试、读走用户数据。
+
+安全项不能靠「记得别加」，所以加了三道：
+
+- `scripts\verify-signing.ps1`：发版前本地拦截
+- CI 闸门 1b：`aapt2 dump badging` 检测
+- `app/build.gradle.kts` 里默认关闭，必须显式传参
+
+两条路径（正常包通过 / debuggable 包拦截）都实测验证过。

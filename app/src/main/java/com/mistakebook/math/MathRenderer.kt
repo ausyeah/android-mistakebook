@@ -61,7 +61,25 @@ class MathRenderer(context: Context) {
 
     /** 渲染结果为透明背景位图 + 实际字号；失败返回 null（调用方回退为源码文本）。 */
     suspend fun render(latex: String, displayMode: Boolean): RenderedMath? {
-        val trimmed = com.mistakebook.pipeline.LatexSanitizer.clean(latex)
+        // 顺序要紧：先清理语义命令，再修复控制字符。
+        // 反过来的话，清理过程可能新造出控制字符而没人收拾。
+        // mathOnly = false：这里的 latex 是 RichText 切出来的**公式内部内容**，
+        //  + "" + $ 分隔符早已被剥掉（RichText: rest.substring(2, end)），
+        // 若按「数学区内」判定，这个修复一次都不会触发——而且不报错，只是静默失效。
+        // **顺序：先修复，后清理。**
+        //
+        // LatexSanitizer.balanceDelimiters 会数 \left / \right 的个数，
+        // 少了就在末尾补 \right.。若先把损坏文本送去清理，它看到的仍是
+        // ight]（\right 已被 v0.0.3 删掉），于是补一个；
+        // 等修复再把 \right] 补回来，就变成 1 个 \left 配 2 个 \right——
+        // 反而更不平衡，KaTeX 直接报错、整条公式退化成红色源码。
+        //
+        // 真机踩过：修复生效了，但因为多出的那个 \right. 而渲染失败。
+        val repaired = com.mistakebook.pipeline.LatexEscapes.repairForDisplay(
+            latex,
+            mathOnly = false
+        )
+        val trimmed = com.mistakebook.pipeline.LatexSanitizer.clean(repaired)
         if (trimmed.isEmpty()) return null
         val key = (if (displayMode) "d" else "i") + ":" + trimmed
         cache.get(key)?.let { return it }
@@ -94,6 +112,16 @@ class MathRenderer(context: Context) {
                         val width = size.width.coerceIn(1, MAX_BITMAP_EDGE)
                         val height = size.height.coerceIn(1, MAX_BITMAP_EDGE)
                         if (width < 2 || height < 2) return@withLock null
+
+                        // **JS 侧已判定公式渲染失败，直接回退成源码。**
+                        // err=1 源文本已被 JSON 转义破坏；err=2 KaTeX 解析失败。
+                        // 不处理的话，用户看到的是 KaTeX 画出来的**红色错误文本**
+                        // （那正是「一坨红色的字」的来源）——比显示源码糟糕得多：
+                        // 源码至少还能看出题目原本是什么。
+                        if (size.err != 0) {
+                            Log.w(TAG, "公式渲染失败 err=${size.err}，回退源码: $trimmed")
+                            return@withLock null
+                        }
 
                         relayout(view)
                         view.scrollTo(0, 0)
@@ -373,7 +401,7 @@ class MathRenderer(context: Context) {
     /**
      * 解析 `render()` 返回的 `{"w":..,"h":..,"fs":..}`（单位已是设备像素）。
      */
-    private data class Size(val width: Int, val height: Int, val fontPx: Float)
+    private data class Size(val width: Int, val height: Int, val fontPx: Float, val err: Int = 0)
 
     private fun parseSize(raw: String): Size? {
         val text = unwrapJavascriptJson(raw)
@@ -382,7 +410,8 @@ class MathRenderer(context: Context) {
         val w = obj["w"]?.jsonPrimitive?.content?.toFloatOrNull()?.toInt() ?: return null
         val h = obj["h"]?.jsonPrimitive?.content?.toFloatOrNull()?.toInt() ?: return null
         val fs = obj["fs"]?.jsonPrimitive?.content?.toFloatOrNull() ?: DEFAULT_FONT_PX
-        return Size(w, h, fs)
+        val err = obj["err"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0
+        return Size(w, h, fs, err)
     }
 
     /**
@@ -505,8 +534,16 @@ class MathRenderer(context: Context) {
                 }
                 layout.entries.forEach { entry ->
                     val key = entry.key
-                    val value = slice(sheet, entry.x, entry.y, entry.width, entry.height)
-                        ?.let { RenderedMath(it, entry.fontPx) }
+                    // 渲染失败（含被 JSON 转义破坏）一律回退成源码，
+                    // 绝不能把 KaTeX 的红色错误当成公式结果返回——
+                    // 打印时那会变成纸上一片红字。
+                    val value = if (entry.err != 0) {
+                        Log.w(TAG, "批量渲染失败 err=${entry.err}，回退源码: $key")
+                        null
+                    } else {
+                        slice(sheet, entry.x, entry.y, entry.width, entry.height)
+                            ?.let { RenderedMath(it, entry.fontPx) }
+                    }
                     if (value != null) cache.put(key, value)
                     results[key] = value
                 }
@@ -524,10 +561,19 @@ class MathRenderer(context: Context) {
     /** 生成「把 N 个公式竖排进一条长卷」的 JS。 */
     private fun buildBatchScript(items: List<Triple<String, String, Boolean>>): String {
         val payload = items.joinToString(",") { (key, latex, display) ->
-            // 批量路径绕过了 render()，清洗必须在这里也做一次
-            "{k:${jsonString(key)},t:${jsonString(
-                com.mistakebook.pipeline.LatexSanitizer.clean(latex)
-            )},d:$display}"
+            // 批量路径绕过了 render()，清洗与控制字符修复必须在这里也做一次。
+            // restoreLatexControlChars 不能省：批量路径直接拿草稿里的原始字符串，
+            // 若此前解析层漏了保护，红色错误会被原样切进位图、印到纸上。
+            // 同 render()：批量路径拿到的也是剥掉分隔符的公式内部内容。
+            // 打印走这条路，漏了修复就会把损坏公式原样印到纸上。
+            // 顺序理由同 render()：先修复再清理，否则 balanceDelimiters
+            // 会基于损坏文本误判，把多余 \right. 印到纸上。
+            val repaired = com.mistakebook.pipeline.LatexEscapes.repairForDisplay(
+                latex,
+                mathOnly = false
+            )
+            val cleaned = com.mistakebook.pipeline.LatexSanitizer.clean(repaired)
+            "{k:${jsonString(key)},t:${jsonString(cleaned)},d:$display}"
         }
         return "renderBatch([$payload],${MAX_BITMAP_EDGE - 32})"
     }
@@ -568,7 +614,9 @@ class MathRenderer(context: Context) {
         val y: Int,
         val width: Int,
         val height: Int,
-        val fontPx: Float
+        val fontPx: Float,
+        /** 0 = 正常；1 = 源文本被 JSON 转义破坏；2 = KaTeX 解析失败。 */
+        val err: Int = 0
     )
 
     private data class BatchLayout(
@@ -596,7 +644,8 @@ class MathRenderer(context: Context) {
                 y = item.optInt("y"),
                 width = item.optInt("w"),
                 height = item.optInt("h"),
-                fontPx = item.optDouble("f", 0.0).toFloat()
+                fontPx = item.optDouble("f", 0.0).toFloat(),
+                err = item.optInt("e", 0)
             )
         }
         return BatchLayout(w, h, entries)

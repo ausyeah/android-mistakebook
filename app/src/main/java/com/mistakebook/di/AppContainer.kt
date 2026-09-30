@@ -74,20 +74,6 @@ class AppContainer(context: Context) {
         SubjectRepository(database.subjectDao())
     }
 
-    init {
-        // 预置学科（数学 / 通信原理）保证下拉框一进来就有得选
-        appScope.launch { subjectRepository.seedPresets() }
-        // 默认错题本 + 把历史题目归入其中。必须在任何写入之前跑完，
-        // 否则新题会以「未归类」入库，首页按默认本筛选时就看不到它们。
-        appScope.launch { notebookRepository.seedDefault() }
-        // 缓存增强开关，供 ImageImporter 的同步回调读取
-        appScope.launch {
-            enhancePhotosCache.set(
-                runCatching { settingsStore.snapshotNow().enhancePhotos }.getOrDefault(true)
-            )
-        }
-    }
-
     val tagRepository: TagRepository by lazy {
         TagRepository(database.tagDao(), database.subjectDao())
     }
@@ -173,6 +159,40 @@ class AppContainer(context: Context) {
      * 编辑页读不到变化，原图看起来就没被替换。
      */
     var recroppedImagePath: String? by mutableStateOf(null)
+
+    /**
+     * 启动时的三件预置工作。
+     *
+     * ## 为什么必须放在类的最后
+     *
+     * Kotlin 的属性初始化与 `init` 块**按声明顺序**执行。
+     * 这个块原先写在类的中部，它启动的协程引用了
+     * `notebookRepository` 与 `enhancePhotosCache`——
+     * 而这两个声明在它**下面**，此时 `by lazy` 的委托字段还是 `null`。
+     *
+     * 协程一旦在构造函数跑完前被调度到别的线程，就会读到 null 委托：
+     * ```
+     * NullPointerException: kotlin.Lazy.getValue() on a null object reference
+     *     at AppContainer.getNotebookRepository(AppContainer.kt:108)
+     * ```
+     * 表现为**启动即崩溃**，且触发概率与数据库打开速度相关——
+     * 装包后首次启动、网络盘/慢存储下必现，平时却可能一直不复现。
+     *
+     * 移到类末尾后，所有委托都已初始化，竞态从结构上消失。
+     */
+    init {
+        // 预置学科（数学 / 通信原理）保证下拉框一进来就有得选
+        appScope.launch { subjectRepository.seedPresets() }
+        // 默认错题本 + 把历史题目归入其中。必须在任何写入之前跑完，
+        // 否则新题会以「未归类」入库，首页按默认本筛选时就看不到它们。
+        appScope.launch { notebookRepository.seedDefault() }
+        // 缓存增强开关，供 ImageImporter 的同步回调读取
+        appScope.launch {
+            enhancePhotosCache.set(
+                runCatching { settingsStore.snapshotNow().enhancePhotos }.getOrDefault(true)
+            )
+        }
+    }
 
     private companion object {
         const val LLM_PLACEHOLDER_BASE_URL = "https://placeholder.invalid/"

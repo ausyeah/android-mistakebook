@@ -206,3 +206,59 @@ mistakebook-<version>-android.apk
       但**没在真机验证过**。混淆问题只在运行时暴露（编译期一切正常），
       验证前不开。验证方法：装上 release 包，跑一遍「拍照 → 识别 → 编辑 → 打印」全流程。
 - [ ] 打包 woff2/woff 字体，消除 KaTeX 首次渲染的失败请求（见 `THIRD_PARTY_LICENSES.md`）
+
+---
+
+## 发布密钥：位置与恢复
+
+### 密钥必须放在持久目录
+
+**绝不能放 `%TEMP%`。** 本项目已经在那里丢过一次密钥，
+后果是本地再也无法构建可覆盖安装的包（签名不同，`adb install -r` 直接被拒）。
+
+现位置：`<用户主目录>\.android\mistakebook\mistakebook-release.jks`
+
+`keystore.properties` 指向它，该文件已 `.gitignore`。仓库里只保留
+`keystore.properties.template`。
+
+**另需离线备份一份**（U 盘 / 私有仓库 / 密码管理器附件）。
+本机文件与 GitHub Secrets 都不是备份：前者会丢，后者读不出来。
+
+### 丢失后怎么办
+
+1. 重新 `keytool -genkeypair` 生成
+2. 更新 `signing/expected-cert-sha256.txt`
+3. 更新 4 个 GitHub Actions Secrets，让 CI 与本地保持同一把密钥：
+   - `RELEASE_KEYSTORE_B64` —— keystore 文件的 base64
+   - `RELEASE_STORE_PASSWORD` / `RELEASE_KEY_PASSWORD`
+   - `RELEASE_KEY_ALIAS`
+
+   GitHub 要求用仓库公钥做 libsodium sealed-box 加密，
+   不能直接 PUT 明文。PowerShell 做不到，用 Python：
+
+   ```python
+   import base64, nacl.public
+   pk = api("/actions/secrets/public-key")      # key 字段本身是 base64
+   box = nacl.public.SealedBox(nacl.public.PublicKey(base64.b64decode(pk["key"])))
+   enc = base64.b64encode(box.encrypt(value.encode())).decode()
+   api(f"/actions/secrets/{name}", "PUT", {"encrypted_value": enc, "key_id": pk["key_id"]})
+   ```
+
+4. **如果旧密钥无法找回而被迫换密钥**：`applicationId` 也要一并更换。
+   否则老用户会遇到「只能卸载重装、数据丢失」。
+
+### 发版前两道本地闸门
+
+```powershell
+.\gradlew --no-daemon --offline assembleRelease -PprefillKeys=false
+powershell -ExecutionPolicy Bypass -File scripts\verify-signing.ps1
+```
+
+它检查两件事，退出码非 0 就**不要发版**：
+
+1. 产物证书指纹 == `signing/expected-cert-sha256.txt`
+2. 产物**不是** debuggable 包
+
+第 2 条防的是 `-PenforceDebuggable=true` 被顺手带进发版流程。
+那个开关是本地排障用的（`run-as` 读数据库比对设备上的真实数据），
+但带 `android:debuggable` 的发布包能被任意工具附加调试，用户数据等于公开。

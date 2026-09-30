@@ -578,9 +578,29 @@ class PdfExporter(
                         lineHasContent = true
                     } else {
                         val image = rendered.bitmap
-                        val scale = sizePt / rendered.fontPx.coerceAtLeast(1f)
-                        val w = image.width * scale
-                        val h = image.height * scale
+                        // 与屏幕端**共用同一套缩放规则**（com.mistakebook.math.MathLayout）。
+                        //
+                        // 原来这里只判断「放不下就换行」，**没有等比缩小**，
+                        // 于是比可打印宽度还宽的长公式会直接冲出纸面右边被切掉；
+                        // 而同样的公式在 App 里却会被缩小——两边表现不一致。
+                        val fitted = com.mistakebook.math.MathLayout.fit(
+                            bitmapW = image.width,
+                            bitmapH = image.height,
+                            srcFontPx = rendered.fontPx,
+                            // 字母与正文同大；总高度封顶，天生高的结构整体缩小。
+                            // 与屏幕端（RichText）共用同一套规则，两边表现一致。
+                            targetFontPx = com.mistakebook.math.MathLayout.letterTargetPx(sizePt),
+                            maxWidthPx = USABLE_WIDTH,
+                            maxHeightPx = if (token.display) {
+                                com.mistakebook.math.MathLayout.displayMathMaxHeightPx(sizePt)
+                            } else {
+                                com.mistakebook.math.MathLayout.inlineMathMaxHeightPx(sizePt)
+                            }
+                        )
+                        val w = fitted.width
+                        val h = fitted.height
+                        // 放得下就随行，放不下先换行；换行后仍放不下（公式本身超宽）
+                        // 上面已经把它缩到 USABLE_WIDTH 以内，所以这里必然放得下。
                         if (x + w > USABLE_WIDTH && lineHasContent) flush()
                         pieces += MathPiece.Image(image, x, w, h)
                         x += w

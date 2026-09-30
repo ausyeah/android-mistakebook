@@ -89,17 +89,31 @@ object JsonExtractor {
         return null
     }
 
-    private fun decodeSingle(text: String): RefinedQuestionDto? =
-        runCatching { json.decodeFromString<RefinedQuestionDto>(text) }.getOrNull()
-            ?: runCatching { json.decodeFromString<RefinedQuestionDto>(repairJson(text)) }.getOrNull()
+    /**
+     * 所有 JSON 解析的**唯一入口**。
+     *
+     * 解析前先跑 [LatexEscapes.protectLatexEscapes]：模型在 JSON 字符串里写
+     * `\to` `\right` `\neq` 时，这些首字母恰好都是合法 JSON 转义，会被静默
+     * 变成控制字符——解析**不报错**，公式却已经坏了。
+     * 见 [LatexEscapes] 的详细说明。
+     */
+    private fun prepare(raw: String): String = LatexEscapes.protectLatexEscapes(raw)
 
-    private fun decodeItems(text: String): List<RefinedQuestionDto>? =
-        runCatching { json.decodeFromString<RefinedItemsDto>(text).items }.getOrNull()
-            ?: runCatching { json.decodeFromString<List<RefinedQuestionDto>>(text) }.getOrNull()
-            ?: runCatching { json.decodeFromString<RefinedItemsDto>(repairJson(text)).items }.getOrNull()
-            ?: runCatching { json.decodeFromString<List<RefinedQuestionDto>>(repairJson(text)) }.getOrNull()
-            ?: decodeByBraceScan(text)
-            ?: decodeByBraceScan(repairJson(text))
+    private fun decodeSingle(text: String): RefinedQuestionDto? {
+        val prepared = prepare(text)
+        return runCatching { json.decodeFromString<RefinedQuestionDto>(prepared) }.getOrNull()
+            ?: runCatching { json.decodeFromString<RefinedQuestionDto>(repairJson(prepared)) }.getOrNull()
+    }
+
+    private fun decodeItems(text: String): List<RefinedQuestionDto>? {
+        val prepared = prepare(text)
+        return runCatching { json.decodeFromString<RefinedItemsDto>(prepared).items }.getOrNull()
+            ?: runCatching { json.decodeFromString<List<RefinedQuestionDto>>(prepared) }.getOrNull()
+            ?: runCatching { json.decodeFromString<RefinedItemsDto>(repairJson(prepared)).items }.getOrNull()
+            ?: runCatching { json.decodeFromString<List<RefinedQuestionDto>>(repairJson(prepared)) }.getOrNull()
+            ?: decodeByBraceScan(prepared)
+            ?: decodeByBraceScan(repairJson(prepared))
+    }
 
     /**
      * 括号配平扫描，逐个解出最外层的 `{...}`。
@@ -213,37 +227,45 @@ object JsonExtractor {
     }
 
     /**
-     * 把模型输出的**字面量** `\n` `\t` 还原成真换行 / 制表符。
+     * 把模型输出的**字面量** `\n` 还原成真换行，并修复漏网的 LaTeX 控制字符。
      *
-     * 这是一个自造的坑：提示词里写了「步骤之间用 \n 分隔」，
-     * 模型就忠实地输出了两个字符 `\` `n`，而序列化后的 JSON 里它是转义序列，
-     * `Json` 会把它解成真换行——但**没走 JSON 解析的那条路**（降级兜底、
-     * 以及部分模型把 analysis 直接塞进字符串）就会在界面上显示成 `\n`。
-     * 统一在这里擦一遍，两条路径都受益。
+     * ## 这个函数改过两次，两次都是因为它自己
      *
-     * 注意不能用 `replace("\\n", "\n")` 一刀切：那会把 LaTeX 里的
-     * `\nabla`、`\neq` 之类命令的前导反斜杠后紧跟的 `n` 也换掉，
-     * 直接毁掉公式。只替换**不在 LaTeX 分隔符内**的 `\n`。
+     * 第一版无条件处理 `\n` `\t` `\r`。KDoc 里明明写着
+     * 「那会把 LaTeX 里的 \nabla、\neq 之类命令毁掉」——然后代码正是这么干的。
+     * 结果是 `\to` 变制表符、`\right` 被整段删掉，真机上表现为公式里冒出
+     * `ight]`、`x∈0` 这种东西。
+     *
+     * 现在只做两件事，且都限定范围：
+     * 1. `$...$` 数学区**之外**的字面 `\n` 还原成真换行
+     *    （数学区里的 `\n` 可能是 `\neq` `\nabla` `\nu` `\ne` `\not`，绝不能动）
+     * 2. 数学区里残留的控制字符还原成对应 LaTeX 命令
+     *    （JSON 解析本该处理干净，这里兜底，见 [LatexEscapes.restoreLatexControlChars]）
+     *
+     * 制表符与回车**完全不再单独处理**：它们在 LaTeX 里没有意义，
+     * 而 `\t` `\r` 是极常见的命令首字母，一碰就坏。
      */
     private fun normalizeBreaks(raw: String): String {
-        if (!raw.contains('\\')) return raw
-        val out = StringBuilder(raw.length)
+        val restored = LatexEscapes.repairForDisplay(raw)
+        if (!restored.contains("\\n")) return restored
+        val out = StringBuilder(restored.length)
         var i = 0
-        while (i < raw.length) {
-            val ch = raw[i]
-            if (ch == '\\' && i + 1 < raw.length) {
-                when (val next = raw[i + 1]) {
-                    // \n \t \r 是转义序列，还原
-                    'n' -> { out.append('\n'); i += 2 }
-                    't' -> { out.append('\t'); i += 2 }
-                    'r' -> { i += 2 } // \r 单独出现时忽略，避免产生孤立回车
-                    // 其余是 LaTeX 命令（\neq / \nabla / \frac ...），原样保留
-                    else -> { out.append(ch).append(next); i += 2 }
-                }
-            } else {
+        var inMath = false
+        while (i < restored.length) {
+            val ch = restored[i]
+            if (ch == '$') {
+                inMath = !inMath
                 out.append(ch)
                 i++
+                continue
             }
+            if (ch == '\\' && i + 1 < restored.length && restored[i + 1] == 'n' && !inMath) {
+                out.append('\n')
+                i += 2
+                continue
+            }
+            out.append(ch)
+            i++
         }
         return out.toString()
     }

@@ -263,19 +263,30 @@ private fun MathImage(
     centered: Boolean,
     color: Color
 ) {
-    val image = rendered?.bitmap
-    if (image != null) {
+val image = rendered?.bitmap
+    if (rendered != null && image != null) {
         val density = LocalDensity.current
         Box(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
             BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
                 val maxWidthPx = constraints.maxWidth.toFloat()
-                val ratio = if (display) DISPLAY_MATH_FONT_RATIO else INLINE_MATH_FONT_RATIO
-                var scale = targetFontPx * ratio / rendered.fontPx.coerceAtLeast(1f)
-                // 放不下只做等比缩小，绝不裁剪（裁剪会把公式切掉一半）
-                val naturalW = image.width * scale
-                if (naturalW > maxWidthPx && naturalW > 0f) scale *= maxWidthPx / naturalW
-                val w = (image.width * scale).coerceAtLeast(1f)
-                val h = (image.height * scale).coerceAtLeast(1f)
+                // 字母与正文**同大**（比例 1.0），但整体受高度上限约束。
+                //
+                // 这里踩过一次来回：先把上限去掉，想着「不压公式」，
+                // 结果分式按全尺寸渲染，一行就占掉半屏——用户反馈「latex 太大」。
+                // 正确取舍是用户要的那样：
+                // **普通字母与汉字同大，天生高的结构（分式、大指数）整体适当缩小。**
+                val ratio = com.mistakebook.math.MathLayout.MATH_LETTER_RATIO
+                val maxH = if (display) com.mistakebook.math.MathLayout.displayMathMaxHeightPx(targetFontPx) else com.mistakebook.math.MathLayout.inlineMathMaxHeightPx(targetFontPx)
+                val fitted = com.mistakebook.math.MathLayout.fit(
+                    bitmapW = image.width,
+                    bitmapH = image.height,
+                    srcFontPx = rendered.fontPx,
+                    targetFontPx = targetFontPx * ratio,
+                    maxWidthPx = maxWidthPx,
+                    maxHeightPx = maxH
+                )
+                val w = fitted.width.coerceAtLeast(1f)
+                val h = fitted.height.coerceAtLeast(1f)
                 Box(
                     modifier = Modifier.fillMaxWidth(),
                     contentAlignment = if (centered) Alignment.Center else Alignment.CenterStart
@@ -283,7 +294,7 @@ private fun MathImage(
                     Image(
                         bitmap = image.asImageBitmap(),
                         contentDescription = latex,
-                        contentScale = ContentScale.FillWidth,
+                        contentScale = ContentScale.Fit,
                         modifier = Modifier.size(
                             with(density) { w.toDp() },
                             with(density) { h.toDp() }
@@ -388,12 +399,25 @@ private fun InlineRow(
     modifier: Modifier = Modifier
 ) {
     val density = LocalDensity.current
-    val lineHeightPx = targetFontPx * INLINE_LINE_BOX_RATIO
 
     BoxWithConstraints(modifier = modifier) {
         // 可用宽度。留 2dp 余量，避免正好贴边时被父容器裁掉 1px。
         val availableWidthPx = (constraints.maxWidth - with(density) { 2.dp.toPx() })
             .coerceAtLeast(targetFontPx * 2f)
+
+        // 行高是**固定**的正文倍数，不是按本段最高公式动态撑开。
+        //
+        // 这里也走过一次弯路：先改成「行高迁就公式」，结果带分式的段落
+        // 行高被拉到三四倍，一行占掉半屏（用户反馈"latex 太大"）。
+        //
+        // 最终取舍是用户要的那样，也是唯一自洽的方案：
+        // 1. 字母按正文大小渲染（[MATH_LETTER_RATIO] = 1.0）；
+        // 2. 整体高度封顶在 [INLINE_MATH_MAX_HEIGHT_RATIO]，
+        //    天生高的分式/嵌套指数等比缩小，矮公式（`x\to0`）完全不受影响；
+        // 3. 行高取一个**略大于**该上限的固定值，给公式留出上下呼吸空间，
+        //    保证既不压行框、也不会被无限撑高。
+        val lineHeightPx = com.mistakebook.math.MathLayout.lineBoxPx(targetFontPx)
+        val inlineMathMaxHeightPx = com.mistakebook.math.MathLayout.inlineMathMaxHeightPx(targetFontPx)
 
         val inlineContent = remember(spans, mathCache, lineHeightPx, availableWidthPx, targetFontPx) {
             buildMap<String, InlineTextContent> {
@@ -402,29 +426,22 @@ private fun InlineRow(
                         is InlineSpan.Math -> {
                             val rendered = mathCache["i:${span.latex}"]
                             val image = rendered?.bitmap
-                            val scale = if (rendered == null) {
-                                1f
+                            // 渲染失败时按一个正文字号的空位占位，
+                            // 让回退出来的源码文字还能正常参与换行。
+                            val fitted = if (rendered != null && image != null) {
+                                com.mistakebook.math.MathLayout.fit(
+                                    bitmapW = image.width,
+                                    bitmapH = image.height,
+                                    srcFontPx = rendered.fontPx,
+                                    targetFontPx = com.mistakebook.math.MathLayout.letterTargetPx(targetFontPx),
+                                    maxWidthPx = availableWidthPx,
+                                    maxHeightPx = inlineMathMaxHeightPx
+                                )
                             } else {
-                                targetFontPx / rendered.fontPx.coerceAtLeast(1f)
+                                null
                             }
-                            val bw = image?.width?.toFloat() ?: targetFontPx
-                            val bh = image?.height?.toFloat() ?: targetFontPx
-                            var w = bw * scale
-                            var h = bh * scale
-                            // 先按宽度压：超宽公式等比缩到刚好放得下
-                            if (w > availableWidthPx && w > 0f) {
-                                val k = availableWidthPx / w
-                                w *= k
-                                h *= k
-                            }
-                            // 再按行高压：不让公式高过行框，避免和上下行文字重叠
-                            if (h > lineHeightPx) {
-                                val k = lineHeightPx / h
-                                w *= k
-                                h *= k
-                            }
-                            w = w.coerceAtLeast(targetFontPx * 0.2f)
-                            h = h.coerceIn(targetFontPx * 0.6f, lineHeightPx)
+                            val w = fitted?.width ?: targetFontPx
+                            val h = fitted?.height ?: (targetFontPx * 0.9f)
                             put(
                                 "math$index",
                                 InlineTextContent(
@@ -434,7 +451,7 @@ private fun InlineRow(
                                         placeholderVerticalAlign = PlaceholderVerticalAlign.TextBottom
                                     )
                                 ) { _ ->
-                                    if (image != null) {
+                                    if (image != null && fitted != null) {
                                         Image(
                                             bitmap = image.asImageBitmap(),
                                             contentDescription = span.latex,
@@ -542,23 +559,7 @@ private sealed interface InlineSpan {
 }
 
 private val inlineMath = Regex("\\$\\$([^$]+)\\$\\$|\\$([^$]+)\\$")
-
-/**
- * 行内公式高度上限（相对字号倍数）。
- * 超过这个高度就提成独立行：Compose 的 inline content 不会撑高行框，
- * 公式一旦高过行框就会和上下行文字叠在一起。1.5 左右是行高的安全边界。
- */
-private const val INLINE_MATH_MAX_HEIGHT_RATIO = 1.5f
-
-/** 独立行公式相对正文的字号倍数。 */
-private const val DISPLAY_MATH_FONT_RATIO = 0.92f
-
-/** 被提成独立行的行内公式，相对正文的字号倍数。 */
-private const val INLINE_MATH_FONT_RATIO = 0.95f
-
-/** 行高（相对字号倍数）。要能容下常见分式，否则带公式的行会和上下行文字重叠。 */
-private const val INLINE_LINE_BOX_RATIO = 1.9f
-
+// 排版常量统一放在 com.mistakebook.math.MathLayout，屏幕与 PDF 共用同一套规则。
 private fun parseInline(input: String): List<InlineSpan> {
     val spans = mutableListOf<InlineSpan>()
     var cursor = 0

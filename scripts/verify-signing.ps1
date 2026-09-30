@@ -98,5 +98,32 @@ if ($actual -ne $expected) {
 }
 
 Write-Host ""
-Write-Host "[OK] 签名一致" -ForegroundColor Green
+  # 发布包绝不能是 debuggable 的。
+  # `enforceDebuggable` 是本地排障开关（用来 run-as 读数据库比对数据），
+  # 一旦混进发版流程，任何人都能附加调试、读走用户数据。
+  # CI 里也有一道同样的闸门，这里再挡一次是为了**发版前就发现**，而不是等 CI 跑完。
+  $apkPath = Join-Path $root 'app\build\outputs\apk\release\app-release.apk'
+  if (Test-Path $apkPath) {
+      # SDK 路径优先读 local.properties / ANDROID_HOME / ANDROID_SDK_ROOT，写死本机路径
+      # 会让 clone 仓库的人直接报错——本项目已经因此踩过一次。
+      $sdkRoots = @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT) | Where-Object { $_ -and (Test-Path $_) }
+      $aapt2 = $sdkRoots | ForEach-Object { Get-ChildItem (Join-Path $_ 'build-tools') -Recurse -Filter 'aapt2.exe' -ErrorAction SilentlyContinue } | Sort-Object FullName -Descending | Select-Object -First 1
+          Sort-Object FullName -Descending | Select-Object -First 1
+      # 上面已覆盖多个候选路径
+      if ($aapt2) {
+          $isDebuggable = & $aapt2.FullName dump badging $apkPath 2>&1 | Select-String 'application-debuggable' -Quiet
+          if ($isDebuggable) {
+              Write-Host ""
+              Write-Host "发布包带上了 android:debuggable，拒绝通过" -ForegroundColor Red
+              Write-Host ""
+              Write-Host "  本地排障开关 -PenforceDebuggable=true 不能进入发版流程。" -ForegroundColor Yellow
+              Write-Host "  带 debuggable 的包能被任意工具附加调试，用户数据等于公开。"
+              Write-Host ""
+              exit 1
+          }
+          Write-Host "[OK] 发布包未开启 debuggable"
+      }
+  }
+
+  Write-Host "[OK] 签名一致，且不是 debuggable 包" -ForegroundColor Green
 exit 0
