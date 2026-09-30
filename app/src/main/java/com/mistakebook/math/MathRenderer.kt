@@ -351,19 +351,33 @@ class MathRenderer(context: Context) {
     }
 
     /**
+     * 剥掉 `evaluateJavascript` 对**字符串**返回值多加的那一层 JSON 编码。
+     *
+     * `render()` / `renderBatch()` 都用 `JSON.stringify(...)` 返回，
+     * 而 evaluateJavascript 会把这个字符串再 JSON 编码一次，回调收到的是形如
+     * `"{\"w\":2016,...}"` 的**字符串字面量**。不剥这层直接 `JSONObject(raw)` 必然失败。
+     *
+     * 抽出来共用，是因为这个坑踩过一次：单条路径 [parseSize] 一直处理了它，
+     * 后来加的批量路径忘了，于是整个批量结果被判为 null、所有公式退回 LaTeX 源码，
+     * 表现为「公式完全渲染不出来」。两条路径必须走同一个解包函数。
+     */
+    private fun unwrapJavascriptJson(raw: String): String {
+        val text = raw.trim()
+        if (text.length >= 2 && text.startsWith("\"") && text.endsWith("\"")) {
+            return runCatching { Json.parseToJsonElement(text).jsonPrimitive.content }
+                .getOrDefault(text)
+        }
+        return text
+    }
+
+    /**
      * 解析 `render()` 返回的 `{"w":..,"h":..,"fs":..}`（单位已是设备像素）。
-     * evaluateJavascript 会把字符串再 JSON 编码一层，形如 `"{\"w\":1}"`，
-     * 这里先剥外层引号再按对象解析，两种形态都吃下。
      */
     private data class Size(val width: Int, val height: Int, val fontPx: Float)
 
     private fun parseSize(raw: String): Size? {
-        var text = raw.trim()
+        val text = unwrapJavascriptJson(raw)
         if (text.isEmpty()) return null
-        if (text.length >= 2 && text.startsWith("\"") && text.endsWith("\"")) {
-            text = runCatching { Json.parseToJsonElement(text).jsonPrimitive.content }
-                .getOrDefault(text)
-        }
         val obj = runCatching { Json.parseToJsonElement(text).jsonObject }.getOrNull() ?: return null
         val w = obj["w"]?.jsonPrimitive?.content?.toFloatOrNull()?.toInt() ?: return null
         val h = obj["h"]?.jsonPrimitive?.content?.toFloatOrNull()?.toInt() ?: return null
@@ -564,7 +578,11 @@ class MathRenderer(context: Context) {
     )
 
     private fun parseBatchLayout(raw: String): BatchLayout? {
-        val obj = runCatching { org.json.JSONObject(raw) }.getOrNull() ?: return null
+        // 关键：必须用 [unwrapJavascriptJson] 剥掉 evaluateJavascript 多加的
+        // 那层 JSON 编码，否则 JSONObject(raw) 解析一个「字符串字面量」必然失败，
+        // 整个批量结果被判为 null，所有公式退回 LaTeX 源码。
+        val obj = runCatching { org.json.JSONObject(unwrapJavascriptJson(raw)) }.getOrNull()
+            ?: return null
         val w = obj.optInt("w", 0)
         val h = obj.optInt("h", 0)
         if (w <= 0 || h <= 0) return null
