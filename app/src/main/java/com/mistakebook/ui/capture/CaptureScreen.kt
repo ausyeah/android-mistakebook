@@ -90,6 +90,8 @@ fun CaptureScreen(
     container: AppContainer,
     onCropped: (String) -> Unit,
     onOpenSettings: () -> Unit,
+    /** Key 门禁里的「改用手动录入」出口，见 [ApiKeyRequiredDialog]。 */
+    onManualEntry: () -> Unit,
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
@@ -179,6 +181,7 @@ fun CaptureScreen(
             mineruMissing = mineruMissing,
             llmMissing = llmMissing,
             onOpenSettings = onOpenSettings,
+            onManualEntry = onManualEntry,
             onDismiss = { showKeyGate = false }
         )
     }

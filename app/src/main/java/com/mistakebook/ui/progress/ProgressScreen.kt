@@ -57,6 +57,7 @@ fun ProgressScreen(
     taskId: Long,
     onBack: () -> Unit,
     onEdit: (Long) -> Unit,
+    onManualEntry: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
     val viewModel: ProgressViewModel = containerViewModel(container) { ProgressViewModel(it, taskId) }
@@ -84,6 +85,7 @@ fun ProgressScreen(
                     onRetry = viewModel::retry,
                     onOpenSettings = onOpenSettings,
                     onSkipLlm = { viewModel.skipLlm { onEdit(taskId) } },
+                    onManualEntry = onManualEntry,
                     onBack = onBack
                 )
 
@@ -169,6 +171,7 @@ private fun FailureContent(
     onRetry: () -> Unit,
     onOpenSettings: () -> Unit,
     onSkipLlm: () -> Unit,
+    onManualEntry: () -> Unit,
     onBack: () -> Unit
 ) {
     val kind = errorKindOf(task?.errorKind)
@@ -201,16 +204,23 @@ private fun FailureContent(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center
         )
+        val hasMarkdown = !task?.markdown.isNullOrBlank()
         Button(onClick = onRetry) { Text(stringResource(R.string.action_retry)) }
         if (kind == com.mistakebook.net.ApiErrorKind.NO_KEY) {
             Button(onClick = onOpenSettings) {
                 Text(stringResource(R.string.error_no_key_action))
             }
         }
-        val hasMarkdown = !task?.markdown.isNullOrBlank()
         if (hasMarkdown) {
             OutlinedButton(onClick = onSkipLlm) {
                 Text(stringResource(R.string.progress_skip_llm))
+            }
+        } else {
+            // 识别彻底失败时的兜底：不靠任何 API 也能把题录进去。
+            // 只在「连 MinerU 的 markdown 都没拿到」时出现——已经有原始文本的话，
+            // 「跳过 AI 直接用原始文本」更合适，没必要让用户手打一遍。
+            OutlinedButton(onClick = onManualEntry) {
+                Text(stringResource(R.string.progress_manual_entry))
             }
         }
         OutlinedButton(onClick = onBack) { Text(stringResource(R.string.action_back)) }

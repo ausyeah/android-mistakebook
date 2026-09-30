@@ -80,12 +80,15 @@ import com.mistakebook.ui.theme.WarningAmber
 
 /**
  * 编辑页（PRD 7.5）：一次识别可含多道题，顶部翻页切换。
+ *
+ * [taskId] 传 null 即「手动录入」：MinerU 连不上、Key 没配、或者用户就是想手写一道题时，
+ * 走的是同一套表单，只是草稿从空白开始、且没有原图与原始识别文本。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun EditScreen(
     container: AppContainer,
-    taskId: Long,
+    taskId: Long?,
     initialIndex: Int,
     onRecrop: (String) -> Unit,
     onBack: () -> Unit,
@@ -112,10 +115,15 @@ fun EditScreen(
             TopAppBar(
                 title = {
                     Text(
-                        if (state.total > 1) {
-                            stringResource(R.string.edit_title_with_index, state.index + 1, state.total)
-                        } else {
-                            stringResource(R.string.edit_title)
+                        when {
+                            state.manualEntry -> stringResource(R.string.edit_title_manual)
+                            state.total > 1 -> stringResource(
+                                R.string.edit_title_with_index,
+                                state.index + 1,
+                                state.total
+                            )
+
+                            else -> stringResource(R.string.edit_title)
                         }
                     )
                 },
@@ -142,8 +150,12 @@ fun EditScreen(
                             Icon(Icons.Default.ChevronRight, contentDescription = stringResource(R.string.edit_next))
                         }
                     }
-                    TextButton(onClick = { showRawSheet = true }) {
-                        Text(stringResource(R.string.edit_view_raw))
+                    // 手动录入没有识别文本可看，这个入口必须藏起来，
+                    // 否则点开是一张空白面板，更让人以为坏了
+                    if (!state.manualEntry) {
+                        TextButton(onClick = { showRawSheet = true }) {
+                            Text(stringResource(R.string.edit_view_raw))
+                        }
                     }
                 }
             )
@@ -208,6 +220,11 @@ fun EditScreen(
                         }
                         if (state.truncated) {
                             WarningBanner(text = stringResource(R.string.edit_truncated_warning))
+                        }
+                        // 手动录入没有原图，也没有「识别文本 vs 修正结果」的对照。
+                        // 提前说清楚，免得用户一直找那个不存在的原图。
+                        if (state.manualEntry) {
+                            InfoBanner(text = stringResource(R.string.edit_manual_hint))
                         }
 
                         // 渲染预览：下方输入框是 LaTeX 源码，这里实时显示排版后的效果
@@ -556,6 +573,25 @@ private fun WarningBanner(text: String) {
             .fillMaxWidth()
             .padding(bottom = 8.dp),
         color = WarningAmber.copy(alpha = 0.16f),
+        shape = RoundedCornerShape(8.dp)
+    ) {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.padding(12.dp)
+        )
+    }
+}
+
+/** 中性提示条：说明当前状态，但不是错误。手动录入时就用这个而不是警告色。 */
+@Composable
+private fun InfoBanner(text: String) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 8.dp),
+        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f),
         shape = RoundedCornerShape(8.dp)
     ) {
         Text(

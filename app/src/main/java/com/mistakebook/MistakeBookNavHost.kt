@@ -39,6 +39,14 @@ object Routes {
     const val QUESTION_EDIT = "questionEdit"
     const val NOTEBOOKS = "notebooks"
 
+    /**
+     * 手动录入用的编辑页入口。
+     *
+     * 用路径区分而不是给 `edit` 加一个可空参数：导航参数类型越简单越不容易出错，
+     * 而且「没有 taskId」这件事本身就该体现在路由上。
+     */
+    const val MANUAL_EDIT = "manualEdit"
+
     fun crop(imagePath: String): String = "$CROP/${Uri.encode(imagePath)}"
 
     fun progress(taskId: Long): String = "$PROGRESS/$taskId"
@@ -70,6 +78,7 @@ fun MistakeBookNavHost(
                 onNotebookPicked = { homeNotebookPick = it },
                 onAddByPhoto = { navController.navigate(Routes.CAPTURE) },
                 onImportPdf = { navController.navigate(Routes.PDF_IMPORT) },
+                onAddManual = { navController.navigate(Routes.MANUAL_EDIT) },
                 onCropImage = { path ->
                     container.cropSourceIsGallery = true
                     navController.navigate(Routes.crop(path))
@@ -106,6 +115,7 @@ fun MistakeBookNavHost(
                     }
                 },
                 onOpenSettings = { navController.navigate(Routes.SETTINGS) },
+                onManualEntry = { navController.navigate(Routes.MANUAL_EDIT) },
                 onBack = { navController.popBackStack() }
             )
         }
@@ -131,6 +141,7 @@ fun MistakeBookNavHost(
                     }
                 },
                 onOpenSettings = { navController.navigate(Routes.SETTINGS) },
+                onManualEntry = { navController.navigate(Routes.MANUAL_EDIT) },
                 onBack = {
                     container.recropping = false
                     // 用户中途退出裁剪页时必须清掉来源标记，
@@ -155,6 +166,13 @@ fun MistakeBookNavHost(
                         popUpTo(Routes.HOME)
                     }
                 },
+                onManualEntry = {
+                    // 失败的任务留在进度页返回栈里，用户手动录完题
+                    // 直接回首页——那个失败任务没有产出任何东西，留着只是垃圾
+                    navController.navigate(Routes.MANUAL_EDIT) {
+                        popUpTo(Routes.HOME) { inclusive = true }
+                    }
+                },
                 onOpenSettings = { navController.navigate(Routes.SETTINGS) }
             )
         }
@@ -171,6 +189,25 @@ fun MistakeBookNavHost(
                 taskId = entry.arguments?.getLong("taskId") ?: 0L,
                 initialIndex = entry.arguments?.getInt("index") ?: 0,
                 onRecrop = { path -> navController.navigate(Routes.crop(path)) },
+                onBack = { navController.popBackStack() },
+                onSaved = { questionId ->
+                    navController.navigate(Routes.detail(questionId)) {
+                        popUpTo(Routes.HOME)
+                    }
+                }
+            )
+        }
+
+        /**
+         * 手动录入：复用编辑页，传 null 表示「没有识别任务」。
+         * 入口有三处：首页添加面板、识别失败页、Key 门禁对话框。
+         */
+        composable(Routes.MANUAL_EDIT) {
+            EditScreen(
+                container = container,
+                taskId = null,
+                initialIndex = 0,
+                onRecrop = { },
                 onBack = { navController.popBackStack() },
                 onSaved = { questionId ->
                     navController.navigate(Routes.detail(questionId)) {

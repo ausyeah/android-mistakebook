@@ -108,6 +108,8 @@ fun HomeScreen(
      */
     onCropImage: (String) -> Unit,
     onImportPdf: () -> Unit,
+    /** 手动录入：完全不依赖 API，Key 没配 / 识别连不上时的兜底入口。 */
+    onAddManual: () -> Unit,
     onOpenSettings: () -> Unit,
     onOpenPrint: () -> Unit,
     onOpenNotebooks: () -> Unit = {},
@@ -268,7 +270,8 @@ fun HomeScreen(
                 state.questions.isEmpty() && state.totalCount == 0 -> EmptyStateWithActions(
                 onAddByPhoto = onAddByPhoto,
                 onAddFromGallery = { pickFromGallery() },
-                onImportPdf = onImportPdf
+                onImportPdf = onImportPdf,
+                onAddManual = onAddManual
                 )
 
                 state.questions.isEmpty() -> EmptyState(
@@ -352,6 +355,16 @@ fun HomeScreen(
                         onImportPdf()
                     }
                 )
+                // 手动录入：不依赖任何 API，最坏情况下（Key 没配、MinerU 连不上）
+                // 这是唯一还能往错题本里加题的路
+                AddSheetItem(
+                    icon = Icons.Default.Edit,
+                    text = stringResource(R.string.home_add_manual),
+                    onClick = {
+                        showAddSheet = false
+                        onAddManual()
+                    }
+                )
             }
         }
     }
@@ -382,6 +395,7 @@ fun HomeScreen(
             mineruMissing = mineruMissing,
             llmMissing = llmMissing,
             onOpenSettings = onOpenSettings,
+            onManualEntry = onAddManual,
             onDismiss = { showKeyGate = false }
         )
     }
@@ -397,7 +411,8 @@ private fun isDue(question: Question): Boolean {
 private fun EmptyStateWithActions(
     onAddByPhoto: () -> Unit,
     onImportPdf: () -> Unit,
-    onAddFromGallery: () -> Unit
+    onAddFromGallery: () -> Unit,
+    onAddManual: () -> Unit
 ) {
     EmptyState(
         title = stringResource(R.string.home_empty_title),
@@ -417,6 +432,12 @@ private fun EmptyStateWithActions(
                     androidx.compose.material3.TextButton(onClick = onImportPdf) {
                         Text(stringResource(R.string.home_import_pdf))
                     }
+                }
+                Spacer(Modifier.height(4.dp))
+                // 空状态里也留着手动录入：新用户没有题，第一个键还可能没配，
+                // 这时如果只有「拍照/相册/PDF」三条路，他会以为自己用不了
+                androidx.compose.material3.TextButton(onClick = onAddManual) {
+                    Text(stringResource(R.string.home_add_manual))
                 }
             }
         }

@@ -168,6 +168,8 @@ fun CropScreen(
     imagePath: String,
     onConfirmed: (List<Long>) -> Unit,
     onOpenSettings: () -> Unit,
+    /** Key 门禁里的「改用手动录入」出口，见 [ApiKeyRequiredDialog]。 */
+    onManualEntry: () -> Unit,
     onBack: () -> Unit,
     /**
      * 重裁剪模式：录入完成后回来重新框选/旋转原图。
@@ -737,6 +739,7 @@ fun CropScreen(
                 mineruMissing = mineruMissing,
                 llmMissing = llmMissing,
                 onOpenSettings = onOpenSettings,
+                onManualEntry = onManualEntry,
                 onDismiss = { showKeyGate = false }
             )
         }
