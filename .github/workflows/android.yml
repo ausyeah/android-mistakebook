@@ -100,17 +100,25 @@ jobs:
       # 闸门 1：产物必须真的签上名。
       # 没签名的包也能装，但下一次就装不上更新了——这种问题在发版当天发现不了，
       # 要等用户反馈「更新装不上」才发现，所以在这里拦住。
+      #
+      # **必须带 --verbose**：`apksigner verify` 不加它时，校验通过也**不输出**
+      # "Verifies" 这行，只在失败时才输出错误。第一版闸门就是漏了这个参数，
+      # 结果包是签好名的却被自己的闸门拦下，白跑一轮 CI。
+      #
+      # 判据有两层：`apksigner verify` 校验失败时退出码非 0（set -e 直接拦），
+      # 再正向确认确实报出了签名者。
       - name: Verify APK is signed
         run: |
           set -euo pipefail
           APK=app/build/outputs/apk/release/app-release.apk
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$BT/apksigner" verify --print-certs "$APK" | tee /tmp/sig.txt
-          grep -q "Verifies" /tmp/sig.txt || {
-            echo "::error::APK 未通过签名校验，拒绝上传"
+          "$BT/apksigner" verify --verbose --print-certs "$APK" | tee /tmp/sig.txt
+          grep -qE "Number of signers: [1-9]" /tmp/sig.txt || {
+            echo "::error::APK 未报出签名者，拒绝上传"
             exit 1
           }
           echo "签名校验通过"
+          grep -E "certificate SHA-256" /tmp/sig.txt || true
 
       # 闸门 2：产物里绝不能出现 API Key。密钥一旦进过 Release 就等于公开，
       # 必须在上传前拦住，而不是靠人肉检查。
