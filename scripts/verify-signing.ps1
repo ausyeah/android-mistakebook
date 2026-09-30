@@ -34,7 +34,10 @@ $expectedLine = Get-Content $expectedFile -Encoding UTF8 |
     Where-Object { $_ -notmatch '^\s*#' -and $_.Trim() } |
     Select-Object -First 1
 if (-not $expectedLine) { Fail "$expectedFile 里没读到指纹" }
-$expected = ([string]$expectedLine).Trim().ToUpper()
+# 归一化：去掉冒号与空白、转大写。
+# keytool 输出带冒号（EA:AA:5A:...），但 apksigner 输出不带（eaaa5a...）。
+# 两边统一成「无冒号 + 全大写」才比得动——CI 那边也用同一套归一化。
+$expected = (([string]$expectedLine) -replace '[:\s]', '').ToUpper()
 if (-not $expected) { Fail "$expectedFile 里没读到指纹" }
 Write-Host "期望指纹: $expected"
 
@@ -77,7 +80,7 @@ $line = $out | Select-String -Pattern '^\s*SHA256:\s*(\S+)' | Select-Object -Fir
 if (-not $line) {
     Fail "无法从密钥读出证书指纹，keytool 输出：`n$($out -join "`n")"
 }
-$actual = $line.Matches[0].Groups[1].Value.ToUpper()
+$actual = ($line.Matches[0].Groups[1].Value -replace '[:\s]', '').ToUpper()
 Write-Host "实际指纹: $actual"
 
 if ($actual -ne $expected) {

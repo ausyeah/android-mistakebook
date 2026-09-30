@@ -132,16 +132,26 @@ jobs:
       - name: Verify signer matches recorded fingerprint
         run: |
           set -euo pipefail
-          EXPECTED=$(grep -vE '^\s*#' signing/expected-cert-sha256.txt | grep -vE '^\s*$' | head -1 | tr -d '[:space:]' | tr 'a-f' 'A-F')
-          ACTUAL=$(grep -E "certificate SHA-256 digest" /tmp/sig.txt | head -1 | sed 's/.*: //' | tr 'a-f' 'A-F')
+          # **两边都必须归一化成「无冒号 + 全大写」再比。**
+          # 记录的指纹是 keytool 的形式：EA:AA:5A:67:...（95 字符，带冒号）
+          # apksigner 输出的是：eaaa5a67...（64 字符，不带冒号）
+          # 直接字符串比较**永远不相等**，第一版闸门就栽在这——
+          # 包签得完全正确，却被自己的检查拦下、白跑一轮 CI。
+          EXPECTED=$(grep -vE '^[[:space:]]*#' signing/expected-cert-sha256.txt \
+                     | grep -vE '^[[:space:]]*$' | head -1 \
+                     | tr -d '[:space:]:' | tr '[:lower:]' '[:upper:]')
+          ACTUAL=$(grep -E "certificate SHA-256 digest" /tmp/sig.txt | head -1 \
+                   | sed 's/.*:[[:space:]]*//' | tr -d '[:space:]:' | tr '[:lower:]' '[:upper:]')
           if [ -z "$EXPECTED" ] || [ -z "$ACTUAL" ]; then
-            echo "::warning::读不到期望或实际指纹，跳过一致性比对"
+            echo "::warning::读不到期望或实际指纹，跳过一致性比对（期望长度 ${#EXPECTED}，实际长度 ${#ACTUAL}）"
             exit 0
           fi
           if [ "$EXPECTED" != "$ACTUAL" ]; then
             if [ "${GITHUB_REPOSITORY}" = "ausyeah/android-mistakebook" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
               echo "::error::签名证书与 signing/expected-cert-sha256.txt 不一致"
               echo "::error::已安装的用户将无法升级这个 App。请勿发布，先核对发布密钥。"
+              echo "::error::  期望: $EXPECTED"
+              echo "::error::  实际: $ACTUAL"
               exit 1
             fi
             echo "::warning::签名与仓库记录不一致（非维护者仓库，跳过）"
