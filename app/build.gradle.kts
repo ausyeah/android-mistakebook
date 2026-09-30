@@ -51,7 +51,10 @@ android {
         applicationId = "com.mistakebook$appIdSuffix"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
+        // versionCode 必须单调递增，否则手机上已装的同 versionCode 包
+        // 无法被覆盖安装（安装器报「已安装相同版本」），用户就永远拿不到修复版。
+        // 首个 v0.0.1 因设置页无法输入密钥而完全不可用，v0.0.1 重新发布时用 2。
+        versionCode = 2
         // 版本号从 v0.0.1 重新开始。
         // 之前 v0.1.0~v0.1.17 的公开 Release 里带着真实的 API Key（明文躺在 DEX 中），
         // 那批产物与 tag 已全部删除，这个编号视为作废、不再复用。

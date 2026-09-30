@@ -15,6 +15,8 @@ import androidx.security.crypto.MasterKey
 import com.mistakebook.BuildConfig
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
@@ -53,9 +55,29 @@ class SettingsStore(context: Context) {
         encodeDefaults = true
     }
 
-    val settings: Flow<SettingsSnapshot> = appContext.settingsDataStore.data.map { prefs ->
-        snapshot(prefs)
-    }
+    /**
+     * 密文部分的版本号。
+     *
+     * ## 为什么需要它
+     * `settings` 这个 Flow 原本只由 DataStore 驱动，但**密钥类字段存在
+     * EncryptedSharedPreferences 里**。写 SharedPreferences 不会通知 DataStore，
+     * 于是 `setMineruKey()` 写完之后快照永远不会重发：
+     * 受控的 `TextField` 拿到的还是旧值（空串），每敲一个字就被弹回去——
+     * 表现就是「输入框打不进字」。
+     *
+     * 以前这个洞被 buildConfig 预填掩盖了：框里本来就有值，用户从不需要输入。
+     * 公开分发包改成不预填密钥后，它立刻暴露出来。
+     *
+     * 用 `Flow<Long>` 而不是 SharedPreferences.OnSharedPreferenceChangeListener：
+     * 后者拿不到「改动来自哪一次写入」，容易和 combine 出的初始值打架；
+     * 版本号是显式单调递增，语义清楚，也不依赖回调线程。
+     */
+    private val secureVersion = MutableStateFlow(0L)
+
+    val settings: Flow<SettingsSnapshot> = combine(
+        appContext.settingsDataStore.data,
+        secureVersion
+    ) { prefs, _ -> snapshot(prefs) }
 
     suspend fun snapshotNow(): SettingsSnapshot =
         snapshot(appContext.settingsDataStore.data.first())
@@ -107,12 +129,15 @@ class SettingsStore(context: Context) {
         if (stored.none { it.isConfigured() } && seed != null) {
             val merged = stored.filterNot { it == seed } + seed
             Log.i(TAG, "已存接入配置均不可用，注入 buildConfig 预填兜底: ${merged.size} 套")
-            saveProfiles(merged)
+            // 用 writeProfiles 而不是 saveProfiles：这里正在 snapshot() 内部，
+            // 而 snapshot() 又是 secureVersion 的收集者。saveProfiles 会 bump 版本号，
+            // 等于在 combine 的 transform 里自触发重发，绕成活锁。
+            writeProfiles(merged)
             return merged
         }
         if (stored.isNotEmpty()) return stored
         if (seed == null) return emptyList()
-        saveProfiles(listOf(seed))
+        writeProfiles(listOf(seed))
         return listOf(seed)
     }
 
@@ -139,11 +164,24 @@ class SettingsStore(context: Context) {
         ).normalized()
     }
 
-    fun saveProfiles(profiles: List<LlmProfile>) {
+    /**
+     * 只落盘、不通知观察者。
+     *
+     * 供 [loadProfiles] 的自愈播种使用——那条路径运行在 `settings` Flow 的
+     * 收集栈里，此时 bump [secureVersion] 会让上游立刻重发，形成活锁。
+     * 自愈本身已经把结果 `return` 出去了，调用方拿到的就是最新值，
+     * 不需要额外的重发。
+     */
+    private fun writeProfiles(profiles: List<LlmProfile>) {
         val normalized = profiles.map { it.normalized() }
         securePrefs.edit()
             .putString(SECURE_LLM_PROFILES, json.encodeToString(normalized))
             .apply()
+    }
+
+    fun saveProfiles(profiles: List<LlmProfile>) {
+        writeProfiles(profiles)
+        secureVersion.value += 1
     }
 
     suspend fun upsertProfile(profile: LlmProfile) {
@@ -173,6 +211,9 @@ class SettingsStore(context: Context) {
 
     suspend fun setMineruKey(value: String) {
         securePrefs.edit().putString(SECURE_MINERU_KEY, value.trim()).apply()
+        // 密钥写在 SharedPreferences 里，DataStore 不会感知这次写入。
+        // 不 bump 的话设置页的受控输入框会一直显示旧值，用户根本打不进字。
+        secureVersion.value += 1
     }
 
     // ===== MinerU / 识别参数 =====
@@ -237,6 +278,7 @@ class SettingsStore(context: Context) {
 
     fun clearSecrets() {
         securePrefs.edit().clear().apply()
+        secureVersion.value += 1
     }
 
     private fun readSecure(key: String): String = securePrefs.getString(key, "").orEmpty()

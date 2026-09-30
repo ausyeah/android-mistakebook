@@ -29,6 +29,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -85,42 +86,74 @@ private data class CropRect(val left: Float, val top: Float, val right: Float, v
 private enum class Handle { NONE, MOVE, LEFT, RIGHT, TOP, BOTTOM, TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT }
 
 /**
- * 一笔涂鸦，坐标用**归一化图片坐标**（0..1）而不是屏幕像素。
+ * 一笔涂鸦，坐标用**原图归一化坐标**（0..1）而不是屏幕像素。
  *
- * 为什么不存屏幕坐标：旋转 90°、改变裁剪框、手机横竖屏切换之后，
- * 屏幕坐标全部失效，遮罩会跑到别的位置。归一化坐标跟着图片走，
- * 只有「用户主动旋转」这一个事件需要显式变换它。
+ * ## 关键约定：笔迹永远存在「未旋转的原图」坐标系里
+ * 旋转**不会**改写笔迹。屏幕上是哪个朝向，由 [rotationQuarter] 单独决定，
+ * 绘制和保存时再各自把笔迹映射过去。
+ *
+ * 这样做的直接好处：旋转在数学上不可能破坏涂鸦。
+ * 旧实现是「位图每转一次就地替换、笔迹跟着做一次变换」，
+ * 于是每转一次都是一次出错机会——转错了不报错，只是慢慢跑偏，
+ * 而且误差会累积。这套逻辑改了四轮，每轮都在新地方出错。
  */
 internal data class MaskStroke(val points: List<Offset>) {
-    /**
-     * 逆时针旋转 90° 后的新笔画。
-     *
-     * [aspect] 是**旋转前**原图的宽高比 `width / height`。
-     *
-     * ## 为什么必须走像素
-     * 归一化坐标的旋转变换有个反直觉的陷阱：`(x,y) -> (1-y, x)`
-     * 这类「漂亮公式」只对**正方形**成立。照片是 4:3 / 3:4，
-     * 必须「还原成像素 → 变换 → 按新的宽高重新归一化」。
-     *
-     * 逆时针 90°（新宽 = H，新高 = W）：
-     * ```
-     * px = nx * W          py = ny * H
-     * newX_px = py          newY_px = W - px
-     * newX = newX_px / H   newY = newY_px / W
-     * ```
-     *
-     * ## 方向必须和 rotate90() 一致
-     * 位图用 `postRotate(-90f)`（逆时针），这里也必须是逆时针。
-     * 两者不一致 = 遮罩相对图片整体镜像，越转越偏——
-     * 这是「涂鸦容易错位」最隐蔽的一种成因，因为它不报错，只是慢慢跑偏。
-     */
-    fun rotatedCounterClockwise(aspect: Float): MaskStroke = MaskStroke(
-        points.map { (nx, ny) ->
-            val px = nx * aspect      // 旋转前像素 x
-            val py = ny               // ny 已是比例，直接当像素 y 用（分母是 1）
-            // 逆时针 90°：newX = py，newY = W - px；再除以新的宽高
-            Offset(py, 1f - px / aspect)
-        }
+    /** 转到**显示朝向**。只在送往裁剪/预览时调用，屏幕绘制走 [baseToScreen] 同一变换。 */
+    fun rotated(quarters: Int): MaskStroke = MaskStroke(
+        points.map { rotateNormalized(it.x, it.y, quarters) }
+    )
+}
+
+/**
+ * 归一化坐标的**逆时针 90°** 旋转，[quarters] 为圈数（0..3）。
+ *
+ * ## 这个公式为什么对任意宽高比都成立
+ * 归一化坐标里做旋转变换的常见陷阱，是直接套 `(x,y) -> (1-y, x)`：
+ * 那个公式只对**正方形**成立。照片是 4:3 / 3:4，套上去必然错位。
+ *
+ * 推导（原图 W×H，归一化 (nx, ny) 对应像素 (nx·W, ny·H)）：
+ * ```
+ * 逆时针 90°： (x, y) -> (y, W - x)      新尺寸 W'=H, H'=W
+ * newNx = (ny·H) / H' = (ny·H)/H = ny
+ * newNy = (W - nx·W) / W' = W(1-nx)/W = 1 - nx
+ * ```
+ * 宽高比被约掉了，所以结果就是 `(ny, 1-nx)`——与宽高比无关。
+ *
+ * ## 方向必须和 [rotate90] 一致
+ * 位图用 `postRotate(-90f)`（逆时针），这里也必须是逆时针。
+ * 两者不一致 = 遮罩相对图片整体镜像。
+ *
+ * ## 它是群作用
+ * 连用四次回到原点（见 [MASK_ROTATION_PERIOD]），逆变换是 `4 - quarters`。
+ * 屏幕坐标 ↔ 原图坐标的来回换算因此不会累积误差。
+ */
+internal fun rotateNormalized(x: Float, y: Float, quarters: Int): Offset =
+    when (((quarters % 4) + 4) % 4) {
+        1 -> Offset(y, 1f - x)
+        2 -> Offset(1f - x, 1f - y)
+        3 -> Offset(1f - y, x)
+        else -> Offset(x, y)
+    }
+
+/** 旋转一圈（4 次 90°）回到原样。见 [rotateNormalized] 的「它是群作用」。 */
+internal const val MASK_ROTATION_PERIOD = 4
+
+/**
+ * 把 [CropRect] 整体旋转 [quarters] 圈。
+ *
+ * 轴对齐矩形转 90° 之后**仍然是轴对齐的**，所以取四个角变换后的 min/max
+ * 就是精确结果，不需要近似。
+ */
+private fun CropRect.rotatedQuarters(quarters: Int): CropRect {
+    val tl = rotateNormalized(left, top, quarters)
+    val tr = rotateNormalized(right, top, quarters)
+    val br = rotateNormalized(right, bottom, quarters)
+    val bl = rotateNormalized(left, bottom, quarters)
+    return CropRect(
+        left = minOf(tl.x, tr.x, br.x, bl.x),
+        top = minOf(tl.y, tr.y, br.y, bl.y),
+        right = maxOf(tl.x, tr.x, br.x, bl.x),
+        bottom = maxOf(tl.y, tr.y, br.y, bl.y)
     )
 }
 
@@ -147,12 +180,17 @@ fun CropScreen(
     val scope = rememberCoroutineScope()
     // 大图解码必须放 IO 线程，并且显式捕获 OOM：runCatching 会连 OutOfMemoryError 一起吞掉，
     // 让内存问题伪装成「拍照失败」。
-    var bitmap by remember(imagePath) { mutableStateOf<Bitmap?>(null) }
+    //
+    // **decodedBitmap 是「未旋转的原图」，全生命周期只被赋值一次，永不被旋转。**
+    // 屏幕上看到的朝向由 [rotationQuarter] 单独决定。分离这两者是这次重构的全部意义：
+    // 旧实现把位图本身当作旋转状态，每次旋转都新建一张位图并就地替换，
+    // 连带要求笔迹跟着做坐标变换——于是旋转成了会「破坏」涂鸦的操作。
+    var decodedBitmap by remember(imagePath) { mutableStateOf<Bitmap?>(null) }
     var decodeError by remember(imagePath) { mutableStateOf<String?>(null) }
     var decoding by remember(imagePath) { mutableStateOf(true) }
 
     LaunchedEffect(imagePath) {
-        bitmap = null
+        decodedBitmap = null
         decoding = true
         decodeError = null
         val file = File(imagePath)
@@ -180,7 +218,7 @@ fun CropScreen(
                 }
             }
         }
-        bitmap = decoded
+        decodedBitmap = decoded
         decoding = false
         decodeError = when {
             decoded != null -> null
@@ -188,7 +226,7 @@ fun CropScreen(
             else -> context.getString(R.string.crop_decode_oom)
         }
     }
-    var rotationApplied by remember { mutableStateOf(0) }
+    var rotationQuarter by remember { mutableStateOf(0) }
     var rect by remember { mutableStateOf(CropRect.Default) }
     var activeHandle by remember { mutableStateOf(Handle.NONE) }
     var viewport by remember { mutableStateOf(IntSize.Zero) }
@@ -204,20 +242,27 @@ fun CropScreen(
 
     val sessionStore = remember(container) { CropSessionStore(container.settingsStore) }
 
-    // 恢复上次的裁剪框 / 笔迹 / 旋转。
-    // 旋转必须**先应用到位再恢复笔迹**：笔迹存的是归一化坐标，
-    // 旋转会改变图片的实际朝向，先画笔迹再旋转就会错位。
-    // 注意 bitmap 在协程里不能 smart cast（跨挂起点），必须先取局部 val。
-    LaunchedEffect(imagePath, bitmap) {
-        val source = bitmap ?: return@LaunchedEffect
+    /**
+     * 恢复上次的裁剪框 / 笔迹 / 旋转。
+     *
+     * ## 为什么现在这么短
+     * 旧实现是 `LaunchedEffect(imagePath, bitmap)`，body 里会**重放**已保存的旋转
+     * （`repeat(quarters) { rotate90() }`）并写回 `bitmap`。
+     * 两个致命问题叠在一起：
+     *
+     * 1. **自我触发的死循环**——`bitmap` 既是 key 又是被写的状态。每写一次换一次 key、
+     *    effect 重跑一次、再写一次。表现是用户点两下旋转后图片开始「正反跳动」：
+     *    每圈叠了多次旋转，转满 4 次回到原位，看起来像在两个方向之间来回弹。
+     * 2. **误差累积**——每次重放都是一次浮点运算和一次重新解码的位图，
+     *    叠加起来遮罩会相对图片慢慢跑偏。
+     *
+     * 现在位图不再被旋转（见 [rotationQuarter]），笔迹与裁剪框本来就存在
+     * 原图坐标系，所以恢复只是**原样赋值**，没有任何需要重放的东西。
+     */
+    LaunchedEffect(imagePath, decodedBitmap) {
         val session = sessionStore.load(imagePath) ?: return@LaunchedEffect
-        val quarters = ((session.rotationQuarter % 4) + 4) % 4
-        var restored = source
-        repeat(quarters) { restored = rotate90(restored) }
-        if (restored !== source) {
-            bitmap = restored
-            rotationApplied = quarters
-        }
+        rotationQuarter = ((session.rotationQuarter % MASK_ROTATION_PERIOD) + MASK_ROTATION_PERIOD) %
+            MASK_ROTATION_PERIOD
         rect = CropRect(session.left, session.top, session.right, session.bottom)
         strokes = session.strokes.toMaskStrokes()
     }
@@ -226,6 +271,9 @@ fun CropScreen(
     // 始终保证每一步做完都保存状态，然后在此基础上实现下一步编辑」。
     // 只在「松手」「点按钮」这些动作边界保存，不在拖拽过程中保存——
     // 每个 drag event 都写 DataStore 会把 IO 打满。
+    //
+    // 注意存的是**原图坐标系**的 rect / strokes + 圈数，两者都是原样落盘，
+    // 不做任何旋转变换。旋转由 [rotationQuarter] 单独表达。
     suspend fun persistSession() {
         sessionStore.save(
             imagePath,
@@ -234,7 +282,8 @@ fun CropScreen(
                 top = rect.top,
                 right = rect.right,
                 bottom = rect.bottom,
-                rotationQuarter = ((rotationApplied % 4) + 4) % 4,
+                rotationQuarter = ((rotationQuarter % MASK_ROTATION_PERIOD) + MASK_ROTATION_PERIOD) %
+                    MASK_ROTATION_PERIOD,
                 strokes = strokes.toStrokePoints()
             )
         )
@@ -248,7 +297,7 @@ fun CropScreen(
     var previewBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var previewing by remember { mutableStateOf(false) }
 
-    if (decoding || bitmap == null) {
+    if (decoding || decodedBitmap == null) {
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             when {
                 decoding -> Column(
@@ -279,17 +328,61 @@ fun CropScreen(
         return
     }
 
-    val safeBitmap = bitmap ?: return
+    val base = decodedBitmap ?: return
 
-    // 图片在 FILL_CENTER 之外的 FIT 布局下实际占据的区域
-    val imageSize = computeFitSize(safeBitmap.width, safeBitmap.height, viewport)
+    /**
+     * 屏幕上显示的位图 = 原图转 [rotationQuarter] 圈。
+     *
+     * ## 为什么用朝向缓存，而不是每次旋转都新建 + 立刻回收旧的
+     * 「新建即回收旧图」有个致命竞态：用户点旋转时，如果正好有一次
+     * 保存/预览还在 IO 线程上读那张旧位图，回收会让它变成已释放的原生内存，
+     * 直接 native crash——而且是偶发的、极难复现的那种。
+     *
+     * 缓存按圈数存，最多 4 张，且**只有用户真正转到的朝向才会被创建**。
+     * 同一朝向反复旋转（转 4 圈回到原位再转）复用同一张，不产生额外分配。
+     * 回收推迟到离开页面时，那时组合作用域的协程已取消，不会有任务在读。
+     */
+    val rotatedCache = remember(base) { HashMap<Int, Bitmap>() }
+    val displayBitmap = remember(base, rotationQuarter) {
+        val quarters = rotationQuarter
+        rotatedCache.getOrPut(quarters) {
+            var current = base
+            repeat(quarters) { current = rotate90(current) }
+            current
+        }
+    }
+    DisposableEffect(base) {
+        onDispose {
+            // base 本身不归这里管（displayBitmap 在未旋转时就等于 base）
+            rotatedCache.values.forEach { if (it !== base) it.recycle() }
+            rotatedCache.clear()
+        }
+    }
+
+    // 图片在 FIT 布局下实际占据的区域（按**显示朝向**的尺寸算）
+    val imageSize = computeFitSize(displayBitmap.width, displayBitmap.height, viewport)
     val imageLeft = (viewport.width - imageSize.width) / 2f
     val imageTop = (viewport.height - imageSize.height) / 2f
 
-    fun toImageX(x: Float): Float = ((x - imageLeft) / imageSize.width).coerceIn(0f, 1f)
-    fun toImageY(y: Float): Float = ((y - imageTop) / imageSize.height).coerceIn(0f, 1f)
+    /** 屏幕坐标 -> 显示朝向的归一化坐标（0..1） */
+    fun toDisplayX(x: Float): Float = ((x - imageLeft) / imageSize.width).coerceIn(0f, 1f)
+    fun toDisplayY(y: Float): Float = ((y - imageTop) / imageSize.height).coerceIn(0f, 1f)
     fun toScreenX(fraction: Float): Float = imageLeft + fraction * imageSize.width
     fun toScreenY(fraction: Float): Float = imageTop + fraction * imageSize.height
+
+    /** 屏幕坐标 -> **原图**归一化坐标。笔迹与裁剪框都存在这个坐标系里。 */
+    fun screenToBase(x: Float, y: Float): Offset =
+        rotateNormalized(
+            toDisplayX(x),
+            toDisplayY(y),
+            MASK_ROTATION_PERIOD - rotationQuarter
+        )
+
+    /** 原图归一化坐标 -> 屏幕坐标。绘制遮罩与裁剪框时用。 */
+    fun baseToScreen(p: Offset): Offset {
+        val d = rotateNormalized(p.x, p.y, rotationQuarter)
+        return Offset(toScreenX(d.x), toScreenY(d.y))
+    }
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
         Box(
@@ -298,7 +391,7 @@ fun CropScreen(
                 .onSizeChanged { viewport = it }
         ) {
             Image(
-                bitmap = safeBitmap.asImageBitmap(),
+                bitmap = displayBitmap.asImageBitmap(),
                 contentDescription = null,
                 contentScale = ContentScale.Fit,
                 modifier = Modifier.fillMaxSize()
@@ -308,21 +401,21 @@ fun CropScreen(
         Canvas(
             modifier = Modifier
                 .fillMaxSize()
-                // key 用 viewport + 位图：几何换算依赖这两者，且它们只在旋转/布局变化时变，
+                // key 用 viewport + 显示位图：几何换算依赖这两者，且它们只在旋转/布局变化时变，
                 // 拖拽过程中不会重启手势检测器（若把 rect 放进 key，每次拖动都会重建检测器）。
-                .pointerInput(viewport, safeBitmap, maskMode) {
+                .pointerInput(viewport, displayBitmap, maskMode) {
                     detectDragGestures(
                         onDragStart = { offset ->
                             if (maskMode) {
                                 // 涂鸦：每一笔都是新笔画，落笔点同时补一个点，
                                 // 否则单点一下（没拖动）会画出长度为 0 的线段，什么也看不到。
-                                activeStroke = listOf(
-                                    Offset(toImageX(offset.x), toImageY(offset.y))
-                                )
+                                // 屏幕坐标 -> **原图**归一化坐标，笔迹自始至终存在原图坐标系。
+                                activeStroke = listOf(screenToBase(offset.x, offset.y))
                             } else {
                                 activeHandle = pickHandle(
                                     offset = offset,
-                                    rect = rect,
+                                    // 裁剪框存的是原图坐标，命中测试必须在**显示朝向**下做
+                                    rect = rect.rotatedQuarters(rotationQuarter),
                                     toScreenX = ::toScreenX,
                                     toScreenY = ::toScreenY,
                                     slop = touchSlop
@@ -350,23 +443,32 @@ fun CropScreen(
                         onDrag = { change, dragAmount ->
                             change.consume()
                             if (maskMode) {
-                                val point = Offset(
-                                    toImageX(change.position.x),
-                                    toImageY(change.position.y)
-                                )
+                                val point = screenToBase(change.position.x, change.position.y)
                                 val last = activeStroke.lastOrNull()
-                                // 过滤掉几乎没移动的点，否则一笔会塞进上百个点，重绘发烫
-                                if (last == null ||
-                                    abs(last.x - point.x) * imageSize.width > 2f ||
-                                    abs(last.y - point.y) * imageSize.height > 2f
+                                // 过滤掉几乎没移动的点，否则一笔会塞进上百个点，重绘发烫。
+                                // 阈值按**显示尺寸**折算：笔迹存在原图坐标系，
+                                // 但「有没有动」是屏幕上的手感问题。
+                                val lastOnScreen = last?.let { baseToScreen(it) }
+                                if (lastOnScreen == null ||
+                                    abs(lastOnScreen.x - change.position.x) > 2f ||
+                                    abs(lastOnScreen.y - change.position.y) > 2f
                                 ) {
                                     activeStroke = activeStroke + point
                                 }
                             } else {
                                 val dx = dragAmount.x / imageSize.width
                                 val dy = dragAmount.y / imageSize.height
+                                // 拖拽在**显示朝向**下进行（手柄位置是用户看到的），
+                                // 算完再转回原图坐标存起来。
+                                // rotatedQuarters 是自反的：连转两次回到原点。
+                                val displayRect = draggedRect(
+                                    rect.rotatedQuarters(rotationQuarter),
+                                    activeHandle,
+                                    dx,
+                                    dy
+                                )
                                 // 必须产生新实例才能触发重绘
-                                rect = draggedRect(rect, activeHandle, dx, dy)
+                                rect = displayRect.rotatedQuarters(MASK_ROTATION_PERIOD - rotationQuarter)
                             }
                         }
                     )
@@ -378,10 +480,13 @@ fun CropScreen(
                     .filter { it.size >= 2 }
                     .forEach { points ->
                         for (i in 0 until points.size - 1) {
+                            // 笔迹存在原图坐标系，这里映射到显示朝向——
+                            // 与 [buildPreviewBitmap]/[saveCrop] 用的是同一个变换，
+                            // 所以「屏幕上画的」和「涂白在图上的」必然一致。
                             drawLine(
                                 color = Color.White,
-                                start = Offset(toScreenX(points[i].x), toScreenY(points[i].y)),
-                                end = Offset(toScreenX(points[i + 1].x), toScreenY(points[i + 1].y)),
+                                start = baseToScreen(points[i]),
+                                end = baseToScreen(points[i + 1]),
                                 strokeWidth = brushWidthPx,
                                 cap = androidx.compose.ui.graphics.StrokeCap.Round
                             )
@@ -389,10 +494,12 @@ fun CropScreen(
                     }
             }
 
-            val left = toScreenX(rect.left)
-            val top = toScreenY(rect.top)
-            val right = toScreenX(rect.right)
-            val bottom = toScreenY(rect.bottom)
+            // 裁剪框同样存在原图坐标系，显示时转到当前朝向
+            val displayRect = rect.rotatedQuarters(rotationQuarter)
+            val left = toScreenX(displayRect.left)
+            val top = toScreenY(displayRect.top)
+            val right = toScreenX(displayRect.right)
+            val bottom = toScreenY(displayRect.bottom)
 
             // 涂鸦时只画一个淡淡的边框提示选区，不画压暗和手柄——
             // 压暗 60% 会让用户看不清自己正要涂什么，手柄也会干扰落笔
@@ -510,15 +617,14 @@ fun CropScreen(
                             )
                         }
                         TextButton(onClick = {
-                            // 宽高比必须取**旋转前**的图：转完宽高就互换了
-                            val aspect = safeBitmap.width.toFloat() / safeBitmap.height.toFloat()
-                            bitmap = rotate90(safeBitmap)
-                            // 逆时针记为 +1 圈（1 = 逆时针 90°）。
-                            // 位图与笔迹必须同向，否则遮罩相对图片整体镜像、越转越偏
-                            rotationApplied = (rotationApplied + 1) % 4
-                            rect = CropRect.Default
-                            strokes = strokes.map { it.rotatedCounterClockwise(aspect) }
+                            // 旋转现在只是一个整数加一。
+                            // 笔迹和裁剪框存在原图坐标系里，**不需要也不应该**跟着变换——
+                            // 旧实现在这里把笔迹做一次坐标变换，正是「一旋转涂鸦就变」的来源。
+                            rotationQuarter = (rotationQuarter + 1) % MASK_ROTATION_PERIOD
+                            // 裁剪框跟着图一起转（转 90° 仍是轴对齐矩形，min/max 即精确解），
+                            // 不再像以前那样直接重置为默认值——用户辛苦框好的区域不该被一次旋转抹掉。
                             activeStroke = emptyList()
+                            activeHandle = Handle.NONE
                             scope.launch { persistSession() }
                         }) {
                             Text(stringResource(R.string.crop_rotate), color = Color.White)
@@ -527,7 +633,9 @@ fun CropScreen(
                             rect = CropRect.Default
                             strokes = emptyList()
                             activeStroke = emptyList()
-                            // 「重置」是显式清空，也要把清空结果存下来
+                            // 「重置」是显式清空，也要把清空结果存下来。
+                            // 注意**不重置 rotationQuarter**：转正是用户有意做的修正，
+                            // 「重置」针对的是框选和涂鸦，不是把照片转回原样。
                             scope.launch { persistSession() }
                         }) {
                             Text(stringResource(R.string.crop_reset), color = Color.White)
@@ -542,7 +650,10 @@ fun CropScreen(
                                     previewing = true
                                     val preview = withContext(Dispatchers.IO) {
                                         buildPreviewBitmap(
-                                            safeBitmap, rect, strokes, brushWidthPx,
+                                            displayBitmap,
+                                            rect.rotatedQuarters(rotationQuarter),
+                                            strokes.map { it.rotated(rotationQuarter) },
+                                            brushWidthPx,
                                             imageSize.width.toFloat()
                                         )
                                     }
@@ -564,11 +675,15 @@ fun CropScreen(
                     TextButton(onClick = {
                         scope.launch {
                             val committed = strokes
+                            // 转到显示朝向后再裁：这样裁剪框与笔迹的数值
+                            // 和用户眼睛看到的完全对应，也和屏幕上的绘制走同一条路径。
+                            val cropRect = rect.rotatedQuarters(rotationQuarter)
+                            val cropStrokes = committed.map { it.rotated(rotationQuarter) }
                             // 重裁剪：只存图回填，不提交识别、也不需要 API Key
                             if (recropOnly) {
                                 val saved = withContext(Dispatchers.IO) {
                                     saveCrop(
-                                        safeBitmap, rect, container, committed,
+                                        displayBitmap, cropRect, container, cropStrokes,
                                         brushWidthPx, imageSize.width.toFloat()
                                     )
                                 }
@@ -591,7 +706,7 @@ fun CropScreen(
 
                             val saved = withContext(Dispatchers.IO) {
                                 saveCrop(
-                                    safeBitmap, rect, container, committed,
+                                    displayBitmap, cropRect, container, cropStrokes,
                                     brushWidthPx, imageSize.width.toFloat()
                                 )
                             }
