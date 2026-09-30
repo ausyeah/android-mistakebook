@@ -18,6 +18,16 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
+import androidx.compose.foundation.layout.offset
+import androidx.compose.material.icons.filled.Delete
+import kotlin.math.roundToInt
+import com.mistakebook.ui.theme.DeleteReveal
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
@@ -46,12 +56,9 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.SnackbarResult
-import androidx.compose.material3.SwipeToDismissBox
-import androidx.compose.material3.SwipeToDismissBoxValue
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.rememberModalBottomSheetState
-import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -67,6 +74,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.mistakebook.R
 import com.mistakebook.data.local.displayTitle
@@ -472,6 +481,32 @@ private fun AddSheetItem(
     }
 }
 
+/**
+ * 划开删除：滑动只**露出删除按钮**，真删要点一下。
+ *
+ *
+ * 也就是**划一下立即删除**。实测太容易误触：列表滑动时手一抖就删掉一道题，
+ * 只能靠撤销救回来。用户反馈「删除太容易误触」。
+ *
+ * ## 交互
+ *
+ * 1. 左滑 → 露出深红色色块 + 垃圾桶图标，**卡片停在那里不收回**
+ * 2. 再点一下垃圾桶 → 才真删，Snackbar「撤销」保留
+ * 3. 点卡片其余部分 → 收回色块，不进详情
+ *
+ * ## 为什么不再用 SwipeToDismissBox
+ *
+ * 原来用 SwipeToDismissBox，在 confirmValueChange 里直接调 onDelete()，
+ * 也就是**划一下立即删除**。实测太容易误触：列表滑动时手一抖就删掉一道题，
+ * 只能靠撤销救回来。
+ * ## 为什么第 1 步必须「停住」
+ *
+ * 如果松手就回弹，用户根本没机会点垃圾桶——手势还在进行中是不能点击的。
+ * 所以滑到位就吸附展开，把「删除」变成一次**独立的、看得见的**点击。
+ *
+ * 安全边界因此从「会不会误划」转移到「会不会误点」：
+ * 后者需要一次明确的点击，而不是一次滑动。
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SwipeableQuestionCard(
@@ -481,41 +516,100 @@ private fun SwipeableQuestionCard(
     onClick: () -> Unit,
     onDelete: () -> Unit
 ) {
-    val dismissState = rememberSwipeToDismissBoxState(
-        confirmValueChange = { value ->
-            if (value == SwipeToDismissBoxValue.EndToStart) {
-                onDelete()
-                true
-            } else {
-                false
-            }
+    val scope = rememberCoroutineScope()
+    val density = LocalDensity.current
+    val revealWidthPx = with(density) { SwipeDeleteRevealWidth.toPx() }
+
+    val offsetX = remember { Animatable(0f) }
+    // 「是否已划开」是**离散状态**，只在松手时翻转。
+    //
+    // 早先写成 `val isRevealed = offsetX.value <= ...`，那是在组合期读 Animatable，
+    // 滑动时**每帧都会重组**一次。列表里几十张卡同时在手势里，就是几十次重组/帧。
+    // 位移本身走 `Modifier.offset { }`（只跑布局阶段，不重组），这是正确写法。
+    var revealed by remember { mutableStateOf(false) }
+
+    val dragState = rememberDraggableState { delta ->
+        scope.launch {
+            offsetX.snapTo((offsetX.value + delta).coerceIn(-revealWidthPx, 0f))
         }
-    )
-    SwipeToDismissBox(
-        state = dismissState,
-        backgroundContent = {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .clip(MaterialTheme.shapes.medium)
-                    .background(Danger.copy(alpha = 0.12f))
-                    .padding(horizontal = 20.dp),
-                contentAlignment = Alignment.CenterEnd
+    }
+
+    fun close() {
+        revealed = false
+        scope.launch { offsetX.animateTo(0f) }
+    }
+
+    Box(
+        modifier = Modifier
+            .clip(MaterialTheme.shapes.medium)
+            .background(DeleteReveal)
+    ) {
+        // 底层：删除区。滑开前完全被卡片盖住。
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(end = 20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            IconButton(
+                // 滑开前点不到这里（被卡片挡住），但显式禁用更保险：
+                // 万一将来层级调整，也不会变成「随手一点就删」。
+                enabled = revealed,
+                onClick = {
+                    close()
+                    onDelete()
+                }
             ) {
-                Text(
-                    text = stringResource(R.string.action_delete),
-                    color = Danger,
-                    style = MaterialTheme.typography.labelLarge
+                Icon(
+                    imageVector = Icons.Default.Delete,
+                    contentDescription = stringResource(R.string.swipe_delete_action),
+                    tint = Color.White
                 )
             }
+            Text(
+                text = stringResource(R.string.swipe_delete_hint),
+                color = Color.White.copy(alpha = 0.85f),
+                style = MaterialTheme.typography.labelSmall
+            )
         }
-    ) {
-        QuestionCard(
-            question = question,
-            subjectName = subjectName,
-            dueToday = dueToday,
-            onClick = onClick
-        )
+
+        // 上层：卡片，跟随手势位移
+        Box(
+            modifier = Modifier
+                .offset { IntOffset(offsetX.value.roundToInt(), 0) }
+                .draggable(
+                    state = dragState,
+                    orientation = Orientation.Horizontal,
+                    onDragStopped = {
+                        val opened = offsetX.value < -revealWidthPx * 0.35f
+                        revealed = opened
+                        scope.launch {
+                            offsetX.animateTo(
+                                targetValue = if (opened) -revealWidthPx else 0f,
+                                animationSpec = spring(
+                                    dampingRatio = Spring.DampingRatioMediumBouncy,
+                                    stiffness = Spring.StiffnessMediumLow
+                                )
+                            )
+                        }
+                    }
+                )
+        ) {
+            QuestionCard(
+                question = question,
+                subjectName = subjectName,
+                dueToday = dueToday,
+                onClick = {
+                    // 已划开时先收回，不进详情——否则「想点垃圾桶」会变成「打开题目」
+                    if (revealed) {
+                        close()
+                    } else {
+                        onClick()
+                    }
+                }
+            )
+        }
     }
 }
 
@@ -756,3 +850,11 @@ private fun NotebookDropdown(
         }
     }
 }
+
+/**
+ * 划开删除时露出的宽度。
+ *
+ * 要放得下垃圾桶图标（24dp）+ 一行小字 + 左右留白，88dp 是个舒服的值：
+ * 拇指能点中，又不至于把整张卡都推走（推太多用户会失去「这是同一张卡」的感觉）。
+ */
+private val SwipeDeleteRevealWidth = 88.dp
