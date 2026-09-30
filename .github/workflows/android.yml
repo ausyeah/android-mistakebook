@@ -120,6 +120,37 @@ jobs:
           echo "签名校验通过"
           grep -E "certificate SHA-256" /tmp/sig.txt || true
 
+      # 闸门 2：签名要和仓库记录的那份一致。
+      #
+      # ## 为什么 CI 也要查
+      # 「包能装上」和「下次能升级」是两件事。密钥一旦被误换，
+      # 这一轮的包照样装得上、跑得动，问题要到用户点更新时才会暴露。
+      # 在这里拦住，比发出去之后再撤回便宜得多。
+      #
+      # fork 用户的密钥当然和本仓库记录的不一致，所以只在
+      # 维护者的 main 分支上强制；其它情况降级为提示。
+      - name: Verify signer matches recorded fingerprint
+        run: |
+          set -euo pipefail
+          EXPECTED=$(grep -vE '^\s*#' signing/expected-cert-sha256.txt | grep -vE '^\s*$' | head -1 | tr -d '[:space:]' | tr 'a-f' 'A-F')
+          ACTUAL=$(grep -E "certificate SHA-256 digest" /tmp/sig.txt | head -1 | sed 's/.*: //' | tr 'a-f' 'A-F')
+          if [ -z "$EXPECTED" ] || [ -z "$ACTUAL" ]; then
+            echo "::warning::读不到期望或实际指纹，跳过一致性比对"
+            exit 0
+          fi
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            if [ "${GITHUB_REPOSITORY}" = "ausyeah/android-mistakebook" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+              echo "::error::签名证书与 signing/expected-cert-sha256.txt 不一致"
+              echo "::error::已安装的用户将无法升级这个 App。请勿发布，先核对发布密钥。"
+              exit 1
+            fi
+            echo "::warning::签名与仓库记录不一致（非维护者仓库，跳过）"
+            echo "  期望: $EXPECTED"
+            echo "  实际: $ACTUAL"
+            exit 0
+          fi
+          echo "签名证书与仓库记录一致: $ACTUAL"
+
       # 闸门 2：产物里绝不能出现 API Key。密钥一旦进过 Release 就等于公开，
       # 必须在上传前拦住，而不是靠人肉检查。
       - name: Verify no secrets in APK

@@ -39,6 +39,11 @@
 ## 二、发版流程
 
 ```powershell
+# 0. 【发版前必做】核对签名指纹
+#    密钥一旦被误换，已安装的用户就再也升不了级，而这个问题
+#    在发版当天是发现不了的：包能装、能跑，只是下一次装不上。
+powershell -ExecutionPolicy Bypass -File scripts\verify-signing.ps1
+
 # 1. 本地构建通过（release 走固定签名，与 CI 同一个密钥）
 .\gradlew --no-daemon --offline assembleRelease
 
@@ -46,8 +51,8 @@
 powershell -ExecutionPolicy Bypass -File scripts\sync.ps1 -Message "..."
 
 # 3. 等 CI 绿了再打 tag
-git tag v0.0.1
-git push ssh://git@ssh.github.com:443/ausyeah/android-mistakebook.git v0.0.1
+git tag v0.0.2
+git push ssh://git@ssh.github.com:443/ausyeah/android-mistakebook.git v0.0.2
 
 # 4. 轮询 Release 产物
 ```
@@ -92,13 +97,37 @@ keystore 用完即弃，每次构建签名都不一样**。结果不是「装不
 - 对应的口令与 alias
 
 ⚠️ **务必离线备份一份**。GitHub Secrets 里的副本虽然够用来继续发版，
-但 Secrets 一旦丢失、或仓库被误删，就再也找不回来了——
+但 Secrets 一旦丢失、或仓库被误删除，就再也找不回来了——
 而签名密钥无法「重置」，那个应用 ID 只能作废重来。
 
-### 首次切换的代价
+### 「签名一致」是靠检查保证的，不是靠记性
+
+三道闸门，任何一道都能拦住密钥被误换：
+
+| 位置 | 检查 | 不一致时 |
+|---|---|---|
+| 发版前（本地） | `scripts\verify-signing.ps1` 对比 `signing\expected-cert-sha256.txt` | 退出码非 0，打印排查指引 |
+| CI 构建中 | `Verify APK is signed`（只验证有签名） | 构建失败 |
+| CI 构建中 | `Verify signer matches recorded fingerprint` | **在维护者的 main 分支上构建失败**；fork 降级为 warning |
+
+证书指纹记在 `signing/expected-cert-sha256.txt`。它是公开信息
+（每个 APK 里都印着），写进仓库没有安全顾虑。
+
+> 改这个文件是**重大操作**，只在两种情况下改：
+> 首次建立发布签名，或确认旧密钥彻底丢失且已接受「所有用户必须重装」
+> ——后者还应当一并改 `applicationId`，避免新旧包互相覆盖出错。
+
+### 首次切换到发布签名的代价
 
 从 debug 签名切到发布签名，**第一次必须卸载**（签名变了）。
 用户手机里现有数据靠 App 内「数据管理 → 备份」导出 zip 再恢复。
+
+从 v0.0.2 起，往后每次都是普通覆盖升级。
+
+### 关于 R8
+
+`release` 的 `isMinifyEnabled` 目前是 `false`——原因与验证方法见
+[第九节](#九还没做的)。
 
 ## 四、版本号规则
 
