@@ -40,6 +40,36 @@ val prefillKeys = (project.findProperty("prefillKeys") as String?)?.toBoolean() 
 /** 公开分发时注入的占位符。用户看到它就知道要自己去设置里填。 */
 val KEY_PLACEHOLDER = "REPLACE_IN_SETTINGS"
 
+/**
+ * 发布签名配置来源：根目录 `keystore.properties`（已在 .gitignore）。
+ *
+ * ## 为什么必须有这个
+ * 每个 APK 都要有数字签名，Android 用它识别「这个 app 是谁写的」，
+ * 并且**拒绝安装签名不一致的更新**——这是防替换的安全机制。
+ *
+ * 之前 CI 出的是 `assembleDebug`，用的是 runner 上自动生成的
+ * `~/.android/debug.keystore`。GitHub runner 是一次性 VM，
+ * keystore 用完即弃，**每次构建出来的包签名都不一样**。
+ * 结果就是：每个版本都只能卸载重装，手机里的数据一起没。
+ * 这不是「装不上」，是**永远装不上更新**。
+ *
+ * 现在改成一个固定的发布密钥：本地与 CI 共用同一份 `keystore.properties`，
+ * CI 从 Secrets 里把 keystore 还原出来再用。
+ * 从此 `adb install -r` 一直有效。
+ *
+ * 文件缺失时不报错，只是不给 release 配签名——
+ * 这样 clone 仓库的人 `assembleDebug` 照样能跑，不会被别人的密钥卡住。
+ */
+val keystorePropsFile = rootProject.file("keystore.properties")
+val keystoreProps = Properties().apply {
+    if (keystorePropsFile.exists()) {
+        keystorePropsFile.inputStream().use { load(it) }
+    }
+}
+val releaseStoreFile = keystoreProps.getProperty("storeFile")?.takeIf { it.isNotBlank() }
+    ?.let { file(it) }
+    ?.takeIf { it.exists() }
+
 android {
     namespace = "com.mistakebook"
     compileSdk = 35
@@ -60,6 +90,17 @@ android {
         // 那批产物与 tag 已全部删除，这个编号视为作废、不再复用。
         versionName = "0.0.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    signingConfigs {
+        if (releaseStoreFile != null) {
+            create("release") {
+                storeFile = releaseStoreFile
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
     }
 
     buildTypes {
@@ -86,17 +127,33 @@ android {
             )
         }
         release {
-            // 正式打包的 APK 一律为空，使用者必须自行填写，即使 local.properties 有值也不注入
-            isMinifyEnabled = true
-            isShrinkResources = true
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
-            )
+            // 用上面那个固定密钥签名；没配置 keystore.properties 时保持未签名，
+            // 这样 clone 仓库的人不会因为拿不到密钥而构建失败。
+            signingConfigs.findByName("release")?.let { signingConfig = it }
+
+            // 正式打包的 APK 一律不含密钥，使用者必须自行填写，
+            // 即使 local.properties 有值也不注入。
+            // 空串会被 BuildConfigKeys.isPlaceholder() 判成「未配置」，
+            // 不需要占位符——公开包里连这个字符串都不该出现。
             buildConfigField("String", "MINERU_API_KEY", "\"\"")
             buildConfigField("String", "LLM_API_KEY", "\"\"")
             buildConfigField("String", "LLM_BASE_URL", "\"https://api.deepseek.com\"")
             buildConfigField("String", "LLM_MODEL", "\"deepseek-chat\"")
+
+            // **R8 暂时关闭。**
+            //
+            // 混淆会剥掉 kotlinx.serialization / Retrofit 依赖的反射信息，
+            // 序列化在运行时会静默失败（编译期完全正常，运行时才炸），
+            // 而这种问题只有真机能发现。proguard-rules.pro 里已经有对应 keep 规则，
+            // 但**尚未在真机验证过**。
+            //
+            // 当前用户的手机只承受得起一次卸载（数据靠 App 内备份恢复，
+            // 而 API Key 已失效、无法重新识别题目）。万一混淆出问题，
+            // 修复还需要再卸载一次，代价太大。
+            // 所以先关掉，拿到「稳定签名 + debuggable=false」两个确定收益；
+            // 真机验证过之后再打开。
+            isMinifyEnabled = false
+            isShrinkResources = false
         }
     }
 

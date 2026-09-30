@@ -86,22 +86,33 @@
 - **使用者**：安装后进设置页填 MinerU API Key 与大模型接入配置。
   Key 只存本机 `EncryptedSharedPreferences`，不进日志、不随应用上传。
 - **本地开发者**：`local.properties` 放真实 Key（已在 `.gitignore`），
-  模板见 `local.properties.template`。本地构建（默认）会预填进 APK 省去手填。
-- **公开分发**：用 `-PprefillKeys=false` 构建，注入占位符而非真实 Key。
-  CI 固定使用该参数，并在上传前扫描 APK 拦截疑似密钥。
+  模板见 `local.properties.template`。`debug` 构建会预填进 APK 省去手填。
+- **公开分发**：CI 走 `assembleRelease`，`BuildConfig` 里密钥字段恒为空串，
+  并在上传前扫描 APK 拦截疑似密钥。
 
 **大模型接入以设置页为准**：任何 OpenAI 兼容服务都只需改 Base URL / Key / 模型，
 或切换已保存的多套配置。
 
 ## CI 打包
 
-`.github/workflows/android.yml` 推送即触发。**不读取任何 Secrets**，
-只生成不含密钥的 `local.properties`，以 `-PprefillKeys=false` 编译 `assembleDebug`，
-跑单元测试，**再扫描 APK 内所有 dex 拦截疑似密钥**，最后产物命名为
-`mistakebook-<分支或tag>-android.apk`：
+`.github/workflows/android.yml` 推送即触发。流水线：
+
+1. 从 Secrets 还原**发布签名密钥**（仓库里永远没有密钥文件本体）
+2. 编译 `assembleRelease` —— 固定签名，`debuggable=false`，APK 内不含任何密钥
+3. **校验签名** —— 没签名的包也能装，但下一次就装不上更新了
+4. 跑单元测试
+5. **扫描 APK 内所有 dex 拦截疑似密钥**
+
+产物命名为 `mistakebook-<分支或tag>-android.apk`：
 
 - push 到 `main` → 产物在 Actions 运行页（Artifacts）下载
 - push `v*` tag → 自动创建 Release 并附带 APK
+
+> **为什么必须是固定签名**：Android 拒绝安装签名不一致的更新。
+> 早期用 `assembleDebug` 出包，而 GitHub runner 是一次性 VM、
+> debug keystore 用完即弃，**每次构建签名都不同**——
+> 结果是每个版本都只能卸载重装，手机里的数据一起丢。
+> 换成固定发布密钥后，`adb install -r` 一直有效。
 
 发版流程与检查清单见 [`docs/RELEASE.md`](docs/RELEASE.md)。
 
