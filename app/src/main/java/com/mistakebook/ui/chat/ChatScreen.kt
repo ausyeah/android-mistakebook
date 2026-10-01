@@ -160,15 +160,19 @@ fun ChatScreen(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri -> uri?.let(viewModel::onAttachmentPicked) }
 
-    // 首次进入题目会话时预填首问，**不自动发送**
-    LaunchedEffect(state.sessionId) {
-        if (state.sessionId != 0L && state.messages.isEmpty() && questionId != null) {
+    // 首次进入题目会话时预填首问，**不自动发送**。
+    //
+    // 必须同时等 !loading：早先只判 state.messages.isEmpty()，
+    // 而 Flow 还没吐出第一帧时 messages 同样是空的——
+    // 于是**打开一个已有对话时也会弹出一段预填草稿**，
+    // 用户以为自己之前打的字没了。
+    LaunchedEffect(state.sessionId, state.loading) {
+        if (state.sessionId != 0L && !state.loading && state.messages.isEmpty() && questionId != null) {
             viewModel.onInputChange(ChatViewModel.PREFILL_QUESTION)
         }
     }
 
     LaunchedEffect(state.needsApiKey) { if (state.needsApiKey) showKeyGate = true }
-    LaunchedEffect(state.truncated) { if (state.truncated) showKeyGate = false }
 
     LaunchedEffect(Unit) {
         viewModel.events.collect { event ->
