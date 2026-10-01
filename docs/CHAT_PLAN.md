@@ -51,13 +51,13 @@
 | 步骤 | 内容 | 状态 |
 |---|---|---|
 | 1 | 数据层：三实体 + DAO + 转换器 + `MIGRATION_2_3` | ✅ 完成（CI #77 绿） |
-| 2 | 仓储层 `ChatRepository` + 上下文组装 | ⬜ |
-| 3 | 流式客户端 `ChatCompletionStream`（SSE + 降级） | ⬜ |
-| 4 | `ChatViewModel` / `ChatListViewModel`（单一 StateFlow） | ⬜ |
-| 5 | 附件管线（选文件 → 私有目录 → 图片压缩 / 文本抽取） | ⬜ |
-| 6 | 对话页 `ChatScreen`（消息流 / 输入区 / 停止 / 重试 / 复制） | ⬜ |
-| 7 | 滚动跟随 `AutoScrollCoordinator` | ⬜ |
-| 8 | 会话列表页 + 两处入口接线 | ⬜ |
+| 2 | 仓储层 `ChatRepository` + 上下文组装 | ✅ 完成 |
+| 3 | 流式客户端 `ChatCompletionStream`（SSE + 降级） | ✅ 完成 |
+| 4 | `ChatViewModel` / `ChatListViewModel`（单一 StateFlow） | ✅ 完成 |
+| 5 | 附件管线（选文件 → 私有目录 → 图片压缩 / 文本抽取） | ✅ 完成（预览图未做） |
+| 6 | 对话页 `ChatScreen`（消息流 / 输入区 / 停止 / 重试 / 复制） | ✅ 完成 |
+| 7 | 滚动跟随 `AutoScrollCoordinator` | ✅ 完成 |
+| 8 | 会话列表页 + 两处入口接线 | ✅ 完成 |
 
 ---
 

@@ -29,7 +29,8 @@ import com.mistakebook.domain.AttachmentStatus
  *
  * - [sizeBytes]：文件字节数，用于「附件 3.2 MB」这类展示与超限判断
  * - [widthPx] / [heightPx]：只有图片有值；压缩时按长边限制算出，用于占位与展示
- * - [textExcerpt]：**抽出来的纯文本**，只截前若干字符（见 [MAX_EXCERPT_CHARS]），
+ * - [textExcerpt]：**抽出来的纯文本**，只截前若干字符
+ *   （见 [com.mistakebook.data.chat.ChatAttachmentPreparer.MAX_EXCERPT_CHARS]），
  *   不塞进数据库全文——长文档全文入库既膨胀又超 prompt 预算
  * - [extractedChars]：实际抽了多少字符，用于「已提取 12000 字」这类反馈
  */
@@ -62,21 +63,10 @@ data class ChatAttachment(
     val sizeBytes: Long = 0,
     val widthPx: Int = 0,
     val heightPx: Int = 0,
-    /** 抽出来的纯文本**摘要**（截断后），不进数据库全文。 */
+    /** 抽出来的纯文本**摘要**（已截断），不进数据库全文。截断长度见 [ChatAttachmentPreparer.MAX_EXCERPT_CHARS]。 */
     val textExcerpt: String = "",
     /** 实际抽取字符数，供 UI 反馈「已提取 N 字」。 */
     val extractedChars: Int = 0,
     val errorMessage: String? = null,
     val createdAt: Long
-) {
-    companion object {
-        /**
-         * 抽文本最多保留多少字符入库。
-         *
-         * 取 2000 是权衡：够模型看清文档在讲什么，
-         * 又不会让一条附件消息就把上下文预算吃掉大半
-         * （总预算是 8000 字符，见上下文组装）。
-         */
-        const val MAX_EXCERPT_CHARS = 2000
-    }
-}
+)

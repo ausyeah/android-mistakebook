@@ -66,10 +66,16 @@ class ChatRepository(
      *
      * 「每题一个固定会话」就靠这里。复用已存在的，**包括已有消息的**——
      * 用户上次聊到一半，这次接着聊，而不是每次进来都是空白。
+     *
+     * @param questionId null 表示自由会话。此时会**复用最近一个空会话**：
+     *   会话列表点「新对话」如果先建一个、聊天页又建一个，
+     *   就会留下一堆永远空着的孤儿会话，点几次攒几个。
      */
     suspend fun sessionForQuestion(questionId: Long?): ChatSession {
         if (questionId != null) {
             chatDao.findSessionByQuestion(questionId)?.let { return it }
+        } else {
+            chatDao.findEmptyFreeSession()?.let { return it }
         }
         val now = System.currentTimeMillis()
         val id = chatDao.insertSession(
@@ -81,14 +87,6 @@ class ChatRepository(
             )
         )
         return ChatSession(id = id, questionId = questionId, createdAt = now, updatedAt = now)
-    }
-
-    suspend fun newFreeSession(): ChatSession {
-        val now = System.currentTimeMillis()
-        val id = chatDao.insertSession(
-            ChatSession(questionId = null, title = "", createdAt = now, updatedAt = now)
-        )
-        return ChatSession(id = id, questionId = null, createdAt = now, updatedAt = now)
     }
 
     /** 重命名。改完**锁定自动标题**，否则下次进会话会被首条消息摘要冲掉。 */
@@ -233,9 +231,8 @@ class ChatRepository(
         message.attachmentIds().forEach { attachmentId ->
             chatDao.findAttachment(attachmentId)?.let { deleteAttachmentFile(it) }
         }
-        // 附件记录靠外键 CASCADE 清掉；这里显式调一次是为了顺带删文件。
-        chatDao.deleteAttachmentsOf(id)
-        chatDao.markStatus(id, MessageStatus.CANCELED, null, System.currentTimeMillis())
+        // 附件记录靠外键 CASCADE 清掉
+        chatDao.deleteMessage(id)
         chatDao.refreshSessionStats(message.sessionId, System.currentTimeMillis())
     }
 
@@ -245,6 +242,52 @@ class ChatRepository(
         chatDao.observeAttachments(messageId)
 
     suspend fun insertAttachment(attachment: ChatAttachment): Long = chatDao.insertAttachment(attachment)
+
+    /**
+     * 把已准备好的附件落到某条消息上。
+     *
+     * **必须在消息建好之后调**——`chat_attachments.messageId` 是外键指向 `chat_messages`，
+     * 消息还不存在时插入会直接撞约束失败。
+     *
+     * @return 落库后的附件 id，供 [setAttachmentIds] 回写到消息上。
+     */
+    suspend fun attachPrepared(
+        messageId: Long,
+        sessionId: Long,
+        items: List<com.mistakebook.data.chat.PreparedAttachment>
+    ): List<Long> {
+        val now = System.currentTimeMillis()
+        return items.map { prepared ->
+            chatDao.insertAttachment(
+                ChatAttachment(
+                    messageId = messageId,
+                    sessionId = sessionId,
+                    kind = prepared.kind,
+                    localPath = prepared.localPath,
+                    fileName = prepared.fileName,
+                    mimeType = prepared.mimeType,
+                    status = com.mistakebook.domain.AttachmentStatus.READY,
+                    sizeBytes = prepared.sizeBytes,
+                    widthPx = prepared.widthPx,
+                    heightPx = prepared.heightPx,
+                    textExcerpt = prepared.textExcerpt,
+                    extractedChars = prepared.extractedChars,
+                    createdAt = now
+                )
+            )
+        }
+    }
+
+    /** 回写消息上的附件 id 列表。 */
+    suspend fun setAttachmentIds(messageId: Long, ids: List<Long>) {
+        val message = chatDao.findMessage(messageId) ?: return
+        chatDao.updateMessage(
+            message.copy(
+                attachmentIdsJson = json.encodeToString(ListSerializer(Long.serializer()), ids),
+                updatedAt = System.currentTimeMillis()
+            )
+        )
+    }
 
     suspend fun updateAttachment(attachment: ChatAttachment) = chatDao.updateAttachment(attachment)
 

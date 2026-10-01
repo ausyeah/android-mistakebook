@@ -2,12 +2,16 @@ package com.mistakebook.ui.chat
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.mistakebook.data.chat.ChatAttachmentPreparer
 import com.mistakebook.data.chat.OutgoingMessage
+import com.mistakebook.data.chat.PreparedAttachment
 import com.mistakebook.data.local.entities.ChatAttachment
 import com.mistakebook.data.local.entities.ChatMessage
 import com.mistakebook.data.prefs.LlmProfile
 import com.mistakebook.data.prefs.SettingsStore
 import com.mistakebook.data.repos.ChatRepository
+import com.mistakebook.domain.AttachmentKind
+import com.mistakebook.domain.AttachmentStatus
 import com.mistakebook.domain.ChatRole
 import com.mistakebook.domain.MessageStatus
 import com.mistakebook.net.ApiErrorKind
@@ -34,6 +38,26 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonPrimitive
 
 /**
+ * 还没发送的附件。
+ *
+ * **不是 Room 实体**：实体的 `messageId` 是非空外键，而用户是**先选附件、后发消息**
+ * ——选的那一刻消息还不存在，插进去会撞外键约束。
+ * 所以准备阶段只在内存里，发送时才由仓储落库。
+ *
+ * @param id 本地自增，仅供 UI 区分与删除。
+ */
+data class PendingAttachment(
+    val id: Long,
+    val fileName: String,
+    val kind: AttachmentKind,
+    val status: AttachmentStatus,
+    val sizeBytes: Long = 0,
+    val extractedChars: Int = 0,
+    val errorMessage: String? = null,
+    val prepared: PreparedAttachment? = null
+)
+
+/**
  * 对话页状态。**单一 StateFlow**（项目规则 5）。
  *
  * 一次性事件（错误提示、已复制等）走 [ChatViewModel.events]，不塞进这里——
@@ -50,7 +74,7 @@ data class ChatUiState(
     val input: String = "",
 
     /** 还没发送的待发附件。 */
-    val pendingAttachments: List<ChatAttachment> = emptyList(),
+    val pendingAttachments: List<PendingAttachment> = emptyList(),
 
     val isStreaming: Boolean = false,
 
@@ -90,6 +114,7 @@ class ChatViewModel(
     private val repository: ChatRepository,
     private val stream: ChatCompletionStream,
     private val settingsStore: SettingsStore,
+    private val preparer: ChatAttachmentPreparer,
     private val questionId: Long?
 ) : ViewModel() {
 
@@ -103,6 +128,9 @@ class ChatViewModel(
     private val partSerializer = ListSerializer(ChatContentPart.serializer())
 
     private var streamJob: Job? = null
+
+    /** 待发附件的本地自增 id。 */
+    private var attachmentSeq = 0L
 
     init {
         viewModelScope.launch {
@@ -138,7 +166,9 @@ class ChatViewModel(
         val current = _state.value
         if (current.isStreaming || current.loading) return
         val text = current.input.trim()
-        if (text.isEmpty() && current.pendingAttachments.isEmpty()) return
+        // 还在准备中的附件不算数：用户可能刚点发送就点附件
+        val ready = current.pendingAttachments.filter { it.status == AttachmentStatus.READY }
+        if (text.isEmpty() && ready.isEmpty()) return
 
         viewModelScope.launch {
             val profile = settingsStore.settings.first().activeProfile
@@ -146,13 +176,13 @@ class ChatViewModel(
                 _state.value = _state.value.copy(needsApiKey = true)
                 return@launch
             }
-            val attachmentIds = _state.value.pendingAttachments.map { it.id }
+            // 处理失败的附件就地丢弃，不要让整条消息发不出去
             _state.value = _state.value.copy(
                 input = "",
                 pendingAttachments = emptyList(),
                 truncated = false
             )
-            runOnce(profile, text, attachmentIds, isRetry = false)
+            runOnce(profile, text, ready.mapNotNull { it.prepared }, isRetry = false)
         }
     }
 
@@ -175,7 +205,7 @@ class ChatViewModel(
                 return@launch
             }
             repository.deleteMessage(failed.id)
-            runOnce(profile, lastUser.content, lastUser.attachmentIds(), isRetry = true)
+            runOnce(profile, lastUser.content, emptyList(), isRetry = true)
         }
     }
 
@@ -186,14 +216,20 @@ class ChatViewModel(
     private suspend fun runOnce(
         profile: LlmProfile,
         text: String,
-        attachmentIds: List<Long>,
+        attachments: List<PreparedAttachment>,
         isRetry: Boolean
     ) {
         val sessionId = _state.value.sessionId
         if (sessionId == 0L) return
 
         if (!isRetry) {
-            repository.insertUserMessage(sessionId, text, attachmentIds, questionId)
+            val message = repository.insertUserMessage(sessionId, text, emptyList(), questionId)
+            // 附件必须在消息建好之后才能插（外键指向它），
+            // 插完再把 id 列表回写到消息上
+            if (attachments.isNotEmpty()) {
+                val ids = repository.attachPrepared(message.id, sessionId, attachments)
+                repository.setAttachmentIds(message.id, ids)
+            }
         }
         val context = repository.buildContext(sessionId, questionId)
         val assistantId = repository.insertStreamingAssistantMessage(sessionId, profile.model)
@@ -304,11 +340,47 @@ class ChatViewModel(
 
     // ------------------------------------------------------------ 附件
 
-    /** 步骤 5 的附件管线接进来。这里只管把结果挂到 state 上。 */
-    fun onAttachmentsPrepared(attachments: List<ChatAttachment>) {
-        _state.value = _state.value.copy(
-            pendingAttachments = _state.value.pendingAttachments + attachments
+    /**
+     * 选了一个文件。
+     *
+     * 立刻插一条 [AttachmentStatus.PREPARING] 占位让用户看到反馈，
+     * 处理在 IO 线程跑（复制 + 解码 + 抽文本都可能耗时几十到几百毫秒）。
+     */
+    fun onAttachmentPicked(uri: android.net.Uri) {
+        val sessionId = _state.value.sessionId
+        if (sessionId == 0L) return
+        val localId = ++attachmentSeq
+        val placeholder = PendingAttachment(
+            id = localId,
+            fileName = uri.lastPathSegment?.substringAfterLast('/') ?: "",
+            kind = AttachmentKind.OTHER,
+            status = AttachmentStatus.PREPARING
         )
+        _state.value = _state.value.copy(
+            pendingAttachments = _state.value.pendingAttachments + placeholder
+        )
+
+        viewModelScope.launch {
+            val longEdge = settingsStore.settings.first().imageLongEdgePx
+            val result = preparer.prepare(sessionId, uri, longEdge)
+            _state.value = _state.value.copy(
+                pendingAttachments = _state.value.pendingAttachments.map {
+                    if (it.id != localId) it
+                    else PendingAttachment(
+                        id = localId,
+                        fileName = result.fileName,
+                        kind = result.kind,
+                        // 准备失败的文件仍留在列表里，用户能看到「处理失败」并移除；
+                        // 直接从 UI 消失的话用户会以为是自己没选上
+                        status = if (result.ok) AttachmentStatus.READY else AttachmentStatus.FAILED,
+                        sizeBytes = result.sizeBytes,
+                        extractedChars = result.extractedChars,
+                        errorMessage = result.errorMessage,
+                        prepared = result.takeIf { it.ok }
+                    )
+                }
+            )
+        }
     }
 
     fun removePendingAttachment(id: Long) {
@@ -316,7 +388,10 @@ class ChatViewModel(
         _state.value = _state.value.copy(
             pendingAttachments = _state.value.pendingAttachments.filterNot { it.id == id }
         )
-        viewModelScope.launch { repository.deleteAttachment(target) }
+        // 落盘的文件要删掉，否则用户反复添加删除附件会不断占空间
+        target.prepared?.localPath?.takeIf { it.isNotBlank() }?.let { path ->
+            viewModelScope.launch { runCatching { java.io.File(path).delete() } }
+        }
     }
 
     // ------------------------------------------------------------ 其他

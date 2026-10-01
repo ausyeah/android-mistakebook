@@ -119,6 +119,11 @@ class AppContainer(context: Context) {
         com.mistakebook.net.llm.ChatCompletionStream(httpClient, llmApi)
     }
 
+    /** 对话附件准备：复制到私有目录 + 图片压缩 / 文档抽文本。 */
+    val chatAttachmentPreparer: com.mistakebook.data.chat.ChatAttachmentPreparer by lazy {
+        com.mistakebook.data.chat.ChatAttachmentPreparer(appContext, files)
+    }
+
     val recognitionEngine: RecognitionEngine by lazy {
         RecognitionEngine(
             taskRepository = captureTaskRepository,

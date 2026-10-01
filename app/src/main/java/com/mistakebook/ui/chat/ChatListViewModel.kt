@@ -47,9 +47,15 @@ class ChatListViewModel(
         }
     }
 
-    /** 首页右上角进入：直接开一个自由会话。 */
-    fun startFreeSession(onReady: (Long) -> Unit) {
-        viewModelScope.launch { onReady(repository.newFreeSession().id) }
+    /**
+     * 首页/列表页进入「新对话」。
+     *
+     * **不预先建会话**——直接跳到聊天页，由 ChatViewModel 调
+     * `sessionForQuestion(null)` 建（那里会复用已有的空会话）。
+     * 两边都建就会攒出一串空会话。
+     */
+    fun startFreeSession(onReady: (Long?) -> Unit) {
+        onReady(null)
     }
 
     fun rename(id: Long, title: String) {

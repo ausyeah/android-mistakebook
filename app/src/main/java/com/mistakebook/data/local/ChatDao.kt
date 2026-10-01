@@ -49,6 +49,20 @@ interface ChatDao {
     suspend fun findSessionByQuestion(questionId: Long): ChatSession?
 
     /**
+     * 最近一个**空**的自由会话（一条消息都没有）。
+     *
+     * 用于「点新对话」时复用而不是每次新建——否则会话列表里会攒出一串
+     * 永远空着的孤儿会话，用户点几次「新对话」就多几行空白。
+     */
+    @Query(
+        """SELECT s.* FROM chat_sessions s
+           WHERE s.questionId IS NULL AND s.deletedAt IS NULL
+             AND NOT EXISTS (SELECT 1 FROM chat_messages m WHERE m.sessionId = s.id)
+           ORDER BY s.updatedAt DESC LIMIT 1"""
+    )
+    suspend fun findEmptyFreeSession(): ChatSession?
+
+    /**
      * 会话列表页。
      *
      * 带 `questionId` 便于列表直接显示「哪道题」——否则用户面对十几个
@@ -109,6 +123,16 @@ interface ChatDao {
 
     @Query("SELECT * FROM chat_messages WHERE id = :id")
     suspend fun findMessage(id: Long): ChatMessage?
+
+    /**
+     * 真删。
+     *
+     * 早先的「删除」是把状态标成 CANCELED——而「重试」正是「标记旧消息 + 插入新消息」，
+     * 于是被标记的那条**永远留在列表里**，用户点了删除却看到消息还在。
+     * 附件记录靠外键 CASCADE 一起清掉。
+     */
+    @Query("DELETE FROM chat_messages WHERE id = :id")
+    suspend fun deleteMessage(id: Long)
 
     /**
      * 组装请求时用：排除 [ChatMessage.injected] 的题目上下文消息。

@@ -1,5 +1,7 @@
 package com.mistakebook.ui.chat
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -23,7 +25,13 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
@@ -36,7 +44,9 @@ import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
@@ -74,6 +84,23 @@ import kotlinx.coroutines.launch
 /** 列表末尾的哨兵项。**必须有**——否则消息正好排满时没有可滚余量，结论会被藏在屏幕外。 */
 private const val SENTINEL_INDEX = -1
 
+/**
+ * 选图片的 MIME 过滤。
+ *
+ * 不用通配 image 类型：部分文档管理应用会把 HEIC 归到 image 类型、
+ * 但也有把不相关文件归到这里的，让用户自己挑下文件不能最终判定。
+ */
+private val IMAGE_MIME_TYPES = arrayOf("image/jpeg", "image/png", "image/webp", "image/heic", "image/bmp")
+
+/** 选文档。PDF 单独列出，因为部分文件管理应用不会把 .pdf 归到 text 类型。 */
+private val DOCUMENT_MIME_TYPES = arrayOf(
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "text/plain",
+    "text/markdown",
+    "text/csv"
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
@@ -91,6 +118,7 @@ fun ChatScreen(
             repository = c.chatRepository,
             stream = c.chatCompletionStream,
             settingsStore = c.settingsStore,
+            preparer = c.chatAttachmentPreparer,
             questionId = questionId
         )
     }
@@ -120,6 +148,17 @@ fun ChatScreen(
     var pendingDeleteId by remember { mutableStateOf(0L) }
     var showRenameDialog by remember { mutableStateOf(false) }
     var renameText by remember { mutableStateOf("") }
+    var showAttachSheet by remember { mutableStateOf(false) }
+
+    // 选文件：OpenDocument 拿的是可长期读取的 Uri（不依赖临时授权），
+    // 比 GetContent 好——GetContent 在进程重启后就读不到了。
+    val imagePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri -> uri?.let(viewModel::onAttachmentPicked) }
+
+    val filePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri -> uri?.let(viewModel::onAttachmentPicked) }
 
     // 首次进入题目会话时预填首问，**不自动发送**
     LaunchedEffect(state.sessionId) {
@@ -188,8 +227,7 @@ fun ChatScreen(
         )
     }
 
-    if (showRenameDialog) {
-        AlertDialog(
+    if (showRenameDialog) {        AlertDialog(
             onDismissRequest = { showRenameDialog = false },
             title = { Text(stringResource(R.string.chat_rename_title)) },
             text = {
@@ -211,6 +249,14 @@ fun ChatScreen(
                     Text(stringResource(R.string.chat_cancel))
                 }
             }
+        )
+    }
+
+    if (showAttachSheet) {
+        AttachmentSourceSheet(
+            onPickImage = { imagePicker.launch(IMAGE_MIME_TYPES) },
+            onPickFile = { filePicker.launch(DOCUMENT_MIME_TYPES) },
+            onDismiss = { showAttachSheet = false }
         )
     }
 
@@ -289,6 +335,7 @@ fun ChatScreen(
                 onTextChange = viewModel::onInputChange,
                 onSend = viewModel::send,
                 onStop = viewModel::stop,
+                onAttach = { showAttachSheet = true },
                 onRemoveAttachment = viewModel::removePendingAttachment
             )
         }
@@ -522,10 +569,11 @@ private fun JumpToBottomButton(modifier: Modifier = Modifier, onClick: () -> Uni
 private fun ChatInputBar(
     text: String,
     streaming: Boolean,
-    attachments: List<com.mistakebook.data.local.entities.ChatAttachment>,
+    attachments: List<PendingAttachment>,
     onTextChange: (String) -> Unit,
     onSend: () -> Unit,
     onStop: () -> Unit,
+    onAttach: () -> Unit,
     onRemoveAttachment: (Long) -> Unit
 ) {
     Surface(tonalElevation = 3.dp, shadowElevation = 8.dp) {
@@ -545,6 +593,12 @@ private fun ChatInputBar(
             }
 
             Row(verticalAlignment = Alignment.Bottom) {
+                IconButton(onClick = onAttach, enabled = !streaming, modifier = Modifier.size(48.dp)) {
+                    Icon(
+                        Icons.Default.AttachFile,
+                        contentDescription = stringResource(R.string.chat_attach)
+                    )
+                }
                 OutlinedTextField(
                     value = text,
                     onValueChange = onTextChange,
@@ -556,11 +610,13 @@ private fun ChatInputBar(
                 Spacer(Modifier.width(8.dp))
                 FilledIconButton(
                     onClick = { if (streaming) onStop() else onSend() },
-                    enabled = streaming || text.isNotBlank() || attachments.isNotEmpty(),
+                    enabled = streaming ||
+                        text.isNotBlank() ||
+                        attachments.any { it.status == com.mistakebook.domain.AttachmentStatus.READY },
                     modifier = Modifier.size(48.dp)
                 ) {
                     Icon(
-                        imageVector = if (streaming) Icons.Default.Stop else Icons.Default.Send,
+                        imageVector = if (streaming) Icons.Default.Stop else Icons.AutoMirrored.Filled.Send,
                         contentDescription = stringResource(if (streaming) R.string.chat_stop else R.string.chat_send)
                     )
                 }
@@ -569,47 +625,118 @@ private fun ChatInputBar(
     }
 }
 
+/** 附件来源选择。相册 / 拍照 / 文件三选一。 */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AttachmentSourceSheet(
+    onPickImage: () -> Unit,
+    onPickFile: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(modifier = Modifier.padding(bottom = 24.dp)) {
+            ListItem(
+                headlineContent = { Text(stringResource(R.string.chat_attach_gallery)) },
+                leadingContent = { Icon(Icons.Default.Image, contentDescription = null) },
+                modifier = Modifier.clickable {
+                    onDismiss()
+                    onPickImage()
+                }
+            )
+            ListItem(
+                headlineContent = { Text(stringResource(R.string.chat_attach_files)) },
+                leadingContent = { Icon(Icons.Default.Description, contentDescription = null) },
+                modifier = Modifier.clickable {
+                    onDismiss()
+                    onPickFile()
+                }
+            )
+        }
+    }
+}
+
 @Composable
 private fun PendingAttachmentChip(
-    attachment: com.mistakebook.data.local.entities.ChatAttachment,
+    attachment: PendingAttachment,
     onRemove: () -> Unit
 ) {
     Surface(
         shape = RoundedCornerShape(8.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant,
-        modifier = Modifier.clickable(onClick = onRemove)
+        color = if (attachment.status == com.mistakebook.domain.AttachmentStatus.FAILED) {
+            MaterialTheme.colorScheme.errorContainer
+        } else {
+            MaterialTheme.colorScheme.surfaceVariant
+        }
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.padding(start = 10.dp, end = 4.dp, top = 4.dp, bottom = 4.dp)
         ) {
-            when (attachment.status) {
-                com.mistakebook.domain.AttachmentStatus.PREPARING -> {
-                    CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 2.dp)
-                    Spacer(Modifier.width(6.dp))
+            if (attachment.status == com.mistakebook.domain.AttachmentStatus.PREPARING) {
+                CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    stringResource(R.string.chat_attachment_preparing),
+                    style = MaterialTheme.typography.labelSmall
+                )
+            } else {
+                Icon(
+                    imageVector = when (attachment.kind) {
+                        com.mistakebook.domain.AttachmentKind.IMAGE -> Icons.Default.Image
+                        com.mistakebook.domain.AttachmentKind.PDF -> Icons.Default.PictureAsPdf
+                        else -> Icons.Default.Description
+                    },
+                    contentDescription = null,
+                    modifier = Modifier.size(14.dp)
+                )
+                Spacer(Modifier.width(4.dp))
+                Column {
                     Text(
-                        stringResource(R.string.chat_attachment_preparing),
-                        style = MaterialTheme.typography.labelSmall
-                    )
-                }
-
-                else -> {
-                    Text(
-                        text = attachment.fileName,
+                        text = attachment.fileName.ifBlank { stringResource(R.string.chat_attach_file) },
                         style = MaterialTheme.typography.labelSmall,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.widthIn(max = 140.dp)
+                        modifier = Modifier.widthIn(max = 130.dp)
+                    )
+                    val subtitle = when (attachment.status) {
+                        com.mistakebook.domain.AttachmentStatus.FAILED ->
+                            attachment.errorMessage ?: stringResource(R.string.chat_attachment_failed)
+
+                        else -> if (attachment.extractedChars > 0) {
+                            stringResource(R.string.chat_attachment_extracted, attachment.extractedChars)
+                        } else {
+                            formatSize(attachment.sizeBytes)
+                        }
+                    }
+                    Text(
+                        text = subtitle,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (attachment.status == com.mistakebook.domain.AttachmentStatus.FAILED) {
+                            MaterialTheme.colorScheme.onErrorContainer
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.widthIn(max = 130.dp)
                     )
                 }
             }
             IconButton(onClick = onRemove, modifier = Modifier.size(24.dp)) {
                 Icon(
-                    Icons.Default.Delete,
+                    Icons.Default.Close,
                     contentDescription = stringResource(R.string.chat_attachment_remove),
                     modifier = Modifier.size(12.dp)
                 )
             }
         }
     }
+}
+
+/** 字节数 -> 人类可读。 */
+private fun formatSize(bytes: Long): String = when {
+    bytes <= 0 -> ""
+    bytes < 1024 -> "$bytes B"
+    bytes < 1024 * 1024 -> "${bytes / 1024} KB"
+    else -> String.format("%.1f MB", bytes / 1024.0 / 1024.0)
 }
