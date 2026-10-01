@@ -6,6 +6,9 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.TypeConverters
 import com.mistakebook.data.local.entities.CaptureTask
+import com.mistakebook.data.local.entities.ChatAttachment
+import com.mistakebook.data.local.entities.ChatMessage
+import com.mistakebook.data.local.entities.ChatSession
 import com.mistakebook.data.local.entities.Notebook
 import com.mistakebook.data.local.entities.Question
 import com.mistakebook.data.local.entities.QuestionTagCrossRef
@@ -21,9 +24,12 @@ import com.mistakebook.data.local.entities.Tag
         QuestionTagCrossRef::class,
         ReviewLog::class,
         CaptureTask::class,
-        Notebook::class
+        Notebook::class,
+        ChatSession::class,
+        ChatMessage::class,
+        ChatAttachment::class
     ],
-    version = 2,
+    version = 3,
     exportSchema = true
 )
 @TypeConverters(Converters::class)
@@ -40,6 +46,8 @@ abstract class MistakeBookDatabase : RoomDatabase() {
     abstract fun captureTaskDao(): CaptureTaskDao
 
     abstract fun notebookDao(): NotebookDao
+
+    abstract fun chatDao(): ChatDao
 
     companion object {
         const val DB_NAME = "mistake_book.db"
@@ -77,6 +85,110 @@ abstract class MistakeBookDatabase : RoomDatabase() {
                 db.execSQL("ALTER TABLE `questions` ADD COLUMN `notebookId` INTEGER")
                 db.execSQL(
                     "CREATE INDEX IF NOT EXISTS `index_questions_notebookId` ON `questions` (`notebookId`)"
+                )
+            }
+        }
+
+        /**
+         * 2 -> 3：新增 AI 对话三张表。
+         *
+         * **必须写 Migration 并升版本号。** 只加表不改版本号的话，
+         * Room 运行时会比对 schema 指纹，发现结构变了却没迁移，
+         * 直接抛 IllegalStateException 闪退。
+         * 更不能 `fallbackToDestructiveMigration()`——那会静默清空用户数据。
+         *
+         * 建表 SQL **必须与实体声明逐字对应**（列名、类型、可空性、索引名、
+         * 外键 onDelete），否则 schema 校验同样会失败。改了实体就要同步改这里。
+         */
+        val MIGRATION_2_3 = object : androidx.room.migration.Migration(2, 3) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `chat_sessions` (
+                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `questionId` INTEGER,
+                        `title` TEXT NOT NULL,
+                        `titleLocked` INTEGER NOT NULL,
+                        `model` TEXT NOT NULL,
+                        `messageCount` INTEGER NOT NULL,
+                        `lastPreview` TEXT NOT NULL,
+                        `createdAt` INTEGER NOT NULL,
+                        `updatedAt` INTEGER NOT NULL,
+                        `deletedAt` INTEGER
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_chat_sessions_questionId` ON `chat_sessions` (`questionId`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_chat_sessions_updatedAt` ON `chat_sessions` (`updatedAt`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_chat_sessions_deletedAt` ON `chat_sessions` (`deletedAt`)"
+                )
+
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `chat_messages` (
+                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `sessionId` INTEGER NOT NULL,
+                        `role` TEXT NOT NULL,
+                        `content` TEXT NOT NULL,
+                        `status` TEXT NOT NULL,
+                        `errorMessage` TEXT,
+                        `attachmentIdsJson` TEXT NOT NULL,
+                        `questionId` INTEGER,
+                        `injected` INTEGER NOT NULL,
+                        `promptTokens` INTEGER NOT NULL,
+                        `completionTokens` INTEGER NOT NULL,
+                        `createdAt` INTEGER NOT NULL,
+                        `updatedAt` INTEGER NOT NULL,
+                        FOREIGN KEY(`sessionId`) REFERENCES `chat_sessions`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE,
+                        FOREIGN KEY(`questionId`) REFERENCES `questions`(`id`) ON UPDATE NO ACTION ON DELETE SET NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_chat_messages_sessionId` ON `chat_messages` (`sessionId`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_chat_messages_createdAt` ON `chat_messages` (`createdAt`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_chat_messages_questionId` ON `chat_messages` (`questionId`)"
+                )
+
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `chat_attachments` (
+                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `messageId` INTEGER NOT NULL,
+                        `sessionId` INTEGER NOT NULL,
+                        `kind` TEXT NOT NULL,
+                        `localPath` TEXT NOT NULL,
+                        `fileName` TEXT NOT NULL,
+                        `mimeType` TEXT NOT NULL,
+                        `status` TEXT NOT NULL,
+                        `sizeBytes` INTEGER NOT NULL,
+                        `widthPx` INTEGER NOT NULL,
+                        `heightPx` INTEGER NOT NULL,
+                        `textExcerpt` TEXT NOT NULL,
+                        `extractedChars` INTEGER NOT NULL,
+                        `errorMessage` TEXT,
+                        `createdAt` INTEGER NOT NULL,
+                        FOREIGN KEY(`messageId`) REFERENCES `chat_messages`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_chat_attachments_messageId` ON `chat_attachments` (`messageId`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_chat_attachments_sessionId` ON `chat_attachments` (`sessionId`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_chat_attachments_status` ON `chat_attachments` (`status`)"
                 )
             }
         }
