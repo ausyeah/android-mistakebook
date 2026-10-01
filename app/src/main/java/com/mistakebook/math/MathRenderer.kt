@@ -407,10 +407,10 @@ class MathRenderer(context: Context) {
         val text = unwrapJavascriptJson(raw)
         if (text.isEmpty()) return null
         val obj = runCatching { Json.parseToJsonElement(text).jsonObject }.getOrNull() ?: return null
-        val w = obj["w"]?.jsonPrimitive?.content?.toFloatOrNull()?.toInt() ?: return null
-        val h = obj["h"]?.jsonPrimitive?.content?.toFloatOrNull()?.toInt() ?: return null
-        val fs = obj["fs"]?.jsonPrimitive?.content?.toFloatOrNull() ?: DEFAULT_FONT_PX
-        val err = obj["err"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0
+        val w = obj[SingleProtocol.WIDTH]?.jsonPrimitive?.content?.toFloatOrNull()?.toInt() ?: return null
+        val h = obj[SingleProtocol.HEIGHT]?.jsonPrimitive?.content?.toFloatOrNull()?.toInt() ?: return null
+        val fs = obj[SingleProtocol.FONT_PX]?.jsonPrimitive?.content?.toFloatOrNull() ?: DEFAULT_FONT_PX
+        val err = obj[SingleProtocol.ERR]?.jsonPrimitive?.content?.toIntOrNull() ?: 0
         return Size(w, h, fs, err)
     }
 
@@ -519,7 +519,7 @@ class MathRenderer(context: Context) {
                     pending.forEach { (key, _) -> results[key] = null }
                     return@withLock
                 }
-                val layout = parseBatchLayout(raw) ?: run {
+                val layout = BatchProtocol.parse(raw) ?: run {
                     Log.w(TAG, "批量布局解析失败, 原始返回(截断): ${raw.take(200)}")
                     pending.forEach { (key, _) -> results[key] = null }
                     return@withLock
@@ -592,6 +592,25 @@ class MathRenderer(context: Context) {
         return bitmap
     }
 
+    /**
+     * 从长卷里切出一条公式。
+     *
+     * ## 为什么「切不全就返回 null」而不是返回残缺图
+     *
+     * 原来这里是：
+     * ```
+     * val safeW = width.coerceAtMost(sheet.width - safeX)
+     * val safeH = height.coerceAtMost(sheet.height - safeY)
+     * Bitmap.createBitmap(sheet, safeX, safeY, safeW, safeH)   // 残缺也照给
+     * ```
+     * 公式超出长卷时被**切掉一块照样当完整结果返回**，没有任何日志——
+     * 用户看到的就是「大量公式显示不全」，而且完全无从排查。
+     *
+     * 长卷高度受视口上限约束（见 [BATCH_SAFE_SHEET_HEIGHT]），
+     * 一批公式高到超限时必然溢出。现在改成：**切不全就不给**，
+     * 上层回退成显示源码。源码至少还能看出题目原样，
+     * 截断的公式则既看不懂、也不知道发生了什么。
+     */
     private fun slice(
         sheet: Bitmap,
         x: Int,
@@ -605,50 +624,15 @@ class MathRenderer(context: Context) {
         val safeW = width.coerceAtMost(sheet.width - safeX)
         val safeH = height.coerceAtMost(sheet.height - safeY)
         if (safeW <= 0 || safeH <= 0) return null
-        return runCatching { Bitmap.createBitmap(sheet, safeX, safeY, safeW, safeH) }.getOrNull()
-    }
-
-    private data class BatchEntry(
-        val key: String,
-        val x: Int,
-        val y: Int,
-        val width: Int,
-        val height: Int,
-        val fontPx: Float,
-        /** 0 = 正常；1 = 源文本被 JSON 转义破坏；2 = KaTeX 解析失败。 */
-        val err: Int = 0
-    )
-
-    private data class BatchLayout(
-        val sheetWidth: Int,
-        val sheetHeight: Int,
-        val entries: List<BatchEntry>
-    )
-
-    private fun parseBatchLayout(raw: String): BatchLayout? {
-        // 关键：必须用 [unwrapJavascriptJson] 剥掉 evaluateJavascript 多加的
-        // 那层 JSON 编码，否则 JSONObject(raw) 解析一个「字符串字面量」必然失败，
-        // 整个批量结果被判为 null，所有公式退回 LaTeX 源码。
-        val obj = runCatching { org.json.JSONObject(unwrapJavascriptJson(raw)) }.getOrNull()
-            ?: return null
-        val w = obj.optInt("w", 0)
-        val h = obj.optInt("h", 0)
-        if (w <= 0 || h <= 0) return null
-        val array = obj.optJSONArray("items") ?: return null
-        val entries = mutableListOf<BatchEntry>()
-        for (i in 0 until array.length()) {
-            val item = array.optJSONObject(i) ?: continue
-            entries += BatchEntry(
-                key = item.optString("k"),
-                x = item.optInt("x"),
-                y = item.optInt("y"),
-                width = item.optInt("w"),
-                height = item.optInt("h"),
-                fontPx = item.optDouble("f", 0.0).toFloat(),
-                err = item.optInt("e", 0)
+        if (safeW < width || safeH < height) {
+            Log.w(
+                TAG,
+                "公式超出长卷边界，已截断 ${width}x$height -> ${safeW}x$safeH" +
+                    "（长卷 ${sheet.width}x${sheet.height} @ ${safeX},$safeY）。改为回退源码"
             )
+            return null
         }
-        return BatchLayout(w, h, entries)
+        return runCatching { Bitmap.createBitmap(sheet, safeX, safeY, safeW, safeH) }.getOrNull()
     }
 
     companion object {
@@ -676,7 +660,19 @@ class MathRenderer(context: Context) {
          * 超出就分批：一张长卷位图按 ARGB_8888 算是 width×height×4 字节，
          * 公式多了长卷会高到吃内存并触发 GC，反而比多次小渲染更慢。
          */
-        private const val BATCH_LIMIT = 12
+        /**
+     * 一批渲染多少条公式。
+     *
+     * 原值 12，配套注释假设「每条约 200 设备像素，4096 够用」。
+     * 实际带分式、嵌套指数的公式能到 400~500 设备像素，
+     * 12 条就是 4800~6000，**超出视口上限**——后面几条被裁掉，
+     * 而旧代码把残缺位图当完整结果返回（用户报「大量公式显示不全」）。
+     *
+     * 降到 6：最坏情况 6x500 = 3000，留出余量不再溢出。
+     * 代价是 WebView 往返次数翻倍，但批量本来就是为性能做的，
+     * 而「少渲染一点」比「渲染出一堆错的」好得多。
+     */
+    private const val BATCH_LIMIT = 6
 
         /** 批量长卷视口上限。12 个公式 × ~200 设备像素 + 余量，4096 绰绰有余。 */
         private const val BATCH_VIEWPORT_HEIGHT = 4096

@@ -84,12 +84,12 @@ android {
         // versionCode 必须单调递增，否则手机上已装的同 versionCode 包
         // 无法被覆盖安装（安装器报「已安装相同版本」），用户就永远拿不到修复版。
         // 2 = 首个可用的 v0.0.1（设置页无法输入密钥那版不可用，重新发布时占用 2）
-        // 3 = v0.0.2   4 = v0.0.3   5 = v0.0.4（LaTeX 修复）
-        versionCode = 5
+        // 3 = v0.0.2   4 = v0.0.3   5 = v0.0.4   6 = v0.0.5（公式尺寸与裁切）
+        versionCode = 6
         // 版本号从 v0.0.1 重新开始。
         // 之前 v0.1.0~v0.1.17 的公开 Release 里带着真实的 API Key（明文躺在 DEX 中），
         // 那批产物与 tag 已全部删除，这个编号视为作废、不再复用。
-        versionName = "0.0.4"
+        versionName = "0.0.5"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
