@@ -109,6 +109,16 @@ class AppContainer(context: Context) {
 
     val llmClient: LlmClient by lazy { LlmClient(llmApi) }
 
+    /**
+     * 对话流式客户端。
+     *
+     * 传的是**同一个** [httpClient]：`ChatCompletionStream` 内部会派生出
+     * 一个关掉 call timeout 的副本，共享连接池与日志脱敏配置。
+     */
+    val chatCompletionStream: com.mistakebook.net.llm.ChatCompletionStream by lazy {
+        com.mistakebook.net.llm.ChatCompletionStream(httpClient, llmApi)
+    }
+
     val recognitionEngine: RecognitionEngine by lazy {
         RecognitionEngine(
             taskRepository = captureTaskRepository,
