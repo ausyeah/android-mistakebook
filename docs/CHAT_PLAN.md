@@ -50,7 +50,7 @@
 
 | 步骤 | 内容 | 状态 |
 |---|---|---|
-| 1 | 数据层：三实体 + DAO + 转换器 + `MIGRATION_2_3` | ✅ 完成（CI #77 绿） |
+| 1 | 数据层：三实体 + DAO + 转换器 + `MIGRATION_2_3` | ✅ 完成（CI #77 绿；整体发布见 v0.0.7） |
 | 2 | 仓储层 `ChatRepository` + 上下文组装 | ✅ 完成 |
 | 3 | 流式客户端 `ChatCompletionStream`（SSE + 降级） | ✅ 完成 |
 | 4 | `ChatViewModel` / `ChatListViewModel`（单一 StateFlow） | ✅ 完成 |
