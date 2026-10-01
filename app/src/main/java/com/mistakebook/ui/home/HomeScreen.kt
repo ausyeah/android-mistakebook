@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -544,34 +545,46 @@ private fun SwipeableQuestionCard(
             .clip(MaterialTheme.shapes.medium)
             .background(DeleteReveal)
     ) {
-        // 底层：删除区。滑开前完全被卡片盖住。
-        Column(
+        // 底层：删除区。
+        //
+        // **必须限定在露出来的那一条宽度内、并靠右对齐。**
+        // v0.0.5 用的是 `fillMaxSize()` + `Alignment.Center`，
+        // 图标被放在**整张卡的正中**——而滑开只露出最右边 88dp，
+        // 于是图标压根没露出来，用户看到「一片红、什么都没有」，
+        // 自然也没有东西可点。这是 v0.0.5 的实际回归。
+        Box(
             modifier = Modifier
-                .fillMaxSize()
-                .padding(end = 20.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
+                .fillMaxHeight()
+                .width(SwipeDeleteRevealWidth)
+                .align(Alignment.CenterEnd)
+                .clickable(
+                    // 滑开前点不到这里（被卡片挡住），但显式禁用更保险：
+                    // 万一将来层级调整，也不会变成「随手一点就删」。
+                    enabled = revealed,
+                    onClick = {
+                        close()
+                        onDelete()
+                    }
+                ),
+            contentAlignment = Alignment.Center
         ) {
-            IconButton(
-                // 滑开前点不到这里（被卡片挡住），但显式禁用更保险：
-                // 万一将来层级调整，也不会变成「随手一点就删」。
-                enabled = revealed,
-                onClick = {
-                    close()
-                    onDelete()
-                }
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(2.dp)
             ) {
                 Icon(
                     imageVector = Icons.Default.Delete,
                     contentDescription = stringResource(R.string.swipe_delete_action),
-                    tint = Color.White
+                    tint = Color.White,
+                    modifier = Modifier.size(26.dp)
+                )
+                Text(
+                    text = stringResource(R.string.swipe_delete_hint),
+                    color = Color.White.copy(alpha = 0.9f),
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1
                 )
             }
-            Text(
-                text = stringResource(R.string.swipe_delete_hint),
-                color = Color.White.copy(alpha = 0.85f),
-                style = MaterialTheme.typography.labelSmall
-            )
         }
 
         // 上层：卡片，跟随手势位移
