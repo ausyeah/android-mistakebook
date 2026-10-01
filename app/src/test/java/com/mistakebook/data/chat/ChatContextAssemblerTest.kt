@@ -20,6 +20,46 @@ class ChatContextAssemblerTest {
     private fun assistant(id: Long, text: String) =
         OutgoingMessage(id = id, role = ChatRole.ASSISTANT, text = text)
 
+    /** 去掉头部（system + 题目上下文），只看对话正文。 */
+    private fun AssembledContext.body(): List<OutgoingMessage> = messages.filter { it.role != ChatRole.SYSTEM }
+
+    private fun assemble(
+        history: List<OutgoingMessage>,
+        pendingText: String = "",
+        questionContext: String = "题目"
+    ) = ChatContextAssembler.assemble("sys", questionContext, history, pendingText)
+
+    // ------------------------------------------------------------ 头部结构
+
+    @Test
+    fun `system 与题目上下文拼在输出头部`() {
+        // 输出必须自包含。早先 assemble 收下这两个参数却没用，
+        // 靠调用方自己拼——那种约定迟早在某次改动里漏掉，
+        // 漏了还不报错，只是模型突然失忆。
+        val result = assemble(listOf(user(1, "问1")))
+        assertEquals(3, result.messages.size)
+        assertEquals(ChatRole.SYSTEM, result.messages[0].role)
+        assertEquals("sys", result.messages[0].text)
+        assertEquals(ChatRole.SYSTEM, result.messages[1].role)
+        assertEquals("题目", result.messages[1].text)
+        assertEquals(ChatRole.USER, result.messages[2].role)
+    }
+
+    @Test
+    fun `题目上下文为空时不占位`() {
+        val result = ChatContextAssembler.assemble("sys", "", listOf(user(1, "问1")))
+        assertEquals(2, result.messages.size)
+        assertEquals("sys", result.messages[0].text)
+        assertEquals("问1", result.messages[1].text)
+    }
+
+    @Test
+    fun `system 为空时也不占位`() {
+        val result = ChatContextAssembler.assemble("", "题目", listOf(user(1, "问1")))
+        assertEquals(2, result.messages.size)
+        assertEquals("题目", result.messages[0].text)
+    }
+
     // ------------------------------------------------------------ 分轮
 
     @Test
@@ -62,44 +102,37 @@ class ChatContextAssemblerTest {
 
     @Test
     fun `短历史全部保留且顺序不变`() {
-        val result = ChatContextAssembler.assemble(
-            systemPrompt = "sys",
-            questionContext = "题目",
-            history = listOf(user(1, "问1"), assistant(2, "答1"), user(3, "问2"), assistant(4, "答2"))
-        )
+        val result = assemble(listOf(user(1, "问1"), assistant(2, "答1"), user(3, "问2"), assistant(4, "答2")))
         assertEquals(0, result.omittedCount)
-        assertEquals(listOf(1L, 2L, 3L, 4L), result.messages.map { it.id })
+        assertEquals(listOf(1L, 2L, 3L, 4L), result.body().map { it.id })
     }
 
     @Test
     fun `历史里的 SYSTEM 消息被剔除`() {
         // SYSTEM 是给模型看的上下文标记，不该作为「用户说过的话」再发一遍。
-        val result = ChatContextAssembler.assemble(
-            systemPrompt = "sys",
-            questionContext = "题目",
-            history = listOf(
+        val result = assemble(
+            listOf(
                 user(1, "问1"), assistant(2, "答1"),
                 OutgoingMessage(id = 3, role = ChatRole.SYSTEM, text = "已省略 2 条早期对话")
             )
         )
-        assertEquals(listOf(1L, 2L), result.messages.map { it.id })
+        assertEquals(listOf(1L, 2L), result.body().map { it.id })
     }
 
     // ------------------------------------------------------------ 轮数上限
 
     @Test
     fun `超过轮数上限时丢最旧的整轮`() {
-        // 8 轮上限：造 10 轮，前 2 轮应被丢，且**不能丢半轮**。
         val history = (1L..20L).map { id ->
             if (id % 2 == 1L) user(id, "问$id") else assistant(id, "答$id")
         }
-        val result = ChatContextAssembler.assemble("sys", "题目", history)
+        val result = assemble(history)
         assertEquals(8, result.keptRounds)
         assertEquals(2, result.omittedCount)
-        // 保留的是最近 8 轮 = id 5..20，且 id=5 这一轮的用户消息必须还在
-        assertEquals(16, result.messages.size)
-        assertTrue(result.messages.any { it.id == 5L })
-        assertTrue(result.messages.none { it.id == 1L || it.id == 2L })
+        assertEquals(16, result.body().size)
+        // 保留的是最近 8 轮 = id 5..20
+        assertTrue(result.body().any { it.id == 5L })
+        assertTrue(result.body().none { it.id == 1L || it.id == 2L })
     }
 
     @Test
@@ -108,8 +141,8 @@ class ChatContextAssemblerTest {
         val history = (1L..20L).map { id ->
             if (id % 2 == 1L) user(id, "问$id") else assistant(id, "答$id")
         }
-        val result = ChatContextAssembler.assemble("sys", "题目", history)
-        val keptIds = result.messages.map { it.id }.toSet()
+        val result = assemble(history)
+        val keptIds = result.body().map { it.id }.toSet()
         // 每个保留的用户消息后面必须跟着它的回答
         keptIds.filter { it % 2 == 1L }.forEach { userId ->
             assertTrue("用户 $userId 的回答被丢了", keptIds.contains(userId + 1))
@@ -127,10 +160,10 @@ class ChatContextAssemblerTest {
             user(3, "问3$big"), assistant(4, "答4$big"),
             user(5, "问5$big"), assistant(6, "答6$big")
         )
-        val result = ChatContextAssembler.assemble("sys", "题目", history)
+        val result = assemble(history)
         assertEquals(2, result.keptRounds)
         assertEquals(1, result.omittedCount)
-        assertEquals(listOf(3L, 4L, 5L, 6L), result.messages.map { it.id })
+        assertEquals(listOf(3L, 4L, 5L, 6L), result.body().map { it.id })
     }
 
     @Test
@@ -142,18 +175,29 @@ class ChatContextAssemblerTest {
             OutgoingMessage(id = 3, role = ChatRole.USER, text = "问3", attachmentText = "y".repeat(5000)),
             assistant(4, "答4")
         )
-        val withAttachment = ChatContextAssembler.assemble("sys", "题目", sameHistory)
+        val withAttachment = assemble(sameHistory)
         // 每轮 5000+ 字符，2 轮就超 8000 -> 只留最新一轮
         assertEquals(1, withAttachment.keptRounds)
         assertEquals(1, withAttachment.omittedCount)
 
         // 同样两条消息，附件文本清空后正文只有几个字 -> 一轮都不该丢。
         // 两条断言放一起，才能证明「丢弃是被附件文本撑出来的」而不是别的原因。
-        val withoutAttachment = ChatContextAssembler.assemble(
-            "sys", "题目", sameHistory.map { it.copy(attachmentText = "") }
-        )
+        val withoutAttachment = assemble(sameHistory.map { it.copy(attachmentText = "") })
         assertEquals(0, withoutAttachment.omittedCount)
         assertEquals(2, withoutAttachment.keptRounds)
+    }
+
+    @Test
+    fun `system 与题目上下文不占历史预算`() {
+        // 它们是「每轮都要带」的固定开销，不该挤掉历史。
+        val big = "x".repeat(1900)
+        val history = listOf(
+            user(1, "问1$big"), assistant(2, "答1$big"),
+            user(3, "问3$big"), assistant(4, "答4$big")
+        )
+        val result = assemble(history, questionContext = "题".repeat(3000))
+        assertEquals(2, result.keptRounds)
+        assertEquals(0, result.omittedCount)
     }
 
     // ------------------------------------------------------------ 最新一轮必留
@@ -166,38 +210,33 @@ class ChatContextAssemblerTest {
             user(1, "旧问$huge"), assistant(2, "旧答$huge"),
             user(3, "旧问3$huge"), assistant(4, "旧答4$huge")
         )
-        val result = ChatContextAssembler.assemble("sys", "题目", history)
+        val result = assemble(history)
         assertEquals(1, result.keptRounds)
-        assertEquals(listOf(3L, 4L), result.messages.map { it.id })
+        assertEquals(listOf(3L, 4L), result.body().map { it.id })
     }
 
     @Test
-    fun `本次新输入无论多大都发送且计入省略条数`() {
+    fun `本次新输入无论多大都发送`() {
         val huge = "x".repeat(50_000)
-        val result = ChatContextAssembler.assemble(
-            systemPrompt = "sys",
-            questionContext = "题目",
-            history = listOf(user(1, "旧问"), assistant(2, "旧答")),
-            pendingText = "新的超长问题$huge"
-        )
-        // 最后一轮 = 新输入，id = -1
-        assertEquals(listOf(-1L), result.messages.map { it.id })
+        val result = assemble(listOf(user(1, "旧问"), assistant(2, "旧答")), pendingText = "新的超长问题$huge")
+        assertEquals(listOf(ChatContextAssembler.ID_PENDING), result.body().map { it.id })
         assertEquals(1, result.omittedCount)
     }
 
     @Test
     fun `只有新输入没有历史时省略数为零`() {
-        val result = ChatContextAssembler.assemble("sys", "题目", emptyList(), pendingText = "你好")
+        val result = assemble(emptyList(), pendingText = "你好")
         assertEquals(0, result.omittedCount)
-        // 只有新输入这一轮，没有历史可丢
         assertEquals(1, result.keptRounds)
-        assertEquals(listOf(-1L), result.messages.map { it.id })
+        assertEquals(listOf(ChatContextAssembler.ID_PENDING), result.body().map { it.id })
     }
 
     @Test
     fun `全空输入不崩`() {
-        val result = ChatContextAssembler.assemble("sys", "题目", emptyList())
-        assertEquals(0, result.messages.size)
+        val result = assemble(emptyList())
+        // 只有 system + 题目上下文两条，正文为空
+        assertEquals(2, result.messages.size)
+        assertEquals(0, result.body().size)
         assertEquals(0, result.omittedCount)
     }
 
@@ -214,29 +253,35 @@ class ChatContextAssemblerTest {
             OutgoingMessage(5, ChatRole.USER, "问5", images = img),
             assistant(6, "答6")
         )
-        val result = ChatContextAssembler.assemble("sys", "题目", history)
-        val withImages = result.messages.filter { it.images.isNotEmpty() }
+        val result = assemble(history)
+        val withImages = result.body().filter { it.images.isNotEmpty() }
         assertEquals(2, withImages.size)
-        // 输出按时间排序；这里要验的是「拿到名额的是最近两条」，
-        // 不是名额的分配顺序——所以比集合。
+        // 输出按时间排序；这里要验的是「拿到名额的是最近两条」，不是名额的分配顺序
         assertEquals(setOf(3L, 5L), withImages.map { it.id }.toSet())
         // 反向用例：最旧那条必须没有图（正序遍历会让它抢光名额）
-        assertTrue(result.messages.none { it.id == 1L && it.images.isNotEmpty() })
+        assertTrue(result.body().none { it.id == 1L && it.images.isNotEmpty() })
     }
 
     @Test
-    fun `一条消息里多张图也只占一个名额但只取前几张`() {
-        val img = listOf("data:image/jpeg;base64,A", "data:image/jpeg;base64,B", "data:image/jpeg;base64,C")
+    fun `一条消息里多张图只取前几张并占满剩余名额`() {
+        val img = listOf("A", "B", "C")
         val history = listOf(
             OutgoingMessage(1, ChatRole.USER, "问1", images = img),
             assistant(2, "答2"),
-            OutgoingMessage(3, ChatRole.USER, "问3", images = listOf("data:image/jpeg;base64,D"))
+            OutgoingMessage(3, ChatRole.USER, "问3", images = listOf("D"))
         )
-        val result = ChatContextAssembler.assemble("sys", "题目", history)
-        val first = result.messages.first { it.id == 1L }
+        val result = assemble(history)
+        val first = result.body().first { it.id == 1L }
         // 上限 2：最新那条占 1 个，旧消息只剩 1 个名额
         assertEquals(1, first.images.size)
-        assertEquals("data:image/jpeg;base64,A", first.images.first())
+        assertEquals("A", first.images.first())
+    }
+
+    @Test
+    fun `没有图时不改动消息`() {
+        val history = listOf(user(1, "纯文字"))
+        val result = assemble(history)
+        assertTrue(result.body().single().images.isEmpty())
     }
 
     // ------------------------------------------------------------ 省略条数
@@ -247,17 +292,22 @@ class ChatContextAssemblerTest {
             if (id % 2 == 1L) user(id, "问$id") else assistant(id, "答$id")
         }
         // 10 轮历史，轮数上限 8 -> 丢 2 轮
-        val withoutPending = ChatContextAssembler.assemble("sys", "题目", history)
-        assertEquals(10, withoutPending.keptRounds + withoutPending.omittedCount)
-        assertEquals(2, withoutPending.omittedCount)
+        val withoutPending = assemble(history)
         assertEquals(8, withoutPending.keptRounds)
+        assertEquals(2, withoutPending.omittedCount)
 
-        val withPending = ChatContextAssembler.assemble("sys", "题目", history, pendingText = "新问题")
+        val withPending = assemble(history, pendingText = "新问题")
         // 11 轮（10 历史 + 新输入），上限 8 -> 只留最新 8 轮，
         // 其中 1 轮是新输入，所以历史保留 7 轮、丢 3 轮。
         // 关键：新输入占了一个名额，省略数要跟着涨，否则 UI 会少报一条。
         assertEquals(8, withPending.keptRounds)
         assertEquals(3, withPending.omittedCount)
-        assertEquals(listOf(-1L), withPending.messages.takeLast(1).map { it.id })
+        assertEquals(ChatContextAssembler.ID_PENDING, withPending.body().last().id)
+    }
+
+    @Test
+    fun `usedChars 反映历史占用`() {
+        val result = assemble(listOf(user(1, "12345"), assistant(2, "678")))
+        assertEquals(8, result.usedChars)
     }
 }

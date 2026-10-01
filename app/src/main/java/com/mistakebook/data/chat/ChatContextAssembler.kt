@@ -36,6 +36,15 @@ object ChatContextAssembler {
      */
     const val MAX_IMAGES_PER_REQUEST = 2
 
+    /** 合成消息的 id：负数，避免与数据库自增 id 撞上。 */
+    const val ID_SYSTEM = -1L
+
+    /** 同上，题目上下文。 */
+    const val ID_QUESTION = -2L
+
+    /** 本次新输入。 */
+    const val ID_PENDING = -3L
+
     /**
      * 把历史切成「轮」。
      *
@@ -74,15 +83,11 @@ object ChatContextAssembler {
 
         // 新内容并入最后一轮。这样它和它的回答算同一轮，不会被「整轮丢弃」吃掉。
         val pending = OutgoingMessage(
-            id = -1L,
+            id = ID_PENDING,
             role = ChatRole.USER,
             text = pendingText
         )
         val rounds = if (pendingText.isBlank()) allRounds else allRounds + listOf(listOf(pending))
-
-        if (rounds.isEmpty()) {
-            return AssembledContext(messages = emptyList(), omittedCount = 0, keptRounds = 0, usedChars = 0)
-        }
 
         // 从最新一轮往回装，装不下就停。
         // 倒着走是为了「停」得干脆：一旦超预算，再往前面的轮只会更大。
@@ -102,7 +107,18 @@ object ChatContextAssembler {
         val omitted = allRounds.size - (if (pendingText.isBlank()) kept.size else kept.size - 1)
 
         return AssembledContext(
-            messages = body,
+            // system 与题目上下文**由这里拼在头部**，输出自包含。
+            // 早先把这两个参数收下却没用，靠调用方记得自己拼——
+            // 那种约定迟早在某次改动里漏掉，而且漏了不报错，只是模型突然失忆。
+            messages = buildList {
+                if (systemPrompt.isNotBlank()) {
+                    add(OutgoingMessage(id = ID_SYSTEM, role = ChatRole.SYSTEM, text = systemPrompt))
+                }
+                if (questionContext.isNotBlank()) {
+                    add(OutgoingMessage(id = ID_QUESTION, role = ChatRole.SYSTEM, text = questionContext))
+                }
+                addAll(body)
+            },
             omittedCount = omitted.coerceAtLeast(0),
             keptRounds = kept.size,
             usedChars = used

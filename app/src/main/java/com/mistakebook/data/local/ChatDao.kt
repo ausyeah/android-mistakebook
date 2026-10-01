@@ -166,6 +166,15 @@ interface ChatDao {
     @Query("SELECT COUNT(*) FROM chat_messages WHERE sessionId = :sessionId")
     suspend fun countMessages(sessionId: Long): Int
 
+    /**
+     * 找已注入的题目上下文消息。
+     *
+     * 判断「要不要再注入一次」必须用这个，**不能用 [countMessages]**：
+     * 发送流程是「先插用户消息、再注入上下文」，用消息总数判断会恒为已注入。
+     */
+    @Query("SELECT * FROM chat_messages WHERE sessionId = :sessionId AND injected = 1 LIMIT 1")
+    suspend fun findInjectedMessage(sessionId: Long): ChatMessage?
+
     // ------------------------------------------------------------ 附件
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)

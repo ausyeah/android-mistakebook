@@ -161,10 +161,15 @@ class ChatRepository(
     /**
      * 插入题目上下文那条 [ChatRole.SYSTEM] 消息（`injected = true`）。
      *
-     * **只在会话第一条时插一次**，之后一直靠它垫在上下文头部。
+     * **只在会话里还没有这条时插一次**，之后一直靠它垫在上下文头部。
+     *
+     * 守卫查的是「有没有 injected 消息」而不是「会话里有没有消息」——
+     * 早先写成后者，而调用顺序是「先插用户消息、再注入题目上下文」，
+     * 于是 `countMessages > 0` 恒成立，这段代码**永远返回 false**，
+     * 题目上下文一次都注不进去，而且不报任何错。
      */
     suspend fun ensureQuestionContext(sessionId: Long, questionId: Long): Boolean {
-        if (chatDao.countMessages(sessionId) > 0) return false
+        if (chatDao.findInjectedMessage(sessionId) != null) return false
         val text = buildQuestionContext(questionId) ?: return false
         val now = System.currentTimeMillis()
         chatDao.insertMessage(
@@ -266,9 +271,10 @@ class ChatRepository(
         pendingText: String = ""
     ): AssembledContext {
         val systemContext = if (questionId != null) buildQuestionContext(questionId).orEmpty() else ""
-        val history = chatDao.messagesExcludingInjected(sessionId)
-            .filter { it.status != MessageStatus.FAILED }
-            .map { it.toOutgoing() }
+        // 失败的、取消的消息**都保留**：它们的内容是有效的对话上下文。
+        // 整条剔除会让模型看到「用户问了什么」却看不到「已经答到哪」，
+        // 于是换个说法把同一段重讲一遍。
+        val history = chatDao.messagesExcludingInjected(sessionId).map { it.toOutgoing() }
         return ChatContextAssembler.assemble(
             systemPrompt = ChatPrompts.SYSTEM,
             questionContext = systemContext,
