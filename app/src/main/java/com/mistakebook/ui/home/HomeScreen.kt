@@ -27,6 +27,7 @@ import androidx.compose.foundation.gestures.draggable
 import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.layout.offset
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Forum
 import kotlin.math.roundToInt
 import com.mistakebook.ui.theme.DeleteReveal
 import androidx.compose.material.icons.Icons
@@ -123,7 +124,9 @@ fun HomeScreen(
     onOpenSettings: () -> Unit,
     onOpenPrint: () -> Unit,
     onOpenNotebooks: () -> Unit = {},
-    onOpenQuestion: (Long) -> Unit
+    onOpenQuestion: (Long) -> Unit,
+    /** AI 对话：进历史会话列表（规格锁定只放顶栏，不加底部按钮）。 */
+    onOpenChatList: () -> Unit = {}
 ) {
     val viewModel: HomeViewModel = containerViewModel(container) { HomeViewModel(it) }
     val state by viewModel.uiState.collectAsState()
@@ -247,6 +250,11 @@ fun HomeScreen(
                     // 塞一段文字在中间既突兀又抢注意力，题数在筛选菜单里已经能看到。
                     IconButton(onClick = onOpenPrint) {
                         Icon(Icons.Default.Print, contentDescription = stringResource(R.string.home_action_print))
+                    }
+                    // AI 对话入口。用对话气泡图标而不是 AutoAwesome：
+                    // 后者在首页已经有别的含义（智能处理），这里要的是「聊过的话」
+                    IconButton(onClick = onOpenChatList) {
+                        Icon(Icons.Default.Forum, contentDescription = stringResource(R.string.chat_list_title))
                     }
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Default.Settings, contentDescription = stringResource(R.string.home_action_settings))

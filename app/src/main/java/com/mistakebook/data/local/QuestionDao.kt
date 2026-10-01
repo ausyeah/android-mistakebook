@@ -74,6 +74,15 @@ interface QuestionDao {
     @Query("SELECT * FROM questions WHERE id = :id")
     suspend fun findById(id: Long): Question?
 
+    /**
+     * 只取 id + title，给「对话列表」标注每段对话属于哪道题。
+     *
+     * 不返回整个 [Question]：题干、解析、原图路径全都不需要，
+     * 而会话列表每次重组都会重新发射一次全表。
+     */
+    @Query("SELECT id, title FROM questions WHERE deletedAt IS NULL")
+    fun observeTitles(): Flow<List<QuestionTitleRow>>
+
     @Query(
         """
         SELECT * FROM questions
@@ -125,3 +134,14 @@ interface QuestionDao {
     @Query("DELETE FROM questions WHERE id IN (:ids)")
     suspend fun hardDelete(ids: List<Long>)
 }
+
+/**
+ * [QuestionDao.observeTitles] 的行类型。
+ *
+ * 单独定义而不是复用 [Question]：查询只投影两列，
+ * Room 会按这个类的字段名校验，列名必须一致。
+ */
+data class QuestionTitleRow(
+    val id: Long,
+    val title: String
+)

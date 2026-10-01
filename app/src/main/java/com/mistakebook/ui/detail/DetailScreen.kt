@@ -20,6 +20,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.draw.clip
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.AlertDialog
@@ -81,7 +82,8 @@ fun DetailScreen(
     onBack: () -> Unit,
     onEdit: (Long) -> Unit,
     onRecrop: (String) -> Unit = {},
-    onReRecognize: (Long) -> Unit = {}
+    onReRecognize: (Long) -> Unit = {},
+    onOpenChat: (Long) -> Unit = {}
 ) {
     val viewModel: DetailViewModel =
         containerViewModel(container) { DetailViewModel(it, questionId) }
@@ -113,6 +115,13 @@ fun DetailScreen(
                 },
                 actions = {
                     if (question != null) {
+                        // AI 对话入口：放在最前面，因为它是对这道题最常用的后续动作
+                        IconButton(onClick = { onOpenChat(question.id) }) {
+                            Icon(
+                                Icons.Default.AutoAwesome,
+                                contentDescription = stringResource(R.string.chat_title_question)
+                            )
+                        }
                         IconButton(onClick = { showReRecognizeDialog = true }) {
                             Icon(
                                 Icons.Default.Refresh,

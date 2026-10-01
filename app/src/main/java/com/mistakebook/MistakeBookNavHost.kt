@@ -15,6 +15,8 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.mistakebook.di.AppContainer
 import com.mistakebook.ui.capture.CaptureScreen
+import com.mistakebook.ui.chat.ChatListScreen
+import com.mistakebook.ui.chat.ChatScreen
 import com.mistakebook.ui.crop.CropScreen
 import com.mistakebook.ui.detail.DetailScreen
 import com.mistakebook.ui.edit.EditScreen
@@ -38,6 +40,17 @@ object Routes {
     const val PDF_IMPORT = "pdfImport"
     const val QUESTION_EDIT = "questionEdit"
     const val NOTEBOOKS = "notebooks"
+
+    /** AI 对话：按题目进入。questionId 用 -1 表示自由会话。 */
+    const val CHAT = "chat"
+
+    /** 会话列表（首页入口）。 */
+    const val CHAT_LIST = "chatList"
+
+    /** 自由会话的 questionId 哨兵值。0 是数据库自增起点，不能拿来当「无」。 */
+    const val CHAT_FREE = -1L
+
+    fun chat(questionId: Long?): String = "$CHAT/${questionId ?: CHAT_FREE}"
 
     /**
      * 手动录入用的编辑页入口。
@@ -86,6 +99,7 @@ fun MistakeBookNavHost(
                 onOpenSettings = { navController.navigate(Routes.SETTINGS) },
                 onOpenPrint = { navController.navigate(Routes.PRINT) },
                 onOpenNotebooks = { navController.navigate(Routes.NOTEBOOKS) },
+                onOpenChatList = { navController.navigate(Routes.CHAT_LIST) },
                 onOpenQuestion = { id -> navController.navigate(Routes.detail(id)) }
             )
         }
@@ -229,6 +243,7 @@ fun MistakeBookNavHost(
                 onRecrop = { path -> navController.navigate(Routes.crop(path)) },
                 // 重新识别提交成功后跳进度页，让用户看着它跑完。
                 // 之前调的是 onBack()，用户点完就「回到主页」，完全不知道任务已经提交了。
+                onOpenChat = { questionId -> navController.navigate(Routes.chat(questionId)) },
                 onReRecognize = { taskId ->
                     navController.navigate(Routes.progress(taskId)) {
                         popUpTo(Routes.HOME)
@@ -246,6 +261,34 @@ fun MistakeBookNavHost(
                 questionId = entry.arguments?.getLong("questionId") ?: 0L,
                 onRecrop = { path -> navController.navigate(Routes.crop(path)) },
                 onBack = { navController.popBackStack() }
+            )
+        }
+
+        /**
+         * AI 对话。
+         *
+         * `questionId = -1` 表示自由会话。这里必须用哨兵值而不是可选参数：
+         * 导航参数的 null 与「没传」分不清，而 0 是数据库自增起点，
+         * 拿它当「无」会在极端情况下撞上一条 id=0 的题目。
+         */
+        composable(
+            route = "${Routes.CHAT}/{questionId}",
+            arguments = listOf(navArgument("questionId") { type = NavType.LongType })
+        ) { entry ->
+            val raw = entry.arguments?.getLong("questionId") ?: Routes.CHAT_FREE
+            ChatScreen(
+                container = container,
+                questionId = raw.takeIf { it != Routes.CHAT_FREE },
+                onBack = { navController.popBackStack() },
+                onOpenSettings = { navController.navigate(Routes.SETTINGS) }
+            )
+        }
+
+        composable(Routes.CHAT_LIST) {
+            ChatListScreen(
+                container = container,
+                onBack = { navController.popBackStack() },
+                onOpenSession = { questionId -> navController.navigate(Routes.chat(questionId)) }
             )
         }
 
