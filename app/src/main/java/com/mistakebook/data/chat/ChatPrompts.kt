@@ -1,0 +1,100 @@
+package com.mistakebook.data.chat
+
+import com.mistakebook.domain.Option
+import com.mistakebook.domain.labelFor
+
+/**
+ * 对话用的提示词与题目上下文渲染。
+ *
+ * 纯函数，无 Android 依赖，可单测。
+ */
+object ChatPrompts {
+
+    /**
+     * 角色设定。
+     *
+     * 两条硬要求：
+     * 1. 公式用 `$…$` / `$$…$$`——界面靠 [com.mistakebook.ui.common.RichText] 的
+     *    KaTeX 渲染，模型若输出裸 `x^2`，用户看到的是源码而不是公式。
+     * 2. **先指出记录里的答案或解析是否自洽**。这个 App 收录的错题里，
+     *    OCR/识别环节抄错的题真实存在（v0.0.5 用户实测：`1/(x²-1)` 存成了 `1/(e^x-1)`，
+     *    渲染完全正常、但答案是错的）。不主动核对，用户就会把错的当对的记下去。
+     */
+    val SYSTEM: String = """
+        你是一位耐心的中学/大学理科辅导老师，正在一个「错题本」应用里回答用户关于某道错题的问题。
+
+        输出要求：
+        1. 用中文回答，Markdown 排版，结构清晰；必要时用小标题和列表分步。
+        2. 所有数学公式必须用 LaTeX：行内用 $...$，独立成行用 $$...$$。不要输出裸 LaTeX 源码。
+        3. 如果用户的题目里记录了答案或解析，请**先核对它与题干是否自洽**；
+           若明显有抄录或计算错误，明确指出「记录里的答案可能有问题」并给出正确推导。
+           若没有问题，也简短确认一句，不要默认记录一定正确。
+        4. 不确定的地方直接说不确定，不要编造定理、数据或出处。
+        5. 篇幅适中：讲清思路和关键步骤即可，不要为凑长度重复题干。
+    """.trimIndent()
+
+    /**
+     * 渲染题目上下文。
+     *
+     * **只注入一次**（首条助手消息，`injected = true`），后续轮次靠 [com.mistakebook.domain.ChatRole.SYSTEM]
+     * 消息一直带在上下文头部。
+     *
+     * @param options 题干选项；填空/解答题为空。
+     * @param difficulty 1..5，转成中文档位。
+     * @param errorReason 错因枚举名，转成中文。
+     */
+    fun questionContext(
+        title: String,
+        stem: String,
+        options: List<Option>,
+        answer: String,
+        analysis: String,
+        subjectName: String,
+        knowledgePoints: List<String>,
+        difficulty: Int,
+        errorReasonName: String
+    ): String {
+        val sb = StringBuilder()
+        sb.appendLine("以下是用户正在复习的一道错题：")
+        if (title.isNotBlank()) sb.appendLine("标题：$title")
+        if (subjectName.isNotBlank()) sb.appendLine("学科：$subjectName")
+        if (knowledgePoints.isNotEmpty()) {
+            sb.appendLine("知识点：${knowledgePoints.joinToString("、")}")
+        }
+        sb.appendLine("难度：${difficultyLabel(difficulty)}")
+        if (errorReasonName.isNotBlank()) sb.appendLine("记录中的错因：$errorReasonName")
+        sb.appendLine()
+        sb.appendLine("【题干】")
+        sb.appendLine(stem.ifBlank { "（空）" })
+        if (options.isNotEmpty()) {
+            sb.appendLine()
+            sb.appendLine("【选项】")
+            options.forEachIndexed { index, option ->
+                sb.appendLine("${labelFor(index)}. ${option.text}")
+            }
+        }
+        if (answer.isNotBlank()) {
+            sb.appendLine()
+            sb.appendLine("【我记录的答案】")
+            sb.appendLine(answer)
+        }
+        if (analysis.isNotBlank()) {
+            sb.appendLine()
+            sb.appendLine("【我记录的解析】")
+            sb.appendLine(analysis)
+        }
+        sb.appendLine()
+        sb.append("请基于以上内容回答用户的问题。")
+        return sb.toString().trim()
+    }
+
+    /** 1..5 -> 中文档位。越界时按 3 处理。 */
+    fun difficultyLabel(difficulty: Int): String = when (difficulty) {
+        1 -> "很简单"
+        2 -> "简单"
+        3 -> "中等"
+        4 -> "较难"
+        5 -> "很难"
+        else -> "中等"
+    }
+}

@@ -1,0 +1,354 @@
+package com.mistakebook.data.repos
+
+import android.util.Log
+import com.mistakebook.data.AppFiles
+import com.mistakebook.data.chat.AssembledContext
+import com.mistakebook.data.chat.ChatContextAssembler
+import com.mistakebook.data.chat.ChatPrompts
+import com.mistakebook.data.chat.OutgoingMessage
+import com.mistakebook.data.local.ChatDao
+import com.mistakebook.data.local.QuestionDao
+import com.mistakebook.data.local.SubjectDao
+import com.mistakebook.data.local.entities.ChatAttachment
+import com.mistakebook.data.local.entities.ChatMessage
+import com.mistakebook.data.local.entities.ChatSession
+import com.mistakebook.domain.AttachmentKind
+import com.mistakebook.domain.AttachmentStatus
+import com.mistakebook.domain.ChatRole
+import com.mistakebook.domain.MessageStatus
+import com.mistakebook.domain.Option
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonPrimitive
+
+/**
+ * 图片附件 -> 发给模型的 data URL。
+ *
+ * 抽成接口是为了让 [ChatRepository] 不依赖图片处理细节（步骤 5 才实现真正的那套），
+ * 同时让仓储逻辑能脱离 Android 单测。
+ */
+fun interface ImageDataUrlProvider {
+    /** @return base64 data URL；失败返回 null（该图就不带，**不因此让整条消息失败**）。 */
+    suspend fun dataUrlOf(attachment: ChatAttachment): String?
+}
+
+/**
+ * 对话仓储。
+ *
+ * 只做「存 / 取 / 拼」，**不做网络**——流式在 [com.mistakebook.net.llm.ChatCompletionStream]，
+ * 两者分开才能让上下文组装脱离 IO 单测。
+ */
+class ChatRepository(
+    private val chatDao: ChatDao,
+    private val questionDao: QuestionDao,
+    private val subjectDao: SubjectDao,
+    private val appFiles: AppFiles,
+    private val imageDataUrls: ImageDataUrlProvider
+) {
+
+    private val json = Json { ignoreUnknownKeys = true }
+    private val optionListSerializer = ListSerializer(Option.serializer())
+
+    // ------------------------------------------------------------ 会话
+
+    fun observeSessions(): kotlinx.coroutines.flow.Flow<List<ChatSession>> = chatDao.observeSessions()
+
+    fun observeSession(id: Long): kotlinx.coroutines.flow.Flow<ChatSession?> = chatDao.observeSession(id)
+
+    fun observeMessages(sessionId: Long): kotlinx.coroutines.flow.Flow<List<ChatMessage>> =
+        chatDao.observeMessages(sessionId)
+
+    /**
+     * 取某题的会话，没有就建一个。
+     *
+     * 「每题一个固定会话」就靠这里。复用已存在的，**包括已有消息的**——
+     * 用户上次聊到一半，这次接着聊，而不是每次进来都是空白。
+     */
+    suspend fun sessionForQuestion(questionId: Long?): ChatSession {
+        if (questionId != null) {
+            chatDao.findSessionByQuestion(questionId)?.let { return it }
+        }
+        val now = System.currentTimeMillis()
+        val id = chatDao.insertSession(
+            ChatSession(
+                questionId = questionId,
+                title = "",
+                createdAt = now,
+                updatedAt = now
+            )
+        )
+        return ChatSession(id = id, questionId = questionId, createdAt = now, updatedAt = now)
+    }
+
+    suspend fun newFreeSession(): ChatSession {
+        val now = System.currentTimeMillis()
+        val id = chatDao.insertSession(
+            ChatSession(questionId = null, title = "", createdAt = now, updatedAt = now)
+        )
+        return ChatSession(id = id, questionId = null, createdAt = now, updatedAt = now)
+    }
+
+    /** 重命名。改完**锁定自动标题**，否则下次进会话会被首条消息摘要冲掉。 */
+    suspend fun renameSession(id: Long, title: String) {
+        val session = chatDao.findSession(id) ?: return
+        chatDao.updateSession(session.copy(title = title.trim(), titleLocked = true, updatedAt = System.currentTimeMillis()))
+    }
+
+    suspend fun softDeleteSession(id: Long) {
+        val now = System.currentTimeMillis()
+        chatDao.softDeleteSession(id, now)
+        appFiles.deleteRecursively(appFiles.chatDir(id))
+    }
+
+    suspend fun restoreSession(id: Long) {
+        chatDao.restoreSession(id, System.currentTimeMillis())
+    }
+
+    suspend fun softDeleteAllSessions() {
+        val now = System.currentTimeMillis()
+        val sessions = chatDao.observeSessionsOnce()
+        sessions.forEach { appFiles.deleteRecursively(appFiles.chatDir(it.id)) }
+        chatDao.softDeleteAllSessions(now)
+    }
+
+    // ------------------------------------------------------------ 消息
+
+    /**
+     * 进会话时收拾残局：把仍停在 STREAMING 的消息收敛成 CANCELED。
+     *
+     * 不做的话，进程被杀后重进页面会永远显示「生成中」，
+     * 而且用户没有任何办法让它停下来。
+     */
+    suspend fun recoverStaleStreaming(sessionId: Long) {
+        val stale = chatDao.findStreamingMessage(sessionId) ?: return
+        chatDao.markStatus(
+            id = stale.id,
+            status = MessageStatus.CANCELED,
+            errorMessage = null,
+            updatedAt = System.currentTimeMillis()
+        )
+    }
+
+    suspend fun insertUserMessage(
+        sessionId: Long,
+        text: String,
+        attachmentIds: List<Long> = emptyList(),
+        questionId: Long? = null
+    ): ChatMessage {
+        val now = System.currentTimeMillis()
+        val id = chatDao.insertMessage(
+            ChatMessage(
+                sessionId = sessionId,
+                role = ChatRole.USER,
+                content = text,
+                status = MessageStatus.DONE,
+                attachmentIdsJson = json.encodeToString(ListSerializer(Long.serializer()), attachmentIds),
+                questionId = questionId,
+                createdAt = now,
+                updatedAt = now
+            )
+        )
+        touchSessionWith(sessionId, text, now)
+        return ChatMessage(
+            id = id, sessionId = sessionId, role = ChatRole.USER, content = text,
+            status = MessageStatus.DONE, createdAt = now, updatedAt = now
+        )
+    }
+
+    /**
+     * 插入题目上下文那条 [ChatRole.SYSTEM] 消息（`injected = true`）。
+     *
+     * **只在会话第一条时插一次**，之后一直靠它垫在上下文头部。
+     */
+    suspend fun ensureQuestionContext(sessionId: Long, questionId: Long): Boolean {
+        if (chatDao.countMessages(sessionId) > 0) return false
+        val text = buildQuestionContext(questionId) ?: return false
+        val now = System.currentTimeMillis()
+        chatDao.insertMessage(
+            ChatMessage(
+                sessionId = sessionId,
+                role = ChatRole.SYSTEM,
+                content = text,
+                status = MessageStatus.DONE,
+                questionId = questionId,
+                injected = true,
+                createdAt = now,
+                updatedAt = now
+            )
+        )
+        return true
+    }
+
+    /** 新建一条空的 STREAMING 助手消息，边收边往里写。 */
+    suspend fun insertStreamingAssistantMessage(sessionId: Long, model: String): Long {
+        val now = System.currentTimeMillis()
+        val id = chatDao.insertMessage(
+            ChatMessage(
+                sessionId = sessionId,
+                role = ChatRole.ASSISTANT,
+                content = "",
+                status = MessageStatus.STREAMING,
+                createdAt = now,
+                updatedAt = now
+            )
+        )
+        // 记下「这条是哪个模型答的」。会话内换模型不影响历史。
+        chatDao.findSession(sessionId)?.let { session ->
+            chatDao.updateSession(session.copy(model = model, updatedAt = now))
+        }
+        return id
+    }
+
+    suspend fun appendAssistantContent(id: Long, content: String) {
+        val current = chatDao.findMessage(id) ?: return
+        chatDao.appendContent(id, current.content + content, MessageStatus.STREAMING, System.currentTimeMillis())
+    }
+
+    suspend fun finishAssistantMessage(
+        id: Long,
+        status: MessageStatus,
+        errorMessage: String?,
+        promptTokens: Int = 0,
+        completionTokens: Int = 0
+    ) {
+        val now = System.currentTimeMillis()
+        if (promptTokens > 0 || completionTokens > 0) {
+            chatDao.markUsage(id, promptTokens, completionTokens, now)
+        }
+        chatDao.markStatus(id, status, errorMessage, now)
+        val message = chatDao.findMessage(id)
+        chatDao.refreshSessionStats(message?.sessionId ?: 0L, now)
+    }
+
+    suspend fun deleteMessage(id: Long) {
+        val message = chatDao.findMessage(id) ?: return
+        message.attachmentIds().forEach { attachmentId ->
+            chatDao.findAttachment(attachmentId)?.let { deleteAttachmentFile(it) }
+        }
+        // 附件记录靠外键 CASCADE 清掉；这里显式调一次是为了顺带删文件。
+        chatDao.deleteAttachmentsOf(id)
+        chatDao.markStatus(id, MessageStatus.CANCELED, null, System.currentTimeMillis())
+        chatDao.refreshSessionStats(message.sessionId, System.currentTimeMillis())
+    }
+
+    // ------------------------------------------------------------ 附件
+
+    fun observeAttachments(messageId: Long): kotlinx.coroutines.flow.Flow<List<ChatAttachment>> =
+        chatDao.observeAttachments(messageId)
+
+    suspend fun insertAttachment(attachment: ChatAttachment): Long = chatDao.insertAttachment(attachment)
+
+    suspend fun updateAttachment(attachment: ChatAttachment) = chatDao.updateAttachment(attachment)
+
+    suspend fun deleteAttachment(attachment: ChatAttachment) {
+        chatDao.deleteAttachment(attachment.id)
+        deleteAttachmentFile(attachment)
+    }
+
+    private fun deleteAttachmentFile(attachment: ChatAttachment) {
+        runCatching { java.io.File(attachment.localPath).takeIf { it.exists() }?.delete() }
+            .onFailure { Log.w(TAG, "删除附件文件失败: ${attachment.localPath}", it) }
+    }
+
+    // ------------------------------------------------------------ 上下文组装
+
+    /**
+     * 组装要发出去的请求上下文。
+     *
+     * @param pendingText 本次新输入。为空表示「重试上一条」，此时历史里已含它。
+     */
+    suspend fun buildContext(
+        sessionId: Long,
+        questionId: Long?,
+        pendingText: String = ""
+    ): AssembledContext {
+        val systemContext = if (questionId != null) buildQuestionContext(questionId).orEmpty() else ""
+        val history = chatDao.messagesExcludingInjected(sessionId)
+            .filter { it.status != MessageStatus.FAILED }
+            .map { it.toOutgoing() }
+        return ChatContextAssembler.assemble(
+            systemPrompt = ChatPrompts.SYSTEM,
+            questionContext = systemContext,
+            history = history,
+            pendingText = pendingText
+        )
+    }
+
+    private suspend fun ChatMessage.toOutgoing(): OutgoingMessage {
+        val attachments = attachmentIds().mapNotNull { chatDao.findAttachment(it) }
+        val usable = attachments.filter { it.status == AttachmentStatus.READY }
+        val text = buildString {
+            append(content)
+            val excerpts = usable.filter { it.kind != AttachmentKind.IMAGE }
+                .mapNotNull { it.textExcerpt.takeIf { excerpt -> excerpt.isNotBlank() } }
+            if (excerpts.isNotEmpty()) {
+                append("\n\n")
+                append(excerpts.joinToString("\n\n"))
+            }
+        }
+        val images = usable.filter { it.kind == AttachmentKind.IMAGE }
+            .mapNotNull { attachment -> runCatching { imageDataUrls.dataUrlOf(attachment) }.getOrNull() }
+        return OutgoingMessage(
+            id = id,
+            role = role,
+            text = text,
+            images = images
+        )
+    }
+
+    // ------------------------------------------------------------ 辅助
+
+    private fun ChatMessage.attachmentIds(): List<Long> {
+        if (attachmentIdsJson.isBlank()) return emptyList()
+        return runCatching {
+            val element = json.parseToJsonElement(attachmentIdsJson) as? JsonArray ?: return emptyList()
+            element.mapNotNull { it.jsonPrimitive.content.toLongOrNull() }
+        }.getOrDefault(emptyList())
+    }
+
+    /** 首条用户消息的前若干字当标题。已重命名过的会话不覆盖。 */
+    private suspend fun touchSessionWith(sessionId: Long, firstUserText: String, now: Long) {
+        val session = chatDao.findSession(sessionId) ?: return
+        if (session.titleLocked) {
+            chatDao.refreshSessionStats(sessionId, now)
+            return
+        }
+        val trimmed = firstUserText.trim().replace(Regex("\\s+"), " ")
+        val title = if (trimmed.length <= TITLE_MAX_CHARS) trimmed else trimmed.take(TITLE_MAX_CHARS) + "…"
+        chatDao.updateSession(session.copy(title = title, updatedAt = now))
+        chatDao.refreshSessionStats(sessionId, now)
+    }
+
+    private suspend fun buildQuestionContext(questionId: Long): String? {
+        val question = questionDao.findById(questionId) ?: return null
+        val subjectName = question.subjectId?.let { subjectDao.findById(it)?.name }.orEmpty()
+        val options = runCatching {
+            json.decodeFromString(optionListSerializer, question.optionsJson)
+        }.getOrDefault(emptyList())
+        // 知识点存的是 JSON 字符串数组（`json.encodeToString(List<String>)`），
+        // 不是对象数组——早先按 `{name:...}` 解析会静默得到空列表。
+        val knowledgePoints = runCatching {
+            val element = json.parseToJsonElement(question.knowledgePointsJson) as? JsonArray
+            element?.mapNotNull { it.jsonPrimitive.contentOrNull?.takeIf(String::isNotBlank) }.orEmpty()
+        }.getOrDefault(emptyList())
+        return ChatPrompts.questionContext(
+            title = question.title,
+            stem = question.stem,
+            options = options,
+            answer = question.answer,
+            analysis = question.analysis,
+            subjectName = subjectName,
+            knowledgePoints = knowledgePoints,
+            difficulty = question.difficulty,
+            errorReasonName = question.errorReason.name
+        )
+    }
+
+    private companion object {
+        const val TAG = "ChatRepository"
+        const val TITLE_MAX_CHARS = 20
+    }
+}

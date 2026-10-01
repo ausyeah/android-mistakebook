@@ -46,6 +46,21 @@ class AppFiles(context: Context) {
         return File(dir, "${UUID.randomUUID()}.jpg")
     }
 
+    /**
+     * 对话附件的私有目录。
+     *
+     * **必须拷进应用私有目录**：用户从相册或文件管理器选的原文件随时可能被删或被移动，
+     * 而对话历史是长期存在的——原文件没了，历史里的附件也就渲染不出来了。
+     */
+    fun chatDir(sessionId: Long): File = File(filesRoot, "chats/$sessionId")
+
+    /** 对话附件落盘。扩展名保留原样，便于后续按类型分派。 */
+    fun chatFile(sessionId: Long, name: String, extension: String): File {
+        val dir = chatDir(sessionId)
+        dir.mkdirs()
+        return File(dir, "$name.$extension")
+    }
+
     fun deleteRecursively(file: File?) {
         if (file == null || !file.exists()) return
         file.listFiles()?.forEach { deleteRecursively(it) }

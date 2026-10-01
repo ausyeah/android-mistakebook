@@ -95,6 +95,16 @@ class AppContainer(context: Context) {
         NotebookRepository(database.notebookDao())
     }
 
+    val chatRepository: com.mistakebook.data.repos.ChatRepository by lazy {
+        com.mistakebook.data.repos.ChatRepository(
+            chatDao = database.chatDao(),
+            questionDao = database.questionDao(),
+            subjectDao = database.subjectDao(),
+            appFiles = files,
+            imageDataUrls = com.mistakebook.data.chat.ChatImageDataUrls()
+        )
+    }
+
     val mineruClient: MineruClient by lazy { MineruClient(mineruApi, files) }
 
     val llmClient: LlmClient by lazy { LlmClient(llmApi) }
