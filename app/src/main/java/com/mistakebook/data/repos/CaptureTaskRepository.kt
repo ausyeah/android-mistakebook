@@ -34,8 +34,8 @@ class CaptureTaskRepository(private val dao: CaptureTaskDao) {
     suspend fun setStatus(id: Long, status: TaskStatus, now: Long) =
         dao.updateStatus(id, status, null, now)
 
-    suspend fun setStatusIfParsing(id: Long, stage: String, now: Long) =
-        dao.moveToParsing(id, stage, now)
+    suspend fun setStatusIfParsing(id: Long, now: Long) =
+        dao.moveToParsing(id, now)
 
     suspend fun setStage(id: Long, stage: String, now: Long) = dao.updateStage(id, stage, now)
 

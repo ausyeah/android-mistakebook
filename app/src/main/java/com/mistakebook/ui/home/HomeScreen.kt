@@ -134,9 +134,22 @@ fun HomeScreen(
         if (filterDue) viewModel.setDueOnly(true)
     }
     // 错题本页选完回来时应用筛选
+    // 错题本页选完回来时应用筛选。
+    //
+    // **顺序不能颠倒，且必须先清 source 再设 target。**
+    //
+    // 原来写成 `setNotebook(id)` 然后 `onNotebookPicked(null)`：
+    // 两次都是 state 写入，同一帧内都会触发重组。重组后 effect 因为 key 变成 null
+    // 而**重跑一次**，于是 `setNotebook(null)` 把刚设好的筛选又清掉——
+    // 用户点「某个错题本」，界面闪一下就变回「全部」，功能实际不可用。
+    //
+    // 改成先清 source（key 变 null → effect 重跑，此时读到的已是 null，
+    // 于是 setNotebook(null) 幂等的），再在**下一个 key 值**上设 target。
     LaunchedEffect(pickedNotebookId) {
-        viewModel.setNotebook(pickedNotebookId)
+        val picked = pickedNotebookId
+        if (picked == null) return@LaunchedEffect
         onNotebookPicked(null)
+        viewModel.setNotebook(picked)
     }
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()

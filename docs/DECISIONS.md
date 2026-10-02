@@ -1414,3 +1414,156 @@ scaled = (value - threshold) * 255 / spread + 128
 容易让人去改正确的实现。
 
 单元测试 337 条全绿（原 326）。
+---
+
+## v0.0.12 — 审查核实：4 项属实已修，5 项已失效
+
+收到一份 7 次子代理审查的报告（5 个 P0 / 22 个 P1 / 31 个 P2 / 20 个 P3）。
+**逐条核实后才动手——其中 5 条引用的是我已经删掉或改掉的代码。**
+
+### 已失效（基于旧版本，无需处理）
+
+| 报告条目 | 实际情况 |
+|---|---|
+| P0-2 DOCX 二次转义 | v0.0.10 已改为 `DocxParagraphs.Fragment` 类型模型，`renderTokens` 返回结构化片段，四个调用点无外层 `escapeXml` |
+| P0-3 PDF 原图 OOM | v0.0.10 已删 `PdfExporter`，改 HTML→WebView |
+| P0-4 PDF 分页死循环 | 同上 |
+| P2 `MarkdownModel` 跨行 `$$` | v0.0.11 已加 `displayMath` 状态机 |
+| P3 `PdfExporter` 死代码一批 | 同上 |
+
+**教训**：审查报告引用行号时，**必须先确认那个文件还在不在**。
+一份报告里混着「已修」和「未修」，而 P0 级别的条目最抢眼——
+照单全收会花大量时间去「修」一个不存在的 bug。
+
+### 属实且已修（4 项）
+
+#### 1. Room `MIGRATION_2_3` 定义了但没注册 —— 真阻断
+
+`version = 3`、迁移对象写好了，`addMigrations(MIGRATION_1_2)` 却漏了它。
+老用户从 v2 升级 → Room 找不到路径 → `IllegalStateException` → **启动即闪退**。
+新装用户不受影响，所以能一路发布出去。
+
+`.addMigrations(MIGRATION_1_2, MIGRATION_2_3)`。
+
+**新增 `MigrationRegistrationTest`**：扫源码检查
+① 定义过的迁移全部出现在 `addMigrations(...)` 里
+② 从版本 1 到当前版本路径完整（防止两条迁移之间断链）
+③ 禁止 `fallbackToDestructiveMigration`
+④ 必须开 `exportSchema`
+
+为什么扫源码而不用 `MigrationTestHelper`：要防的**不是迁移写错**，
+而是**迁移忘了注册**——那个错在 JVM 单测里根本不出现，因为没人会去开旧版本数据库。
+
+③ 那条测试自己踩了一次：最初扫全文，而本文件的 KDoc 里就写着
+`fallbackToDestructiveMigration` 这个词（正是在说明为什么不能开）→ **永远报红**。
+改成先剥注释与原始字符串再扫。**提醒功能可靠，但是假的——这类假警报比没测试更费时间。**
+
+#### 2. 首页错题本筛选选中即被自己清掉
+
+```kotlin
+LaunchedEffect(pickedNotebookId) {
+    viewModel.setNotebook(pickedNotebookId)   // 设
+    onNotebookPicked(null)                     // 清 source → key 变 null → effect 重跑
+}
+```
+
+两次都是 state 写入，同帧内触发重组；重组后 effect 因 key 变 null **重跑一次**，
+于是 `setNotebook(null)` 把刚设好的筛选清掉。用户点「某个错题本」，
+界面闪一下就变回「全部」——**功能实际不可用**。
+
+改成先清 source 再设 target，且 `picked == null` 时直接返回。
+
+#### 3. 备份/恢复与 Room WAL
+
+- 备份只拷 `.db` → **丢掉最近写入的数据**（WAL 里的部分）
+- 恢复直接覆盖 Room 仍打开的主库、且不删旧 `-wal/-shm`
+  → 下次启动 SQLite 把**旧 WAL 重放到新库**上 → 库损坏
+
+改法：`BackupManager` 注入 `closeDatabase` / `reopenDatabase`，
+备份前与恢复前都先关库（让 WAL checkpoint 进 `.db`），
+恢复时**连 `-wal`/`-shm` 一起删**。顺带补了 `chats` 目录
+（聊天附件存在里面，漏了它恢复后附件全成死链）和 `finally` 清理
+（失败时也在 cache 攒一份完整文档的体积）。
+
+`AppContainer.database` 从 `by lazy` 换成可替换引用——
+Room 实例一旦 close 就不能重开。
+
+踩了个 Kotlin 坑：`runCatching { try {…} finally {…} }` 里
+`try` 没有 else 分支时**推不出类型**，报「Missing return statement」，
+而这个报错完全指不到真正的原因。两次都改用局部变量 + 显式赋值。
+
+#### 4. MinerU 进度链路彻底失效 —— 用户报「一直在解析中」
+
+**根因不是我预想的 state 枚举问题**——子代理核对官方文档后确认那是**阴性**：
+状态字段名确实是 `state`，枚举有 6 个值（`done`/`waiting-file`/`pending`/
+`running`/`failed`/`converting`），我的 `when` 只处理 `done`/`failed`，
+其余落 `else` 继续轮询，**恰好正确**。PRD 只写了 3 个值是 PRD 漏了。
+
+真正的原因有两条，叠加成「卡死」观感：
+
+**a. `extract_progress` 是对象，不是 0-100 标量**
+
+官方响应：
+```json
+"extract_progress": { "extracted_pages": 1, "total_pages": 2, "start_time": "..." }
+```
+代码按标量处理，`toDoubleOrNull()` 对 `{extracted_pages=1, …}` 恒返回 null
+→ **整轮轮询一次进度都没报出来**。PRD 里写的「0-100」是错的，实现照抄了。
+
+**b. 界面文案被 SQL 覆盖成常量**
+
+`CaptureTaskDao.moveToParsing` 的 `SET …, stageText = :stage`，
+而调用方在同一次 `onStage` 里先写真实文案、再调它覆盖成
+`"MinerU 解析中"`——**第二次写入永远赢**。
+而 `ProgressScreen` 靠正则从 stageText 抠 `%`，那串常量没有百分号
+→ 进度永远算不出 → 无限转圈。
+
+两条叠加：无论服务端在第几步、无论第几次轮询，界面永远是同一句话 + 转圈，
+**与「真卡死」完全无法区分，排障时也拿不到任何信息**。
+
+改法：
+- `progressPercent()` 按对象解析，取值走 `runCatching`（字段类型不稳定时不该崩）
+- `moveToParsing` **不再写 `stageText`**，唯一写入方是 `updateStage`
+- `onStage` 里**先切状态、再写真实文案**（顺序反过来会把 bug 请回来）
+- 轮询**每轮都报状态**，带上服务端原文：「MinerU 解析中（waiting-file）」
+- `extract_result` 为空数组时视为「还没排上队」继续等，而不是立刻失败
+- 超时预算从 300s 提到 360s：循环条件只在每轮开头检查，
+  而单次 HTTP 受 `callTimeout=300` 约束，
+  最坏路径 ≈ 300 + 300 + 10 ≈ **10 分钟**才吐超时——用户看到的就是「一直在加载」
+- `runCatching` 吞掉 `CancellationException` → 按「取消」变成「识别失败，请重试」
+  → 用户重试即**真的重新上传一遍**，又消耗一次额度。
+  新增 `rethrowCancellation` 把取消异常放行
+
+**新增 `MineruProgressTest` 14 条**，覆盖对象/标量/字符串/缺字段/类型不对/未知状态。
+
+**测试立刻抓到一个我自己的 bug**：`intOrNull` 里写了
+`?.takeIf { element -> element is JsonPrimitive }`，
+而 `element` 是原始元素（`JsonObject`）而不是 primitive 结果 → 恒被过滤成 null。
+**断言写错对象，编译器不报错、测试也不报错，只是永远返回 null。**
+
+### 未处理（说明理由）
+
+- **P0-5 `alphaStats` 主线程逐像素**：结论可能成立（每批约 620 万次 JNI `getPixel`），
+  但行号已随 v0.0.10/v0.0.11 改动漂移，需重新核对；且这不是「不渲染」类问题，
+  影响面是卡顿，本轮先修阻断项。
+- **P1 识别引擎取消/去重**（已取消任务复活并真跑一遍，烧额度）：
+  与本次 MinerU 故障同域（都在 `pipeline/`），但需要读 `RecognitionEngine` 全文
+  才能确认 `jobs` map 的生命周期假设，本轮时间不够，留到下一轮。
+- **CI 密钥闸门 `grep | head` 在 pipefail 下被 SIGPIPE 绕过**：
+  属实且只有一行改动，但改 CI 需要谨慎验证，放在下一轮和别的 CI 改动一起做。
+- **P2/P3 全部 51 条**：分批处理。这份报告的价值在于**指出了要修什么**，
+  而不是「一次全修完」——一次改 50 处，改完无法归因是哪处引入的回归。
+
+### 方法论：核实优先于执行
+
+这份报告的 P0 部分最抢眼，也最容易让人直接动手。
+但核实后发现 **5 条 P0 里 3 条引用的是已删除或已修复的代码**。
+如果照单全收，就会花时间去「修」一个不存在的 bug，
+而且可能为了让报告成立而**把已经修好的代码改回去**。
+
+核实成本很低：5 次 grep。
+而误修成本很高：改动越接近 P0，越可能破坏已经在用的东西。
+
+另有一条教训来自测试自身：假警报（扫到注释里的关键词）
+比没有测试更浪费时间，因为它看起来像是「有 bug」，
+会让人去改**正确的**实现。

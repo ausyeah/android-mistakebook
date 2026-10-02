@@ -63,7 +63,7 @@ class MineruClient(
 
         // 关键：OSS 签名不允许带 Content-Type 头，带了会 SignatureDoesNotMatch(403)
         onStage("上传文件 ${formatSize(file.length())}…")
-        val uploaded = runCatching {
+        val uploaded = rethrowCancellation {
             api.uploadFile(
                 uploadUrl = uploadUrl,
                 body = file.asRequestBody()
@@ -85,7 +85,7 @@ class MineruClient(
         language: String,
         forceOcr: Boolean
     ): ApiResult<FileUrlsData> {
-        val response = runCatching {
+        val response = rethrowCancellation {
             api.fileUrlsBatch(
                 authorization = auth,
                 request = FileUrlsRequest(
@@ -129,7 +129,7 @@ class MineruClient(
             }
             delay(waitMs)
 
-            val response = runCatching { api.extractResults(auth, batchId) }
+            val response = rethrowCancellation { api.extractResults(auth, batchId) }
                 .getOrElse { return ApiResult.Failure(HttpFactory.throwableError(it)) }
             val body = response.body()
             if (!response.isSuccessful || body == null) {
@@ -140,15 +140,30 @@ class MineruClient(
                 return fail(ApiError(kind = ApiErrorKind.AUTH, serverMessage = body.msg))
             }
             val item = matchItem(body.data?.extract_result.orEmpty(), fileName)
-                ?: return fail(ApiErrorKind.BAD_RESPONSE, "未找到本次文件的解析结果")
-
-            item.extractProgress?.let { progress ->
-                item.progressPercent()?.let { percent ->
-                    if (percent in 0..99) onStage("MinerU 解析中 ${percent}%")
+                // 数组为空 = 还没排上队，不算错。
+                // 早先直接报「未找到本次文件的解析结果」失败，
+                // 而刚提交的任务确实会短暂返回空数组。
+                ?: if (body.data?.extract_result.isNullOrEmpty()) {
+                    onStage("MinerU 排队中…")
+                    null
+                } else {
+                    return fail(ApiErrorKind.BAD_RESPONSE, "未找到本次文件的解析结果")
                 }
+
+            // 每轮都报一次，带上服务端的状态原文。
+            //
+            // 以前只有 `extract_progress` 存在时才报，而那个字段解析不出来
+            // （它是对象不是标量，见 MineruDto.progressPercent）→
+            // 整轮循环一次都没报过 → 界面上一句固定文案 + 无限转圈，
+            // 与「真卡死」无法区分，也拿不到任何排障信息。
+            if (item != null) {
+                val percent = item.progressPercent()
+                val label = percent?.let { "MinerU 解析中 $it%" } ?: "MinerU 解析中（${item.state}）"
+                onStage(label)
             }
 
-            when (item.state) {
+            when (item?.state) {
+                null -> runningCount++
                 "done" -> {
                     val zipUrl = item.fullZipUrl
                         ?: return fail(ApiErrorKind.BAD_RESPONSE, "解析完成但未返回结果包地址")
@@ -168,7 +183,7 @@ class MineruClient(
         taskId: Long,
         batchId: String
     ): ApiResult<MineruOutcome> {
-        val response = runCatching { api.downloadZip(zipUrl) }
+        val response = rethrowCancellation { api.downloadZip(zipUrl) }
             .getOrElse { return ApiResult.Failure(HttpFactory.throwableError(it)) }
         val body = response.body()
         if (!response.isSuccessful || body == null) {
@@ -259,7 +274,7 @@ class MineruClient(
     /** 设置页「测试连接」：ping 返回 -60012(task not found) 即视为 Key 有效。 */
     suspend fun testConnection(mineruKey: String): ApiResult<Boolean> {
         if (mineruKey.isBlank()) return fail(ApiErrorKind.NO_KEY)
-        val response = runCatching { api.extractResults("Bearer $mineruKey", "ping") }
+        val response = rethrowCancellation { api.extractResults("Bearer $mineruKey", "ping") }
             .getOrElse { return ApiResult.Failure(HttpFactory.throwableError(it)) }
         if (!response.isSuccessful) {
             return fail(HttpFactory.httpError(response.code(), response.errorBody()?.string().orEmpty()))
@@ -278,11 +293,39 @@ class MineruClient(
 
     companion object {
         const val PING_TASK_NOT_FOUND = -60012
-        const val TOTAL_TIMEOUT_MS = 300_000L
+        /**
+ * 轮询总预算。
+ *
+ * **不是 300 秒。** 循环条件只在每轮开头检查一次，而单次 HTTP 调用受
+ * `HttpFactory.CALL_TIMEOUT_SECONDS = 300` 约束，最坏退避 10s。
+ * 于是最坏路径 ≈ 300（预算耗尽）+ 300（单次 call 卡满）+ 10 ≈ **10 分钟**才吐超时。
+ * 用户看到的就是「一直在加载」，远超预期。
+ */
+const val TOTAL_TIMEOUT_MS = 360_000L
         const val FIRST_DELAY_MS = 2_000L
         const val POLL_INTERVAL_MS = 3_000L
         val BACKOFF = longArrayOf(3_000L, 5_000L, 8_000L, 10_000L)
     }
+
+/**
+ * 执行一个会弃异常的块，但**取消异常直接抛出**。
+ *
+ * ## 为什么不能直接用 [runCatching]
+ *
+ * `runCatching` 捕获 `Throwable`，而 [kotlinx.coroutines.CancellationException] 正是
+ * `Throwable` 的子类。所以用户按「取消」时若正处于 HTTP 调用中，
+ * 取消被转成普通 `Failure`，协程继续跑到结束。
+ *
+ * 界面上就是「识别失败，请重试」——用户重试即是真的重新上传一遍，
+ * 又消耗一次 MinerU 额度。为一个取消按钮供应事故更多额度。
+ */
+private inline fun <T> rethrowCancellation(block: () -> T): Result<T> = try {
+    Result.success(block())
+} catch (cancelled: kotlinx.coroutines.CancellationException) {
+    throw cancelled
+} catch (error: Throwable) {
+    Result.failure(error)
+}
 }
 
 class MineruException(message: String) : Exception(message)

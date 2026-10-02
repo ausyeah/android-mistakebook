@@ -57,10 +57,28 @@ interface CaptureTaskDao {
         now: Long
     )
 
+    /**
+     * 切到「解析中」状态。
+     *
+     * **刻意不写 `stageText`。**
+     *
+     * 早先是 `SET status='PARSING', stageText=:stage`，而调用方在同一次
+     * `onStage` 里先写真实文案、再调这个方法把文案覆盖成常量
+     * （`RecognitionEngine.obtainMarkdown`）。**第二次写入永远赢**，
+     * 于是从「上传照片…」开始 stageText 就被钉死成同一句话，
+     * 直到整个识别结束。
+     *
+     * 后果不只是文案不对：`ProgressScreen` 靠正则从 stageText 里抠 `%`，
+     * 而那串常量没有百分号 → 进度永远算不出来 → 界面无限转圈。
+     * 用户看到「MinerU 解析中」转圈不动，与「真的卡死」完全无法区分，
+     * 排障时也拿不到任何信息。
+     *
+     * `stageText` 的唯一写入方必须是 [updateStage]。
+     */
     @Query(
-        "UPDATE capture_tasks SET status = 'PARSING', stageText = :stage, updatedAt = :now WHERE id = :id AND status != 'FAILED'"
+        "UPDATE capture_tasks SET status = 'PARSING', updatedAt = :now WHERE id = :id AND status != 'FAILED'"
     )
-    suspend fun moveToParsing(id: Long, stage: String, now: Long)
+    suspend fun moveToParsing(id: Long, now: Long)
 
     @Query("UPDATE capture_tasks SET stageText = :stage, updatedAt = :now WHERE id = :id")
     suspend fun updateStage(id: Long, stage: String, now: Long)

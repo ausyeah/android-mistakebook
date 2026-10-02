@@ -195,7 +195,17 @@ abstract class MistakeBookDatabase : RoomDatabase() {
 
         fun build(context: Context): MistakeBookDatabase =
             Room.databaseBuilder(context, MistakeBookDatabase::class.java, DB_NAME)
-                .addMigrations(MIGRATION_1_2)
+                // 两个都**必须**注册：漏一个，Room 就找不到那条升级路径，
+                // 直接抛 IllegalStateException——老用户一升级就闪退，
+                // 而且是在启动瞬间崩，闪退日志里只有一句「A migration from 2 to 3 was required
+                // but not found」，指向「数据库迁移」四个字，跟本文件无关，极难排查。
+                //
+                // 不能靠 `fallbackToDestructiveMigration` 兜底：见 MIGRATION_1_2 的注释，
+                // 那会静默清空用户攒下的错题。宁可崩也不能丢数据。
+                //
+                // 加新版本时记得两处同步：改上面的 `version`，并在此追加 MIGRATION_n_n+1。
+                // 「定义了但忘了注册」是 Room 最常见也最致命的疏漏。
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                 .build()
     }
 }

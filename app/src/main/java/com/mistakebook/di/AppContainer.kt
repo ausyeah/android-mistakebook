@@ -68,7 +68,38 @@ class AppContainer(context: Context) {
 
     private val llmApi: LlmApi = llmRetrofit.create(LlmApi::class.java)
 
-    val database: MistakeBookDatabase by lazy { MistakeBookDatabase.build(appContext) }
+    /**
+     * 数据库实例。
+     *
+     * 刻意**不用** `by lazy` + 固定实例：备份/恢复需要先 `close()` 让 WAL 落进
+     * `.db` 文件（Room 默认开 WAL，不关库的话备份缺最近数据，
+     * 恢复时旧 `-wal` 还会被重放到新库上）。
+ *
+     * Room 的实例一旦 close 就不能重开，所以这里换成可替换的引用，
+     * close 后由 [reopenDatabase] 重建一个新的。
+     *
+     * 读取方都是 `by lazy` 持有 DAO 实例，那些实例在重建后仍是旧的——
+     * 所以恢复之后 App 需要重启才完全生效。界面在恢复完成后会提示重启。
+     */
+    @Volatile
+    private var databaseRef: MistakeBookDatabase? = null
+
+    val database: MistakeBookDatabase
+        get() = databaseRef ?: synchronized(this) {
+            databaseRef ?: MistakeBookDatabase.build(appContext).also { databaseRef = it }
+        }
+
+    /** 备份/恢复期间关库。 */
+    fun closeDatabase() {
+        databaseRef?.close()
+        databaseRef = null
+    }
+
+    /** 关库之后重新打开。 */
+    fun reopenDatabase() {
+        databaseRef?.let { if (it.isOpen) return }
+        databaseRef = MistakeBookDatabase.build(appContext)
+    }
 
     val subjectRepository: SubjectRepository by lazy {
         SubjectRepository(database.subjectDao())
@@ -146,7 +177,16 @@ class AppContainer(context: Context) {
         RecognitionSubmitter(captureTaskRepository, recognitionEngine)
     }
 
-    val backupManager: BackupManager by lazy { BackupManager(appContext, files) }
+    val backupManager: BackupManager by lazy {
+        BackupManager(
+            appContext,
+            files,
+            // 关库让 WAL 落进 .db，否则备份缺最近数据、
+            // 恢复时旧 WAL 会被重放到新库上。详见 BackupManager 里的注释。
+            closeDatabase = { closeDatabase() },
+            reopenDatabase = { reopenDatabase() }
+        )
+    }
 
     // LaTeX 公式渲染（WebView + KaTeX，资源在 assets/katex）
     val mathRenderer: com.mistakebook.math.MathRenderer by lazy {

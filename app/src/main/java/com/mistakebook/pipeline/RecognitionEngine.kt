@@ -159,8 +159,12 @@ class RecognitionEngine(
             language = settings.ocrLanguage,
             forceOcr = settings.forceOcr,
             onStage = { stage ->
+                // **顺序：先切状态，再写真实文案。**
+                // 反过来的话 `setStatusIfParsing` 会用常量覆盖掉这里刚写的 stage，
+                // 界面就永远停在同一句话上（那个 bug 已经修掉，
+                // 但顺序反过来又会把它请回来）。
+                taskRepository.setStatusIfParsing(taskId, System.currentTimeMillis())
                 taskRepository.setStage(taskId, stage, System.currentTimeMillis())
-                taskRepository.setStatusIfParsing(taskId, "MinerU 解析中", System.currentTimeMillis())
             }
         )
         return when (result) {
