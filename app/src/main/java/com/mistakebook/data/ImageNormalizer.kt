@@ -43,6 +43,29 @@ object ImageNormalizer {
     /** 超过此饱和度视为「彩色笔迹」，走保色通道。 */
     private const val COLOR_SATURATION = 0.30f
 
+    /** [steepen] 的中点。映射围绕这里双向展开。 */
+    private const val MID = 128f
+
+    /**
+     * 阈值以下的过渡跨度占阈值的比例。
+     *
+     * **已不再使用** —— 早期版本用它决定暗部映射区间的分母，结果把
+     * 阈值下方一段输入钳成同一个值。保留名字是为了让旧注释里的推理可追溯。
+     */
+    private const val DARK_SPAN = 0.45f
+
+    /**
+ * 阈值以上的斜率。取值 4 是权衡：
+ * 太小则纸面推不到纯白（背景还发灰，OCR 多余噪声），
+ * 太大则抗锯齿边缘被切成硬边、铅笔字的灰度层次丢失。
+ *
+ * 原实现这个值是 10~21 —— 过高。
+ */
+    private const val UP_SLOPE = 4f
+
+    /** 暗部映射的最低输出。留 12 而不是 0，让最深的阴影仍不是纯黑。 */
+    private const val DARK_FLOOR = 12f
+
     /**
      * 把 [source] 归一化后写入 [target]，返回是否成功。
      *
@@ -197,14 +220,49 @@ object ImageNormalizer {
         (0.299f * r + 0.587f * g + 0.114f * b).toInt().coerceIn(0, 255)
 
     /**
-     * 以 [threshold] 为界做陡坡映射：
-     * 明显比阈值暗的压向 0，明显比阈值亮的推向 255，阈值附近快速过渡。
-     * 斜坡宽度取阈值的 12%，太宽没效果，太窄会把抗锯齿的边缘切碎。
+     * 以 [threshold] 为界做陡坡映射。
+     *
+     * ## 为什么不能是无脑直线
+     *
+     * 原来是 `(value - threshold) * 255 / spread + 128`，斜率高达 10~21 倍。
+     * 后果是**阈值以下只有 12~24 级灰度可用，而这段全被压到同一个值**：
+     * 暗部纸张（luma 60~90）正好落在这段里，用户看到的就是「没光线的地方一片死黑」，
+     * 而抗锯齿的浅灰边缘也被切碎，铅笔字的层次全丢了。
+     *
+     * ## 现在的做法：分段，且暗部留底
+     *
+     * - 阈值以上：`S-curve` 推到 255，斜率比原来温和，保住边缘过渡
+     * - 阈值以下：**不归零**，而是映射到 `[DARK_FLOOR, 128]`，
+     *   暗部仍有层次，只是被压暗——这是用户要的「提亮暗部」而不是「删掉暗部」
+     *
+     * 参数上，[DARK_SPAN] 取阈值的 0.45 而不是 0.12：
+     * 0.12 意味着阈值下 12 级灰度就归零，而 0.45 给了将近一半的暗部范围。
      */
-    private fun steepen(value: Int, threshold: Int): Int {
-        val spread = (threshold * 0.12f).toInt().coerceAtLeast(12)
-        val scaled = ((value - threshold) * 255f / spread + 128f).toInt()
-        return scaled.coerceIn(0, 255)
+    internal fun steepen(value: Int, threshold: Int): Int {
+        val v = value.toFloat()
+        val t = threshold.toFloat()
+
+        // 阈值以上：向 255 收敛。跨度 0.25 倍阈值 → 斜率 4 左右，
+        // 但**不封顶**：封顶会让 240 停在 229，推不到白，纸面不够干净。
+        // 跨度已经保证了斜率不会失控，不需要第二道保险。
+        if (v >= t) {
+            val upSpan = ((255f - t) / UP_SLOPE).coerceAtLeast(1f)
+            val scaled = (v - t) * (255f - MID) / upSpan + MID
+            return scaled.toInt().coerceIn(0, 255)
+        }
+
+        // 阈值以下：把整个 [0, threshold] 区间线性拉到 [DARK_FLOOR, MID]。
+        //
+        // 关键是区间上界就是 **threshold 本身**。
+        // 中间试过 `v / (threshold * 0.45)`：那么输入 threshold*0.45 ~ threshold
+        // 这一整段（暗部纸张恰恰在这里）全都落在分母之外，被 coerceIn 钳成同一个值，
+        // 「一片死黑」只是变成了「一片死灰」——参数换了，症状没变。
+        //
+        // 线性拉到整个区间的好处：输入 0~threshold 的每一级灰度都分到独立的输出值，
+        // 暗部既提亮了（不再是 0）又保住了层次。
+        val span = t.coerceAtLeast(1f)
+        val scaled = (v / span) * (MID - DARK_FLOOR) + DARK_FLOOR
+        return scaled.toInt().coerceIn(0, MID.toInt())
     }
 
     /** Otsu 法求灰度直方图的最大类间方差阈值。 */
