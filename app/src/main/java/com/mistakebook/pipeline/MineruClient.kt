@@ -58,8 +58,19 @@ class MineruClient(
             is ApiResult.Success -> r.data
             is ApiResult.Failure -> return@withContext r
         }
-        val uploadUrl = batch.file_urls.firstOrNull()
-            ?: return@withContext fail(ApiErrorKind.BAD_RESPONSE, "未获得上传地址")
+        // 请求里只发了一个文件，所以 file_urls 也应当只有一个。
+        // 真出现多个时**不能随便取第一个**——若服务端返回顺序与请求顺序不一致，
+        // 我们会把文件传到「另一个文件」的名下，于是服务端那边永远等不到我们的文件，
+        // 状态就一直停在 waiting-file / pending，而用量统计却在涨（别的文件被解析了）。
+        val uploadUrl = batch.file_urls.singleOrNull()
+            ?: if (batch.file_urls.isEmpty()) {
+                return@withContext fail(ApiErrorKind.BAD_RESPONSE, "未获得上传地址")
+            } else {
+                return@withContext fail(
+                    ApiErrorKind.BAD_RESPONSE,
+                    "服务端返回了 ${batch.file_urls.size} 个上传地址（预期 1 个），无法确定哪个对应本次文件"
+                )
+            }
 
         // 关键：OSS 签名不允许带 Content-Type 头，带了会 SignatureDoesNotMatch(403)
         onStage("上传文件 ${formatSize(file.length())}…")
@@ -115,6 +126,8 @@ class MineruClient(
         val startedAt = System.currentTimeMillis()
         var runningCount = 0
         var first = true
+        // 最后一次观察到的状态，用于超时时的错误文案
+        var lastSeenState = ""
         while (System.currentTimeMillis() - startedAt < TOTAL_TIMEOUT_MS) {
             val waitMs = when {
                 first -> {
@@ -139,27 +152,41 @@ class MineruClient(
                 // -60012 task not found 结合 ping 语义即可判断 Key 有效性，这里一律按错误处理
                 return fail(ApiError(kind = ApiErrorKind.AUTH, serverMessage = body.msg))
             }
-            val item = matchItem(body.data?.extract_result.orEmpty(), fileName)
-                // 数组为空 = 还没排上队，不算错。
-                // 早先直接报「未找到本次文件的解析结果」失败，
-                // 而刚提交的任务确实会短暂返回空数组。
-                ?: if (body.data?.extract_result.isNullOrEmpty()) {
-                    onStage("MinerU 排队中…")
-                    null
-                } else {
-                    return fail(ApiErrorKind.BAD_RESPONSE, "未找到本次文件的解析结果")
-                }
+            // 每轮都把诊断信息写进 stage——**用户看不到 logcat**，
+            // 界面上的这行字是我们唯一的排障依据。
+            // 包含：已等待秒数、服务端 state、返回项数、文件名匹配结果。
+            val elapsedSec = (System.currentTimeMillis() - startedAt) / 1000
+            val rawItems = body.data?.extract_result.orEmpty()
 
-            // 每轮都报一次，带上服务端的状态原文。
-            //
-            // 以前只有 `extract_progress` 存在时才报，而那个字段解析不出来
-            // （它是对象不是标量，见 MineruDto.progressPercent）→
-            // 整轮循环一次都没报过 → 界面上一句固定文案 + 无限转圈，
-            // 与「真卡死」无法区分，也拿不到任何排障信息。
+            val item = matchItem(rawItems, fileName)
+            if (item != null) lastSeenState = item.state
+
             if (item != null) {
                 val percent = item.progressPercent()
-                val label = percent?.let { "MinerU 解析中 $it%" } ?: "MinerU 解析中（${item.state}）"
-                onStage(label)
+                val detail = buildString {
+                    append("MinerU ").append(stageVerb(item.state)).append(' ')
+                    percent?.let { append(it).append("% ") }
+                    append("· ").append(elapsedSec).append("s")
+                    append(" · state=").append(item.state.ifBlank { "(空)" })
+                    append(" · 返回").append(rawItems.size).append("项")
+                }
+                onStage(detail)
+            } else {
+                onStage(
+                    "MinerU 等待服务端登记 · ${elapsedSec}s · 返回${rawItems.size}项" +
+                        if (rawItems.isEmpty()) "" else " · 文件名未匹配"
+                )
+            }
+
+            // `waiting-file` = 服务端还没收到我们上传的文件。
+            // 这是**我们这边**的问题（上传没落到位），继续轮询只会白等，
+            // 必须立刻报错并说清该查什么。
+            if (item?.state == "waiting-file" && elapsedSec > WAITING_FILE_GRACE_SEC) {
+                return fail(
+                    ApiErrorKind.BAD_RESPONSE,
+                    "文件已提交但服务端 90 秒仍未收到。" +
+                        "通常是上传未成功——请检查网络后重试；若反复出现请换个网络环境试"
+                )
             }
 
             when (item?.state) {
@@ -175,7 +202,23 @@ class MineruClient(
                 else -> runningCount++
             }
         }
-        return fail(ApiErrorKind.TIMEOUT, "MinerU 解析超时")
+        // 超时文案要带**最后观察到的状态**。
+        //
+        // 只说「解析超时」的话，用户无法判断该重试还是该等：
+        // 停在 `pending` 通常是服务端队列长（重试只会更糟），
+        // 停在 `running` 更可能是文件太大或内容复杂。
+        val waitedSec = (System.currentTimeMillis() - startedAt) / 1000
+        val lastState = lastSeenState.ifBlank { "未知" }
+        val advice = when (lastState) {
+            "pending" -> "服务端队列较长，重试会排到更后面。建议稍后再试，或减少同时提交的任务数。"
+            "waiting-file" -> "服务端始终没收到文件，请检查上传时的网络。"
+            "running", "converting" -> "任务在服务端处理中但耗时过长，可能是图片过大或页数过多。"
+            else -> "可以重试；若反复超时请检查网络或稍后再试。"
+        }
+        return fail(
+            ApiErrorKind.TIMEOUT,
+            "MinerU 解析超时（已等待 ${waitedSec / 60} 分 ${waitedSec % 60} 秒，最后状态 $lastState）。$advice"
+        )
     }
 
     private suspend fun downloadAndExtract(
@@ -241,13 +284,16 @@ class MineruClient(
         return markdown
     }
 
-    private fun matchItem(items: List<ExtractResultItem>, fileName: String): ExtractResultItem? {
-        items.firstOrNull { it.fileName == fileName }?.let { return it }
-        items.firstOrNull { it.name == fileName }?.let { return it }
-        items.firstOrNull {
-            it.fileName.substringAfterLast('/') == fileName.substringAfterLast('/')
-        }?.let { return it }
-        return items.firstOrNull()
+    /** 状态对应的中文动作词。纯粹为了界面可读。 */
+    @androidx.annotation.VisibleForTesting
+    fun stageVerb(state: String): String = when (state) {
+        "done" -> "完成"
+        "failed" -> "失败"
+        "running" -> "解析中"
+        "pending" -> "排队中"
+        "waiting-file" -> "等待文件上传"
+        "converting" -> "转换中"
+        else -> "处理中"
     }
 
     private fun collectImageRefs(markdown: String): List<String> =
@@ -302,6 +348,15 @@ class MineruClient(
  * 用户看到的就是「一直在加载」，远超预期。
  */
 const val TOTAL_TIMEOUT_MS = 360_000L
+
+/**
+ * `waiting-file` 状态宽限秒数。
+ *
+ * 超过这个时间还停在这个状态，说明我们上传的文件服务端一直没收到——
+ * 那是**我们这边**的问题（上传没落到位），不是队列问题，
+ * 继续轮询只是白等，不如立刻报错说清该查什么。
+ */
+const val WAITING_FILE_GRACE_SEC = 90L
         const val FIRST_DELAY_MS = 2_000L
         const val POLL_INTERVAL_MS = 3_000L
         val BACKOFF = longArrayOf(3_000L, 5_000L, 8_000L, 10_000L)
@@ -326,6 +381,43 @@ private inline fun <T> rethrowCancellation(block: () -> T): Result<T> = try {
 } catch (error: Throwable) {
     Result.failure(error)
 }
+}
+
+/**
+ * 从批量结果里找出属于本次文件的那一项。
+ *
+ * ## 为什么不留 `items.firstOrNull()` 兜底
+ *
+ * 早先最后一行是 `return items.firstOrNull()`。一旦文件名对不上
+ * （服务端改名、加后缀、编码差异），就会**静默拿到别人的那一项**——
+ * 显示的是别的文件的状态，于是「一直 pending」这种症状
+ * 完全无法归因：是它真的在排队，还是我根本在看错的那一项？
+ *
+ * 现在只接受三种明确匹配，且**列表里有多项时不再猜**：
+ * 猜错的代价是用户看到错误的状态却无从判断。
+ *
+ * 提成顶层函数是为了**能单测**。放成 private 时测试只能自己抄一份
+ * 实现——而本项目已经吃过三次「测试复制实现」的亏（BatchProtocolTest、
+ * DocxPackageTest、ManualEntryTest）：抄一份的行为，测的是那份拷贝，
+ * 真实的代码改了它不会红。
+ */
+@androidx.annotation.VisibleForTesting
+fun matchItem(items: List<ExtractResultItem>, fileName: String): ExtractResultItem? {
+    if (items.isEmpty()) return null
+    // **查询名为空时不参与匹配。**
+    // 服务端偶尔对某些文件不返回 `file_name`（空串），
+    // 那时 `it.fileName == fileName` 会把那一项当成匹配成功，
+    // 而它未必是本次的文件——等于又回到了「静默拿到别人的那一项」。
+    if (fileName.isNotBlank()) {
+        items.firstOrNull { it.fileName == fileName }?.let { return it }
+        items.firstOrNull { it.name == fileName }?.let { return it }
+        items.firstOrNull {
+            it.fileName.substringAfterLast('/') == fileName.substringAfterLast('/')
+        }?.let { return it }
+    }
+    // 只有一项时它必然是本次的（批量接口对单文件也返回单项）
+    if (items.size == 1) return items[0]
+    return null
 }
 
 class MineruException(message: String) : Exception(message)
