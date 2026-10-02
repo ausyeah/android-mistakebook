@@ -185,14 +185,12 @@ class DocxExporter(private val mathRenderer: MathRenderer) {
                     zip.closeEntry()
                 }
                 // document.xml 放最后：它是最大的一块，先把包结构铺好
-                put("word/document.xml", documentXml(docTitleFrom(body), body))
+                put("word/document.xml", documentXml(body))
             }
         }
     }
 
-    private fun docTitleFrom(body: String): String = "错题本导出"
-
-    private fun documentXml(title: String, body: String): String = """
+    private fun documentXml(body: String): String = """
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
