@@ -373,4 +373,17 @@
     <string name="chat_error_needs_key">还没配置 API Key</string>
     <string name="chat_error_needs_key_body">配置后才能与 AI 对话。Key 只保存在本机，不会上传到任何地方。</string>
     <string name="chat_loading">正在打开对话…</string>
+
+    <!-- ========== 导出格式（v0.0.8） ========== -->
+    <string name="export_format_title">导出格式</string>
+    <string name="export_format_pdf">PDF（打印用）</string>
+    <string name="export_format_html">HTML（单文件·可直接用浏览器打开）</string>
+    <string name="export_format_docx">DOCX（Word · 公式可编辑）</string>
+    <string name="export_generating">正在生成…</string>
+    <string name="export_done">已导出：%1$s</string>
+    <string name="export_open">打开</string>
+    <string name="export_share">分享</string>
+    <string name="export_failed">导出失败：%1$s</string>
+    <string name="export_skipped">有 %1$d 道题排版失败已跳过</string>
+    <string name="export_page_count">共 %1$d 页</string>
 </resources>

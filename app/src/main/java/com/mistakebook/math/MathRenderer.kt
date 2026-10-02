@@ -1,6 +1,7 @@
 package com.mistakebook.math
 
 import android.content.Context
+import androidx.collection.LruCache
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -202,6 +203,56 @@ class MathRenderer(context: Context) {
      * 「空白」这个症状对应至少五种完全不同的故障，光看现象无法区分，必须看数据。
      * 只做探测，不写缓存。
      */
+    /**
+     * LaTeX -> **MathML** 字符串。用于 HTML 导出。
+     *
+     * 为什么不直接用字体渲染：内嵌位图会让公式变成选不中的图像，
+     * 文件大几十倍，还会破坏复制搜索。MathML 是文字，浏览器自带渲染能力。
+     *
+     * 失败返回 null，由调用方回退到位图方案——每个公式独立回退，
+     * 而不是让整份文档导出失败。
+     */
+    suspend fun toMathMl(latex: String, displayMode: Boolean): String? =
+        withContext(Dispatchers.Main) {
+            mutex.withLock {
+                val trimmed = com.mistakebook.pipeline.LatexSanitizer.clean(
+                    com.mistakebook.pipeline.LatexEscapes.repairForDisplay(latex, mathOnly = false)
+                )
+                if (trimmed.isEmpty()) return@withLock null
+                mathMlCache.get(trimmed)?.let { cached ->
+                    return@withLock cached.takeIf { it.isNotEmpty() }
+                }
+                try {
+                    val view = ensureWebView()
+                    if (withTimeoutOrNull(PAGE_LOAD_TIMEOUT_MS) { pageLoaded.await() } == null) {
+                        Log.w(TAG, "KaTeX 页面加载超时(MathML): $trimmed")
+                        return@withLock null
+                    }
+                    val script = "toMathML(${jsonString(trimmed)}, $displayMode)"
+                    val raw = awaitJavascript(view, script) ?: return@withLock null
+                    // evaluateJavascript 对字符串返回值会再 JSON 编码一层，必须剥掉
+                    val text = unwrapJavascriptJson(raw)
+                    if (text.isEmpty()) return@withLock null
+                    val obj = runCatching { Json.parseToJsonElement(text).jsonObject }.getOrNull()
+                        ?: return@withLock null
+                    val ml = obj[MathMlProtocol.MATHML]?.jsonPrimitive?.content.orEmpty()
+                    if (ml.isBlank()) {
+                        Log.w(TAG, "MathML 为空: $trimmed")
+                        return@withLock null
+                    }
+                    mathMlCache.put(trimmed, ml)
+                    ml
+                } catch (t: Throwable) {
+                    Log.w(TAG, "MathML 生成失败: $trimmed", t)
+                    null
+                }
+            }
+        }
+
+    /** MathML 缓存。不限制数量：字符串比位图小很多，而导出只跑一遍。 */
+    private val mathMlCache = LruCache<String, String>(MATHML_CACHE_ENTRIES)
+
+
     suspend fun diagnose(): String = withContext(Dispatchers.Main) {
         mutex.withLock {
             val sb = StringBuilder()
@@ -643,6 +694,7 @@ class MathRenderer(context: Context) {
         private const val PAGE_LOAD_TIMEOUT_MS = 8_000L
         private const val TOLERANCE = 12
         private const val DEFAULT_FONT_PX = 112f
+    private const val MATHML_CACHE_ENTRIES = 400
         // 单位是设备像素；换算成 CSS 视口约 730px @3x，足够放下常规公式
         // 视口要足够宽：aligned 公式块可能很长，宽度不够就会触发字号缩小甚至裁切。
         // 高度给足，一块多行公式才不会被切掉。

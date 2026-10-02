@@ -153,8 +153,8 @@ class AppContainer(context: Context) {
         com.mistakebook.math.MathRenderer(appContext)
     }
 
-    val pdfPublisher: com.mistakebook.print.PdfPublisher by lazy {
-        com.mistakebook.print.PdfPublisher(appContext, files)
+    val exportPublisher: com.mistakebook.print.ExportPublisher by lazy {
+        com.mistakebook.print.ExportPublisher(appContext, files)
     }
 
     /** PDF 导入的中间状态：选中的文件与刚创建的任务 id。 */

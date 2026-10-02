@@ -940,3 +940,67 @@ NullPointerException: kotlin.Lazy.getValue() on a null object reference
 - **附件的 UI 上传上面图上符**：目前只在输入区显示文件名与大小，没有展开预览图。
 - **粘怠单不包截断处理**：裁断时会在消息尾部加一个提示，但没有“继续写」的流式续写（需要上游支持，且要处理半截公式的 `$` 未闭合问题）。
 - **语义审校**（查答案与解析是否自洽）仍未实现。本轮只在 system 里要求模型自己核对。
+
+## v0.0.8 · 导出格式三选一（PDF / HTML / DOCX）
+
+原本只能导 PDF。用户要求自由选择格式。
+
+### 最关键的决策：内容一份，版式各按格式
+
+新增 `print/ExportModel.kt`：`ExportCard` / `ExportDoc` / `ExportCardBuilder` / `RichToken` / `tokenizeWithMath`。
+`PdfExporter` 原来把「要展示哪些内容」写在自己的 `buildCard` 里，
+加上 HTML / DOCX 后若各写一遍，就会出现三份「这道题要不要显示答案」。
+
+结果是用户会发现「导 PDF 有答案、导 DOCX 没有」，而这种不一致**不会报错**、只会让人怀疑自己选错了题。
+
+这正是本项目植过多次的坑（v0.1.12：手机上加了宽度约束、打印侧没加）。所以：
+`PdfExporter` 只改**输入**（接 `ExportDoc`），版式代码一行不动；
+`RichToken` / `tokenizeWithMath` 从 `PdfExporter` 的 private 移到顶层。
+**重写一遍切分器必然出现细微差异**，那会让同一道题在 PDF 里公式正常、在 HTML 里显示成裸的 `$x$`。
+
+### 公式的处理：优先原生，回退位图
+
+用户指出「DOCX 不是也可以渲染 LaTeX 公式」——对的，OMML 就是 Word 的原生公式，
+双击能编辑。但它不是现成的：需要一个 **LaTeX → OMML 转换器**。
+
+- `print/LatexToOmml.kt`：手写。覆盖 `\frac` / `\sqrt` / `^` / `_` / 希腊字母 /
+  常用算符 / 函数名 / `\left \right`。
+- **不支持的一律返回 null**，由 `DocxExporter` 逐个公式回退成内嵌位图（`alt` 里留 LaTeX 原文）。
+  而不是让整份文档失败：**OMML 一旦吐出结构错误的 XML，Word 打开时会报「文档已损坏」**——
+  整份文档作废，比公式丑严重得多。缓存到位图路径永远可用。
+
+HTML 则走 **MathML**（KaTeX `output: 'mathml'`），而不是内嵌位图：
+MathML 是文字，浏览器自带渲染能力（Chrome 109+ / Safari / Firefox），
+**公式可选中可搜索**；而内嵌位图会让公式变成选不中的图像、文件大几十倍。
+拿不到 MathML 时也逐个公式回退位图。
+
+### docx 手写（零依赖）
+
+docx 就是 zip + XML。最少四份套件：
+`[Content_Types].xml` / `_rels/.rels` / `word/document.xml` / `word/_rels/document.xml.rels`，
+有图时再加 `word/media/`。
+
+- 项目规则禁止引 Apache POI；而上一轮已经手写过**读** docx（`DocxText`，16 条单测），写侧是同一套格式。
+- 图片用 DrawingML（`wp:inline` + `pic:pic`），宽高用 **EMU**（1 px @96dpi = 9525 EMU），
+  给错比例会把照片拉变形。
+- 图片类型按**魔数**判宛而不看扩展名——扩展名可能是错的，Word 会拒绝加载。
+- `content_types.xml` 里的图片 Default **按实际用到的才声明**。
+
+### 共享选项与 MIME
+
+- `PdfExporter.Options` 改为 `typealias Options = ExportOptions`。三种格式各自一份开关的话，
+  早晚会只改到其中一种。
+- `ExportFormat` 把扩展名 / MIME / 显示名收在一处。分享的 Intent 要 MIME，
+  落盘的文件名要扩展名，界面要显示名——**分散在三个文件里时连一个不改那两个就会出现「分享出去的东西打不开」**。
+- 原来的分享与打开都写死 `application/pdf`，现改为 `output.format.mimeType`。
+
+### 单测拖出来的真 bug
+
+1. **词分组后白色被当成一个 run 输出**：`x + 1` 的空白被插进去当成字符宽的空格，
+   而且会把上下标的基推错。“没收到字符就跳过”、不是「当成一个字符」。
+2. **上下标的基取错**：原实现把 `base` 同时当作基和上标内容（`m:sSup` 里 `<m:e>` 与 `<m:sup>` 写了同一个变量）。
+3. KDoc 里的 `word/media/*` 内容 `*/` **提前闭合了注释**（第二次承这个坑，第一次是 ChatScreen 里的 `image/*`）。
+
+### 已知的兼容性限制
+
+- OMML 在 Word 桌面版与 WPS 正常显示，但 **Google Docs 与部分手机端阅读器支持不好**，可能显示为空或转成图片。这是选 OMML 的代价，已知。

@@ -85,6 +85,32 @@
     return /[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(latex) || /\t[a-zA-Z]/.test(latex);
   }
 
+  /**
+   * 输出 **MathML**（不是位图）。
+   *
+   * 用于 HTML 导出：浏览器自带 MathML 渲染能力（Chrome 109+ / Safari / Firefox 均支持），
+   * 所以导出的 HTML 可以不引任何 JS、不联网、且公式是**可选中可搜索**的真文字。
+   * 这比内嵌位图好得多，也比引 KaTeX JS 好得多（那要 300KB+）。
+   *
+   * KaTeX 的 `output: 'mathml'` 与 HTML 输出的区别：HTML 输出会生成一大堆 span 体标记，
+   * 原文几乎完全丢失；MathML 输出保留语义标记，所以选它。
+   */
+  function toMathML(latex, displayMode) {
+    try {
+      var ml = katex.renderToString(latex, {
+        displayMode: !!displayMode,
+        throwOnError: false,
+        strict: false,
+        output: 'mathml'
+      });
+      return JSON.stringify({ ml: ml });
+    } catch (e) {
+      // 返回空字符串而不是抛异常：Android 侧会回退到渲染位图，
+      // 而位图路径永远可用。抛异常会让整份文档导出失败。
+      return JSON.stringify({ ml: '' });
+    }
+  }
+
   function render(latex, displayMode, maxDevicePx) {
     var out = document.getElementById('out');
     // 单条路径只抠 #out，所以必须先把 #sheet 藏起来：

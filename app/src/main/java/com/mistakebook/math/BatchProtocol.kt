@@ -145,3 +145,15 @@ internal object SingleProtocol {
     const val FONT_PX = "fs"
     const val ERR = "err"
 }
+
+/**
+ * JS ↔ Kotlin 的 MathML 协议。
+ *
+ * 与 [BatchProtocol] 同理：字段名**集中定义并用单测钉住**。
+ * 这套代码里已经因为字段名漂移静默失效两次（`fs` 被读成 `f`、
+ * `err` 被读成 `e`）——两次都不报错，只是特定功能一直不生效。
+ */
+internal object MathMlProtocol {
+    /** JS 返回对象里 MathML 字符串的键。 */
+    const val MATHML = "ml"
+}

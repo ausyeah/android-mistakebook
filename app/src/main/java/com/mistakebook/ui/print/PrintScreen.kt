@@ -64,6 +64,11 @@ import com.mistakebook.ui.common.Format
 import com.mistakebook.ui.common.QuestionThumb
 import com.mistakebook.ui.common.containerViewModel
 import com.mistakebook.ui.settings.BlankHeightRow
+import com.mistakebook.print.ExportFormat
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.foundation.shape.RoundedCornerShape
 
 /**
  * 打印页（PRD 7.7）：筛选 -> 勾选 -> 打印选项 -> 生成 PDF -> 分享。
@@ -137,7 +142,9 @@ fun PrintScreen(container: AppContainer, onBack: () -> Unit) {
                 onIncludeImage = viewModel::setIncludeImage,
                 onShowAnswer = viewModel::setShowAnswer,
                 onBlankRedo = viewModel::setBlankRedo,
-                onBlankHeight = viewModel::setBlankHeight
+                onBlankHeight = viewModel::setBlankHeight,
+                format = state.format,
+                onFormat = viewModel::setFormat
             )
 
             if (state.questions.isEmpty()) {
@@ -194,7 +201,8 @@ fun PrintScreen(container: AppContainer, onBack: () -> Unit) {
             confirmButton = {
                 TextButton(onClick = {
                     val intent = Intent(Intent.ACTION_SEND).apply {
-                        type = "application/pdf"
+                        // MIME 必须按格式取：写死 application/pdf 的话，分享 docx 时收件部应用会拒绝。
+                            type = output.format.mimeType
                         putExtra(Intent.EXTRA_STREAM, output.shareUri)
                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     }
@@ -205,7 +213,7 @@ fun PrintScreen(container: AppContainer, onBack: () -> Unit) {
                 Row {
                     TextButton(onClick = {
                         val intent = Intent(Intent.ACTION_VIEW).apply {
-                            setDataAndType(output.shareUri, "application/pdf")
+                            setDataAndType(output.shareUri, output.format.mimeType)
                             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                         }
                         runCatching { context.startActivity(intent) }
@@ -327,11 +335,13 @@ private fun PrintOptionsPanel(
     includeImage: Boolean,
     showAnswer: Boolean,
     blankRedo: Boolean,
-    blankHeight: Int,
+        blankHeight: Int,
+        format: ExportFormat,
     onIncludeImage: (Boolean) -> Unit,
     onShowAnswer: (Boolean) -> Unit,
     onBlankRedo: (Boolean) -> Unit,
-    onBlankHeight: (Int) -> Unit
+        onBlankHeight: (Int) -> Unit,
+        onFormat: (ExportFormat) -> Unit
 ) {
     Card(
         modifier = Modifier
@@ -365,9 +375,67 @@ private fun PrintOptionsPanel(
                 // 与设置页共用同一控件：直接显示并使用设置里存的值，不再是写死的三档
                 BlankHeightRow(height = blankHeight, onChange = onBlankHeight)
             }
+            Spacer(Modifier.height(10.dp))
+            FormatRow(format = format, onChange = onFormat)
         }
     }
 }
+
+  /**
+   * 导出格式选择。
+   *
+   * 用三个卡片而不是下拉框：三种格式的**用途差很大**（打印 / 分享 / 交给 Word 编辑），
+   * 下拉框里一行字说不清，选错了用户开始导出才发现。
+   */
+  @Composable
+  private fun FormatRow(format: ExportFormat, onChange: (ExportFormat) -> Unit) {
+      Column {
+          Text(
+              text = stringResource(R.string.export_format_title),
+              style = MaterialTheme.typography.labelMedium,
+              color = MaterialTheme.colorScheme.onSurfaceVariant
+          )
+          Spacer(Modifier.height(6.dp))
+          Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+              ExportFormat.entries.forEach { candidate ->
+                  val selected = candidate == format
+                  Surface(
+                      shape = RoundedCornerShape(8.dp),
+                      color = if (selected) {
+                          MaterialTheme.colorScheme.primaryContainer
+                      } else {
+                          MaterialTheme.colorScheme.surfaceVariant
+                      },
+                      border = if (selected) {
+                          androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.primary)
+                      } else {
+                          null
+                      },
+                      modifier = Modifier
+                          .weight(1f)
+                          .clickable { onChange(candidate) }
+                  ) {
+                      Box(
+                          modifier = Modifier.padding(horizontal = 8.dp, vertical = 10.dp),
+                          contentAlignment = Alignment.Center
+                      ) {
+                          Text(
+                              text = stringResource(candidate.labelRes),
+                              style = MaterialTheme.typography.labelSmall,
+                              color = if (selected) {
+                                  MaterialTheme.colorScheme.onPrimaryContainer
+                              } else {
+                                  MaterialTheme.colorScheme.onSurfaceVariant
+                              },
+                              maxLines = 2,
+                              textAlign = TextAlign.Center
+                          )
+                      }
+                  }
+              }
+          }
+      }
+  }
 
 @Composable
 private fun OptionSwitch(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {

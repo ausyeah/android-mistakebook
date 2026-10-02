@@ -8,8 +8,14 @@ import com.mistakebook.data.prefs.SettingsSnapshot
 import com.mistakebook.di.AppContainer
 import com.mistakebook.domain.ErrorReason
 import com.mistakebook.domain.MasteryStatus
+import com.mistakebook.print.DocxExporter
+import com.mistakebook.print.ExportCardBuilder
+import com.mistakebook.print.ExportFormat
+import com.mistakebook.print.ExportOptions
+import com.mistakebook.print.ExportPublisher
+import com.mistakebook.print.ExportResult
+import com.mistakebook.print.HtmlExporter
 import com.mistakebook.print.PdfExporter
-import com.mistakebook.print.PdfPublisher
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -30,8 +36,10 @@ data class PrintUiState(
     val showAnswer: Boolean = false,
     val blankRedo: Boolean = true,
     val blankHeight: Int = 100,
+    /** 选中的导出格式。 */
+    val format: ExportFormat = ExportFormat.PDF,
     val generating: Boolean = false,
-    val result: PdfPublisher.Output? = null,
+    val result: ExportPublisher.Output? = null,
     val skipped: List<String> = emptyList(),
     val error: String? = null
 ) {
@@ -42,6 +50,18 @@ data class PrintUiState(
         get() = subjects.associate { it.id to it.name }
 }
 
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class, kotlinx.coroutines.FlowPreview::class)
+/** combine 四个流时用的载荷。Kotlin 只预定义到 Tuple5，这里自己定义更清楚。 */
+private data class ExportOutcome(
+    val output: ExportPublisher.Output?,
+    val skipped: List<String>,
+    val error: String?,
+    val format: ExportFormat
+)
+
+// `debounce` 与 `flatMapLatest` 都还是实验 API。
+// 原来的 @OptIn 加在了 PrintUiState 上，ViewModel 类本身没加，
+// 于是编译器在类的第 89 行就报「需要 opt-in」——两处都留着容易以为已处理。
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class, kotlinx.coroutines.FlowPreview::class)
 class PrintViewModel(private val container: AppContainer) : ViewModel() {
 
@@ -54,8 +74,9 @@ class PrintViewModel(private val container: AppContainer) : ViewModel() {
     private val showAnswer = MutableStateFlow(false)
     private val blankRedo = MutableStateFlow(true)
     private val blankHeight = MutableStateFlow(100)
+    private val format = MutableStateFlow(ExportFormat.PDF)
     private val generating = MutableStateFlow(false)
-    private val result = MutableStateFlow<PdfPublisher.Output?>(null)
+    private val result = MutableStateFlow<ExportPublisher.Output?>(null)
     private val skipped = MutableStateFlow<List<String>>(emptyList())
     private val error = MutableStateFlow<String?>(null)
 
@@ -90,8 +111,8 @@ class PrintViewModel(private val container: AppContainer) : ViewModel() {
         combine(blankRedo, blankHeight, generating) { redo, height, working ->
             Triple(redo, height, working)
         },
-        combine(result, skipped, error) { output, skippedList, errorText ->
-            Triple(output, skippedList, errorText)
+        combine(result, skipped, error, format) { output, skippedList, errorText, chosen ->
+            ExportOutcome(output, skippedList, errorText, chosen)
         }
     ) { list, subjectsAndSelection, imageAndAnswer, redoAndMore, outcome ->
         PrintUiState(
@@ -103,9 +124,10 @@ class PrintViewModel(private val container: AppContainer) : ViewModel() {
             blankRedo = redoAndMore.first,
             blankHeight = redoAndMore.second,
             generating = redoAndMore.third,
-            result = outcome.first,
-            skipped = outcome.second,
-            error = outcome.third
+            result = outcome.output,
+            skipped = outcome.skipped,
+            error = outcome.error,
+            format = outcome.format
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), PrintUiState())
 
@@ -151,36 +173,72 @@ class PrintViewModel(private val container: AppContainer) : ViewModel() {
         blankHeight.value = value
     }
 
+    /**
+     * 按选中的格式导出。
+     *
+     * ## 为什么先建 [ExportDoc] 再分发
+     *
+     * 三种格式的版式各不相同，但「展示哪些内容」必须完全一致——
+     * 否则用户会发现「导 PDF 有答案、导 DOCX 没有」，而这种不一致不会报错、
+     * 只会让人怀疑自己选错了题。所以内容只建一份，三种格式共用。
+     */
     fun generate() {
         val state = uiState.value
         if (state.selected.isEmpty() || state.generating) return
+        val chosen = state.format
         generating.value = true
         error.value = null
+        result.value = null
         viewModelScope.launch {
             val questions = state.selected.mapNotNull { id ->
                 container.questionRepository.findById(id)
             }
-            val exporter = PdfExporter(container.appContext, container.mathRenderer)
-            val options = PdfExporter.Options(
+            if (questions.isEmpty()) {
+                generating.value = false
+                error.value = "选中的题目已不存在"
+                return@launch
+            }
+
+            val options = ExportOptions(
                 includeImage = state.includeImage,
                 showAnswer = state.showAnswer,
                 blankRedoMode = state.blankRedo,
                 blankHeightPt = state.blankHeight
             )
-            val target = container.pdfPublisher.createTempFile()
-            val exportResult = runCatching {
-                exporter.export(questions, options, target) { _, _ -> }
+            val subjectNames = state.subjectNames
+            val doc = ExportCardBuilder(subjectNames).buildDoc(
+                questions = questions,
+                options = options,
+                title = "错题本",
+                generatedAt = System.currentTimeMillis()
+            )
+
+            val target = container.exportPublisher.createTempFile(chosen)
+            val run = runCatching {
+                when (chosen) {
+                    ExportFormat.PDF -> PdfExporter(container.appContext, container.mathRenderer)
+                        .export(doc, target) { _, _ -> }
+
+                    ExportFormat.HTML -> HtmlExporter(container.mathRenderer)
+                        .export(doc, target)
+
+                    ExportFormat.DOCX -> DocxExporter(container.mathRenderer).export(doc, target)
+                }
             }
             generating.value = false
-            exportResult.onSuccess { result ->
-                val output = container.pdfPublisher.publish(result.file)
-                this@PrintViewModel.result.value = output
-                skipped.value = result.skipped
+            run.onSuccess { exported ->
+                val output = container.exportPublisher.publish(exported.file, chosen)
+                result.value = output
+                skipped.value = exported.skipped
             }
-            exportResult.onFailure { throwable ->
-                error.value = throwable.message ?: "生成失败"
+            run.onFailure { throwable ->
+                error.value = throwable.message ?: "导出失败"
             }
         }
+    }
+
+    fun setFormat(value: ExportFormat) {
+        format.value = value
     }
 
     fun consumeResult() {

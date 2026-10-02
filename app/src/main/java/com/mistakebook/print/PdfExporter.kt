@@ -57,44 +57,37 @@ internal fun requiredLineHeightForMath(
  * 可用高度 = 842 - 42*2 - 页眉 26 - 页脚 20。
  * 页脚「第 n / m 页」需要总页数，因此先跑一遍不计页眉页脚的排版，再正式出图。
  */
+/**
+ * 导出选项的别名。三种格式共用同一套开关，定义在 [ExportOptions]——
+ * 各自一份的话无论日晚都只改到其中一种格式，用户会发现「导 PDF 出来的和
+ * 导 DOCX 出来的不一样」。
+ */
+typealias Options = ExportOptions
+
 class PdfExporter(
     private val context: Context,
     private val mathRenderer: com.mistakebook.math.MathRenderer
 ) {
 
-    data class Options(
-        val includeImage: Boolean = false,
-        val showAnswer: Boolean = false,
-        val blankRedoMode: Boolean = true,
-        val blankHeightPt: Int = 100
-    )
-
-    data class Result(
-        val file: File,
-        val pageCount: Int,
-        val skipped: List<String>
-    )
-
     private val dateFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd", Locale.CHINA)
 
     suspend fun export(
-        questions: List<Question>,
-        options: Options,
+        doc: ExportDoc,
         target: File,
         onProgress: (Int, Int) -> Unit
-    ): Result = withContext(Dispatchers.IO) {
-        val built = questions.mapIndexedNotNull { index, question ->
+    ): ExportResult = withContext(Dispatchers.IO) {
+        val options = doc.options
+        val built = doc.cards.mapNotNull { card ->
             // 单题异常不影响整批：跳过后在结果里列出
-            // index 是打印清单里的连续序号（1 起），数据库 id 会跳号，打印时用户靠它核对有没有漏题
             try {
-                buildCard(question, options, index + 1)
+                buildCard(card, options)
             } catch (error: Throwable) {
-                android.util.Log.e("PdfExporter", "题目 ${question.id} 排版失败", error)
+                android.util.Log.e("PdfExporter", "题目 ${card.questionId} 排版失败", error)
                 null
             }
         }
-        val skipped = questions.filterNot { question -> built.any { it.questionId == question.id } }
-            .map { it.stem.take(20) }
+        val skipped = doc.cards.filterNot { card -> built.any { it.questionId == card.questionId } }
+            .map { it.header.take(40) }
 
         // 第一遍量页数（写临时文件，随后删除）
         val probe = File(context.cacheDir, "pdf_probe_${System.currentTimeMillis()}.pdf")
@@ -104,7 +97,7 @@ class PdfExporter(
         target.parentFile?.mkdirs()
         render(target, built, options, totalPages, onProgress)
 
-        Result(file = target, pageCount = totalPages, skipped = skipped)
+        ExportResult(file = target, pageCount = totalPages, skipped = skipped)
     }
 
     // ===== 排版主循环 =====
@@ -363,38 +356,36 @@ class PdfExporter(
      * 正文里的 LaTeX 会先渲染成位图再与文字混排——直接输出源码在 PDF 里就是一堆
      * 反斜杠和花括号，完全没法看。
      */
-    private suspend fun buildCard(question: Question, options: Options, index: Int): Card {
+    private suspend fun buildCard(card: ExportCard, options: Options): Card {
         val blocks = mutableListOf<Block>()
-        val subjectName = question.subjectId?.let { subjectNames[it] }
         // 整题公式一次性批量渲染：逐个渲染是每个公式 2 帧等待，
         // 一张十几题的 PDF 要等几十秒
-        val preRendered = prerenderMath(question)
+        val preRendered = prerenderMath(card)
 
-        blocks += ColorBarBlock(COLOR_BAR_HEIGHT, SubjectPalette.argbOf(subjectName))
-        // 标题高度按实际行数算：知识点多的时候标题会折到两行，
-        // 固定 16pt 会把第二行切掉
-        val titleLayout = titleLayout(question, subjectName, index)
-        blocks += TextBlock(question.id, titleLayout, titleLayout.height.toFloat())
+        blocks += ColorBarBlock(COLOR_BAR_HEIGHT, SubjectPalette.argbOf(card.subjectName))
+        // 标题行高度按实际行数算：知识点多的时候标题会折到两行，
+        // 固定高度会把第二行切掉。标题文本已由 ExportCard 拼好且剔过 LaTeX。
+        val titleLayout = textLayout(card.header, TITLE_SIZE, 1.2f, TEXT_BLACK)
+        blocks += TextBlock(card.questionId, titleLayout, titleLayout.height.toFloat())
         blocks += SpaceBlock(6f)
 
         blocks += richBlock(
-            question.id, question.stem, STEM_SIZE, 1.25f, TEXT_BLACK, preRendered
+            card.questionId, card.stem, STEM_SIZE, 1.25f, TEXT_BLACK, preRendered
         )
 
         // 附图优先：MinerU 切出的题目图才是题目的图，没有附图才回退打原图
         if (options.includeImage) {
-            val figure = question.printImagePath
+            val figure = card.imagePath
             if (figure.isNotBlank()) {
                 val bitmap = runCatching { BitmapFactory.decodeFile(figure) }.getOrNull()
                 if (bitmap != null) {
                     val width = minOf(USABLE_WIDTH * 0.45f, bitmap.width.toFloat())
                     val height = width * bitmap.height / bitmap.width
-                    blocks += ImageBlock(question.id, bitmap, width, height)
-                    val isFigure = question.figurePaths.isNotEmpty()
+                    blocks += ImageBlock(card.questionId, bitmap, width, height)
                     blocks += TextBlock(
-                        question.id,
+                        card.questionId,
                         textLayout(
-                            if (isFigure) "题目附图" else "原题照片",
+                            if (card.imageIsFigure) "题目附图" else "原题照片",
                             CAPTION_SIZE, 1f, LABEL_GRAY
                         ),
                         CAPTION_LINE_HEIGHT
@@ -403,26 +394,26 @@ class PdfExporter(
             }
         }
 
-        question.options.forEach { option ->
+        card.options.forEach { option ->
             blocks += richBlock(
-                question.id,
-                "${option.label}. ${option.text}",
+                card.questionId,
+                tokenizeWithMath("${option.label}. ${option.text}"),
                 OPTION_SIZE, 1.3f, TEXT_BLACK, preRendered
             )
         }
 
         if (options.showAnswer) {
-            if (question.answer.isNotBlank()) {
+            if (card.hasAnswer) {
                 blocks += SpaceBlock(6f)
                 blocks += richBlock(
-                    question.id, "答案：${question.answer}",
+                    card.questionId, prefixed("答案：", card.answer),
                     ANSWER_SIZE, 1.3f, TEXT_BLACK, preRendered
                 )
             }
-            if (question.analysis.isNotBlank()) {
+            if (card.hasAnalysis) {
                 blocks += SpaceBlock(4f)
                 blocks += richBlock(
-                    question.id, "解析：${question.analysis}",
+                    card.questionId, prefixed("解析：", card.analysis),
                     ANALYSIS_SIZE, 1.3f, ANALYSIS_GRAY, preRendered
                 )
             }
@@ -435,8 +426,13 @@ class PdfExporter(
         }
 
         blocks += ColorBarBlock(SEPARATOR_HEIGHT, LINE_GRAY)
-        return Card(question.id, blocks)
+        return Card(card.questionId, blocks)
     }
+
+    /** 给一组 token 前面接上一个前缀文字（「答案：」这类）。 */
+    private fun prefixed(prefix: String, tokens: List<RichToken>): List<RichToken> =
+        listOf(RichToken.TextToken(prefix)) + tokens
+
 
     /**
      * 把一段可能含 `$...$` 公式的文本排成块：公式渲染成位图，与文字按行基线混排。
@@ -447,16 +443,17 @@ class PdfExporter(
      */
     private suspend fun richBlock(
         questionId: Long,
-        text: String,
+        tokens: List<RichToken>,
         sizePt: Float,
         lineSpacing: Float,
         color: Int,
         preRendered: Map<String, RenderedMath?>
     ): Block {
-        if (text.isBlank()) return SpaceBlock(0f)
-        val tokens = tokenizeWithMath(text)
+        if (tokens.isEmpty()) return SpaceBlock(0f)
         if (tokens.none { it is RichToken.MathToken }) {
-            // 没有公式就走原来的纯文本路径，排版质量更好
+            // 没有公式就走原来的纯文本路径，排版质量更好。
+            // 没有公式时 token 拼回来就是原文（遗留的 `$` 也在其中）。
+            val text = tokens.filterIsInstance<RichToken.TextToken>().joinToString("") { it.text }
             return TextBlock(
                 questionId,
                 textLayout(text, sizePt, lineSpacing, color),
@@ -480,17 +477,15 @@ class PdfExporter(
      * @return latex -> 位图。key 用「display:latex」区分块级与行内，
      *   两者排版参数不同，共用一个 key 会拿到错的图。
      */
-    private suspend fun prerenderMath(question: Question): Map<String, RenderedMath?> {
+    private suspend fun prerenderMath(card: ExportCard): Map<String, RenderedMath?> {
         val sources = buildList {
-            fun scan(text: String) {
-                tokenizeWithMath(text).forEach { token ->
-                    if (token is RichToken.MathToken) add(token)
-                }
+            fun scan(tokens: List<RichToken>) {
+                tokens.forEach { token -> if (token is RichToken.MathToken) add(token) }
             }
-            scan(question.stem)
-            question.options.forEach { scan("${it.label}. ${it.text}") }
-            scan(question.answer)
-            scan(question.analysis)
+            scan(card.stem)
+            card.options.forEach { scan(tokenizeWithMath(it.text)) }
+            scan(card.answer)
+            scan(card.analysis)
         }
         if (sources.isEmpty()) return emptyMap()
         val requests = sources
@@ -501,14 +496,11 @@ class PdfExporter(
         // 按 latex 做 key 就够了，调用方查表也简单
         return rendered.entries.associate { entry ->
             val key = entry.key
-            val latex = if (key.startsWith("d:") || key.startsWith("i:")) {
-                key.substring(2)
-            } else {
-                key
-            }
+            val latex = if (key.startsWith("d:") || key.startsWith("i:")) key.substring(2) else key
             Pair(latex, entry.value)
         }
     }
+
 
     private fun textPaintFor(sizePt: Float, color: Int): TextPaint = TextPaint().apply {
         isAntiAlias = true
@@ -618,73 +610,6 @@ class PdfExporter(
         return lines
     }
 
-    private sealed interface RichToken {
-        data class TextToken(val text: String) : RichToken
-        data class MathToken(val latex: String, val display: Boolean) : RichToken
-    }
-
-    /** 按 `$...$` 切出公式，其余按「中文逐字 / 西文按词」切分，便于换行。 */
-    private fun tokenizeWithMath(input: String): List<RichToken> {
-        val out = mutableListOf<RichToken>()
-        val buffer = StringBuilder()
-        var i = 0
-        fun flushText() {
-            if (buffer.isEmpty()) return
-            tokenizePlain(buffer.toString()).forEach { out += it }
-            buffer.clear()
-        }
-        while (i < input.length) {
-            val ch = input[i]
-            if (ch == '$') {
-                val display = input.startsWith("$$", i)
-                val open = if (display) 2 else 1
-                val close = if (display) "$$" else "$"
-                val end = input.indexOf(close, i + open)
-                if (end > i + open) {
-                    flushText()
-                    val body = input.substring(i + open, end).trim()
-                    if (body.isNotEmpty()) {
-                        out += RichToken.MathToken(body, display)
-                    }
-                    i = end + close.length
-                    continue
-                }
-            }
-            buffer.append(ch)
-            i++
-        }
-        flushText()
-        return out
-    }
-
-    private fun tokenizePlain(text: String): List<RichToken> {
-        val out = mutableListOf<RichToken>()
-        val word = StringBuilder()
-        fun flushWord() {
-            if (word.isNotEmpty()) {
-                out += RichToken.TextToken(word.toString())
-                word.clear()
-            }
-        }
-        text.forEach { ch ->
-            when {
-                ch.isWhitespace() -> {
-                    flushWord()
-                    out += RichToken.TextToken(ch.toString())
-                }
-                // 中文与全角标点逐字断行；西文数字按词，避免把单词劈开
-                ch.code >= 0x2E80 -> {
-                    flushWord()
-                    out += RichToken.TextToken(ch.toString())
-                }
-
-                else -> word.append(ch)
-            }
-        }
-        flushWord()
-        return out
-    }
-
     private var subjectNames: Map<Long, String> = emptyMap()
 
     fun setSubjectNames(names: Map<Long, String>) {
@@ -715,35 +640,6 @@ class PdfExporter(
         return textLayout(title, TITLE_SIZE, 1.2f, TEXT_BLACK)
     }
 
-    /**
-     * 标题行里**剥掉 LaTeX**，只留可读文字。
-     *
-     * 知识点字段经常含公式（`对数不等式 $\ln(1+t)$`、`$\int_0^1$`）。
-     * 标题行用的是 StaticLayout，**不做公式渲染**——原来直接把 `$\ln(1+t)$`
-     * 整个打出来，纸上是满行反斜杠。
-     *
-     * 为什么不把标题行也换成 MathRichBlock：标题行允许换行、且知识点里的公式
-     * 本身信息量不大（`$\int_0^1$` 剥成「∫」不如不显示）。
-     * 题目正文和解析里的公式才值得渲染，那里走 richBlock。
-     */
-    private fun plainText(raw: String): String = buildString {
-        var i = 0
-        while (i < raw.length) {
-            val ch = raw[i]
-            if (ch == '$') {
-                val display = raw.startsWith("$$", i)
-                val open = if (display) 2 else 1
-                val close = if (display) "$$" else "$"
-                val end = raw.indexOf(close, i + open)
-                if (end > i + open) {
-                    i = end + close.length
-                    continue
-                }
-            }
-            append(ch)
-            i++
-        }
-    }.replace(WHITESPACE_RUN, " ").trim()
 
     private fun textLayout(
         text: String,
