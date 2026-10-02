@@ -1,5 +1,6 @@
 package com.mistakebook.ui.common
 
+import kotlinx.coroutines.delay
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.background
@@ -113,7 +114,23 @@ fun RichText(
             // 缓存键必须是原 key，否则命中不了单条路径写入的同一份缓存
             Triple(key, target, !run && display)
         }
-        value = mathRenderer.renderAll(requests)
+        // 重试：KaTeX 页面首次 loadUrl 还没光栅化完、或 WebView 被别的
+        // RichText 抢着渲染时，本批可能整体返回 null。这些都是**瞬时**故障，
+        // 但 `mathKeys` 不变就不会再跑一遍这个 effect——
+        // 一次失败就把这次会话的公式永久钉成裸源码，滚出去再滚回来也一样。
+        // 聊天气泡最容易命中：同一屏 N 个 RichText 抢同一把 Mutex，
+        // 而流式那条每 500ms 就换一次 mathKeys。
+        var attempt = 0
+        while (true) {
+            val result = mathRenderer.renderAll(requests)
+            val allFailed = result.isNotEmpty() && result.values.all { it == null }
+            if (!allFailed || attempt >= MAX_RENDER_ATTEMPTS - 1) {
+                value = result
+                return@produceState
+            }
+            attempt++
+            delay(RETRY_DELAY_MS * attempt)
+        }
     }
 
     // 把渲染失败的公式回传给调用方，供文本体检（TextAudit）使用。
@@ -467,8 +484,12 @@ private fun InlineRow(
                                 "math$index",
                                 InlineTextContent(
                                     placeholder = Placeholder(
-                                        width = with(density) { w.toSp() },
-                                        height = with(density) { h.toSp() },
+                                        // w/h 是**设备像素**，必须先 px -> dp 再 dp -> sp。
+                                        // 直接 `w.toSp()` 相当于除了 fontScale 就当成了 sp，
+                                        // 排版回推时再乘 fontScale*density → 占位框大了 density 倍
+                                        //（约 3 倍），公式被挤在巨大空框的左上角。
+                                        width = with(density) { w.toDp().toSp() },
+                                        height = with(density) { h.toDp().toSp() },
                                         placeholderVerticalAlign = PlaceholderVerticalAlign.TextBottom
                                     )
                                 ) { _ ->
@@ -537,8 +558,9 @@ private fun InlineRow(
         }
         Text(
             text = annotated,
-            // 行高放大到能容下行内公式，否则带公式的行会压到上下行
-            style = style.copy(lineHeight = with(density) { lineHeightPx.toSp() }),
+            // 行高放大到能容下行内公式，否则带公式的行会压到上下行。
+            // lineHeightPx 同样是像素，转换路径必须是 px -> dp -> sp，见上面 Placeholder 的注释。
+            style = style.copy(lineHeight = with(density) { lineHeightPx.toDp().toSp() }),
             color = color,
             modifier = Modifier.fillMaxWidth(),
             inlineContent = inlineContent
@@ -662,3 +684,16 @@ private fun parseInline(input: String): List<InlineSpan> {
     flush()
     return spans
 }
+
+/**
+ * 公式批量渲染的最大尝试次数。
+ *
+ * KaTeX 页面首次 `loadUrl` 还没光栅化完、或 WebView 正被同屏其他
+ * `RichText` 占用时，本批可能整体返回 null。这些都是**瞬时**故障，
+ * 而 `mathKeys` 不变就不会再跑一遍渲染 effect——一次失败就把这次会话的
+ * 公式永久钉成裸源码。
+ */
+private const val MAX_RENDER_ATTEMPTS = 3
+
+/** 重试间隔（毫秒）。 */
+private const val RETRY_DELAY_MS = 250L

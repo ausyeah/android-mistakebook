@@ -50,7 +50,14 @@ object Routes {
     /** 自由会话的 questionId 哨兵值。0 是数据库自增起点，不能拿来当「无」。 */
     const val CHAT_FREE = -1L
 
-    fun chat(questionId: Long?): String = "$CHAT/${questionId ?: CHAT_FREE}"
+    /**
+     * 聊天页路由。
+     *
+     * @param sessionId 已知会话 id 时带上，从对话记录点进来**必须**传——
+     *   自由会话的 questionId 是 null，只靠它定位不到任何已有会话。
+     */
+    fun chat(questionId: Long?, sessionId: Long? = null): String =
+        "$CHAT/${questionId ?: CHAT_FREE}?sessionId=${sessionId ?: CHAT_FREE}"
 
     /**
      * 手动录入用的编辑页入口。
@@ -270,15 +277,28 @@ fun MistakeBookNavHost(
          * `questionId = -1` 表示自由会话。这里必须用哨兵值而不是可选参数：
          * 导航参数的 null 与「没传」分不清，而 0 是数据库自增起点，
          * 拿它当「无」会在极端情况下撞上一条 id=0 的题目。
+         *
+         * `sessionId` 是可选的（`-1` 表示没指定）：**从对话记录点进来时必须带上**。
+         * 只靠 questionId 定位不到已有的自由会话——那条记录的 questionId 本来就是 null，
+         * ViewModel 只能去找「空的自由会话」，找不到就新建一条空的，
+         * 于是点进去是一片空白，且每点一次多插一条孤儿会话。
          */
         composable(
-            route = "${Routes.CHAT}/{questionId}",
-            arguments = listOf(navArgument("questionId") { type = NavType.LongType })
+            route = "${Routes.CHAT}/{questionId}?sessionId={sessionId}",
+            arguments = listOf(
+                navArgument("questionId") { type = NavType.LongType },
+                navArgument("sessionId") {
+                    type = NavType.LongType
+                    defaultValue = Routes.CHAT_FREE
+                }
+            )
         ) { entry ->
             val raw = entry.arguments?.getLong("questionId") ?: Routes.CHAT_FREE
+            val rawSession = entry.arguments?.getLong("sessionId") ?: Routes.CHAT_FREE
             ChatScreen(
                 container = container,
                 questionId = raw.takeIf { it != Routes.CHAT_FREE },
+                sessionId = rawSession.takeIf { it != Routes.CHAT_FREE },
                 onBack = { navController.popBackStack() },
                 onOpenSettings = { navController.navigate(Routes.SETTINGS) }
             )
@@ -288,7 +308,9 @@ fun MistakeBookNavHost(
             ChatListScreen(
                 container = container,
                 onBack = { navController.popBackStack() },
-                onOpenSession = { questionId -> navController.navigate(Routes.chat(questionId)) }
+                onOpenSession = { sessionId, questionId ->
+                    navController.navigate(Routes.chat(questionId, sessionId))
+                }
             )
         }
 

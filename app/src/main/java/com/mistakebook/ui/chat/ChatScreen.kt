@@ -82,6 +82,10 @@ import com.mistakebook.ui.common.containerViewModel
 import kotlinx.coroutines.launch
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.ExpandLess
+import android.graphics.BitmapFactory
+import android.util.Base64
+import androidx.compose.foundation.Image
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.material.icons.filled.ExpandMore
 
 /** 列表末尾的哨兵项。**必须有**——否则消息正好排满时没有可滚余量，结论会被藏在屏幕外。 */
@@ -109,20 +113,25 @@ private val DOCUMENT_MIME_TYPES = arrayOf(
 fun ChatScreen(
     container: AppContainer,
     questionId: Long?,
+    sessionId: Long? = null,
     onBack: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
     val viewModel = containerViewModel(
         container = container,
-        // 每题一个固定会话：key 带上 questionId，切换题目时才不会复用上一个的 ViewModel
-        key = "chat-$questionId"
+        // 每题一个固定会话：key 带上标识，切换时才不会复用上一个的 ViewModel。
+        //
+        // **sessionId 必须进 key**：从对话记录先后打开两个自由会话时，
+        // 两者的 questionId 都是 null，key 会撞成同一个 → 显示的还是上一次的会话。
+        key = "chat-${sessionId ?: "q$questionId"}"
     ) { c ->
         ChatViewModel(
             repository = c.chatRepository,
             stream = c.chatCompletionStream,
             settingsStore = c.settingsStore,
             preparer = c.chatAttachmentPreparer,
-            questionId = questionId
+            questionId = questionId,
+            sessionId = sessionId
         )
     }
 
@@ -313,6 +322,8 @@ fun ChatScreen(
                         state = state,
                         listState = listState,
                         mathRenderer = container.mathRenderer,
+                        bubbleImages = state.bubbleImages,
+                        truncatedMessageId = state.truncatedMessageId,
                         onCopy = { text ->
                             clipboard.setText(AnnotatedString(text))
                             viewModel.notifyCopied()
@@ -354,6 +365,8 @@ private fun MessageList(
     state: ChatUiState,
     listState: LazyListState,
     mathRenderer: com.mistakebook.math.MathRenderer,
+    bubbleImages: Map<Long, List<String>>,
+    truncatedMessageId: Long?,
     onCopy: (String) -> Unit,
     onRetry: () -> Unit,
     onDelete: (Long) -> Unit
@@ -375,6 +388,8 @@ private fun MessageList(
                 is ChatListItem.OmittedNotice -> OmittedNoticeRow(item.count)
                 is ChatListItem.Message -> MessageBubble(
                     message = item.message,
+                    images = bubbleImages[item.message.id].orEmpty(),
+                    truncated = truncatedMessageId == item.message.id,
                     mathRenderer = mathRenderer,
                     onCopy = onCopy,
                     onRetry = onRetry,
@@ -415,6 +430,8 @@ private fun OmittedNoticeRow(count: Int) {
 @Composable
 private fun MessageBubble(
     message: ChatMessage,
+    images: List<String>,
+    truncated: Boolean,
     mathRenderer: com.mistakebook.math.MathRenderer,
     onCopy: (String) -> Unit,
     onRetry: () -> Unit,
@@ -463,6 +480,18 @@ private fun MessageBubble(
             modifier = Modifier.widthIn(max = 320.dp)
         ) {
             Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                // 用户自己发的图片。**早先气泡只渲染 message.content，
+                // 附件从来没进过界面**——模型看得到图，用户这边看不见，
+                // 表现成「图片发不出去」。
+                if (images.isNotEmpty()) {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        images.forEach { dataUrl ->
+                            BubbleImage(dataUrl = dataUrl)
+                        }
+                    }
+                    if (message.content.isNotBlank()) Spacer(Modifier.height(8.dp))
+                }
+
                 // 思考过程与正文用 `<think>` 标记存在同一列里，界面拆开渲染。
                 // 正文为空但有思考时也要渲染思考块，否则就是一个空气泡。
                 val (thinking, answer) = remember(message.content) {
@@ -487,6 +516,17 @@ private fun MessageBubble(
                         }
                     )
                 }
+                // 常驻的截断标记。弹窗只在生成当时弹一次，
+                // 用户往回翻时看到的那条残缺回答在界面上和完整回答一模一样，
+                // 他不知道下面少了东西。
+                if (truncated) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = stringResource(R.string.chat_truncated_badge),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
                 if (message.status == MessageStatus.STREAMING) {
                     Spacer(Modifier.height(6.dp))
                     // 光标：流式时末尾的小圆点
@@ -508,6 +548,38 @@ private fun MessageBubble(
             onDelete = onDelete
         )
     }
+}
+
+/**
+ * 气泡里的图片。
+ *
+ * 直接把 data URL 喂给 `Image`，不引任何图片库（项目锁零新增依赖）。
+ * `remember(dataUrl)` 是必须的：LazyColumn 滚动时每一帧都会重组，
+ * 不缓存的话每帧都重新 base64 解码一张几百 KB 的图，滑不动。
+ */
+@Composable
+private fun BubbleImage(dataUrl: String) {
+    val bitmap = remember(dataUrl) {
+        runCatching {
+            val bytes = Base64.decode(dataUrl.substringAfter("base64,"), Base64.NO_WRAP)
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        }.getOrNull()
+    }
+    if (bitmap == null) {
+        Text(
+            text = stringResource(R.string.chat_image_unreadable),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        return
+    }
+    Image(
+        bitmap = bitmap.asImageBitmap(),
+        contentDescription = stringResource(R.string.chat_image_content_description),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+    )
 }
 
 @Composable

@@ -57,7 +57,7 @@ import java.time.format.DateTimeFormatter
 fun ChatListScreen(
     container: AppContainer,
     onBack: () -> Unit,
-    onOpenSession: (questionId: Long?) -> Unit
+    onOpenSession: (sessionId: Long, questionId: Long?) -> Unit
 ) {
     val viewModel = containerViewModel(container) { c ->
         ChatListViewModel(c.chatRepository, c.database.questionDao())
@@ -144,7 +144,12 @@ fun ChatListScreen(
             )
         },
         floatingActionButton = {
-            FloatingActionButton(onClick = { viewModel.startFreeSession { onOpenSession(null) } }) {
+            FloatingActionButton(onClick = {
+                // 新对话：先拿到（或建好）会话 id 再进。
+                // 传 0 是不行的——ViewModel 会当成「没指定」而重建一条，
+                // 这里建的这条就成了孤儿。
+                viewModel.startFreeSession { sessionId -> onOpenSession(sessionId, null) }
+            }) {
                 Icon(Icons.Default.Add, contentDescription = stringResource(R.string.chat_list_new))
             }
         }
@@ -173,13 +178,24 @@ fun ChatListScreen(
         }
 
         LazyColumn(
-            modifier = Modifier.fillMaxSize(),
+            // `padding` 是 Scaffold 的 innerPadding，含 TopAppBar 高度与状态栏。
+            // 漏掉它的话列表从 y=0 开始画，第一行正好被顶栏压掉上半截——
+            // 而空状态分支用了 `.padding(padding)`，所以「有数据时错、空时对」，
+            // 是个很容易骗过自己的 bug。
+            // 这里只取顶部：底部要留给 FAB 的悬浮高度，见 contentPadding。
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(top = padding.calculateTopPadding()),
             contentPadding = PaddingValues(bottom = 88.dp)
         ) {
             items(state.items, key = { it.session.id }) { item ->
                 ChatListRow(
                     item = item,
-                    onOpen = { onOpenSession(item.session.questionId) },
+                    // 必须传 sessionId，不只是 questionId：
+                    // 自由会话 questionId 是 null，光传它等于没传——
+                    // ViewModel 会去找「那条空的自由会话」，找不到就**新建一条空的**，
+                    // 于是点历史记录进去是一片空白，而且每点一次多插一条孤儿会话。
+                    onOpen = { onOpenSession(item.session.id, item.session.questionId) },
                     onRename = {
                         renameText = item.session.title
                         renaming = item

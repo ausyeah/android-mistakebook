@@ -1212,3 +1212,137 @@ MathML Core 要 Chrome 109+（2023 年初）。而 `assets/katex/math.html`
   视觉上对（显示成 `∫₀¹ f(x)dx`），但严格说 `dx` 属于整体而非被求积函数。
   想要更准得实现完整的 TeX 盒子模型，收益不抵成本，先记着。
 - `LatexEscapes.AMBIGUOUS = "trnbf"` 覆盖不全的问题仍未处理（v0.0.9 遗留）。
+---
+
+## v0.0.11 — 对话五个缺陷：气泡图片、公式不渲染、输出截断、历史列表遮挡、点历史一片空白
+
+用户一次报了五个问题。前两个是「功能缺失」，后三个是「静默失败」——
+后者才是本项目反复栽跟头的地方。
+
+### 1. 气泡里的图片从来没渲染过
+
+`MessageBubble` 只渲染 `message.content`，**附件从来没进过界面**。
+用户发图后模型那边看得到、自己这边看不见，表现成「图片发不出去」。
+
+数据一直是有的：消息表存 `attachmentIdsJson`，图片在 `chat_attachments`，
+DAO 有 `observeAttachments`，`ChatImageDataUrls` 早就实现了带 LRU 的 base64 转换。
+**每一层都写好了，只是没人把它们接起来。**
+
+新增 `ChatUiState.bubbleImages: Map<messageId, List<dataUrl>>`，
+`ChatViewModel.loadBubbleImages` 按消息列表异步填充，走同一份 LRU 缓存。
+`BubbleImage` 用 `remember(dataUrl)` 包住 base64 解码——LazyColumn 每帧重组，
+不缓存就滑不动。零新增依赖，`Image` + `BitmapFactory` 就够。
+
+### 2. 公式不渲染：根因是「跨行 `$$` 被静默丢弃」
+
+这一条最费劲，因为**题目区正常、气泡里坏**——同一个 `RichText`、同一个
+`MathRenderer`、同一个 `renderAll`，没有任何气泡专属分支。
+
+子代理逐字比对了三个方向后给出答案，我核对属实：
+`MarkdownModel.kt` 原来只支持「`$$` 与内容同一行」。
+遇到独占一行的 `$$` 时算出空 latex，`if (latex.isNotEmpty())` 不成立，
+**什么都不加**——整块推导被静默丢弃，中间那行掉进段落分支以裸 LaTeX 显示。
+
+**不对称正是答案**：
+
+- 识别链路的提示词 `PromptTemplates.LATEX_FORMAT_APPENDIX` 明文禁止公式内换行
+  → `$$` 永远是单行 → 永远走不到这个洞 → 题目区一直正常
+- 聊天的提示词只说「独立成行用 $$...$$」，**没有禁换行**
+  → LLM 输出 `$$\n\begin{aligned}...\n\end{aligned}\n$$` 是常规写法 → 必然踩中
+
+改法：加 `displayMath` 状态机。独占一行的 `$$` 进入公式块，攒到下一个才产出 `Block.Math`；
+闭合标记之后同一行的剩余内容算正文（不能丢）；**未闭合的也渲染**——
+流式输出时正文尾端正停在 `$$x = ` 这种半截状态，丢弃的话这条公式在生成期间
+永远不显示，生成结束才突然冒出来。
+
+同时给聊天提示词补上禁换行的约束（双保险，不是替代修复）。
+
+#### 顺带修的两个
+
+**`RichText.kt:470/471/541` 的单位 bug**：`w`/`h`/`lineHeightPx` 都是**设备像素**，
+却用 `toSp()` 转换。`toSp()` 的语义是「px ÷ fontScale」，排版回推时再乘
+`fontScale × density` → 占位框和行高被放大 `density` 倍（约 3 倍），
+公式被挤在巨大空框的左上角。11 行之后同一个 `w` 用的是正确的 `toDp()`。
+改成 `w.toDp().toSp()`。
+
+这条只影响行内路径（`InlineRow`），独立公式走 `MathImage`（单位正确）。
+题目区以 `$$...$$` 独立块为主 → 走对的路；聊天气泡里绝大多数是 `$...$` 行内公式 → 走错的路。
+
+**`produceState` 是一次性闩锁**：`mathKeys` 不变就不重跑。
+而 `renderAll` 的失败模式全是**瞬时**的（页面首次 `loadUrl` 还没光栅化完、
+WebView 被同屏其他 `RichText` 抢着渲染时）。一次失败就把这次会话的公式
+永久钉成裸源码，滚出去再滚回来也一样。改成「整批全失败则退避重试，最多 3 次」。
+
+聊天气泡最容易命中：同一屏 N 个 `RichText` 抢同一把 `Mutex`，
+而流式那条每 500ms 就换一次 `mathKeys`。
+
+### 3. 输出长度：4096 提到 8192
+
+用户：「经常限制模型输出长度，长度太长直接啥都不显示了」。
+
+`ChatCompletionStream.MAX_TOKENS = 4096`，注释写着「单题讲解 4096 足够」。
+**不够。** 一道稍复杂的推导就撞上限，正文在句子中间断掉。
+
+提到 8192（多数服务端模型的上限或更高，两边都安全）。
+同时给提示词加一句「一次回答控制在 2000 字以内」——光提高上限不够，
+超长的回答体验也不好。
+
+**截断提示从「一次性弹窗」改成「常驻标记」**：弹窗只在生成当轮弹一次，
+用户往回翻时看到的那条残缺回答在界面上和完整回答长得一模一样，
+他不知道下面少了东西，只能靠「记得刚才弹过窗」来判断。
+现在正文末尾挂一个「已截断」（`chat_truncated_badge` 这条字符串
+**早就写好了却一直没人用**）。
+
+### 4 & 5. 对话记录列表：两个独立的 bug
+
+**列表被顶栏遮挡**：`ChatListScreen` 的 Scaffold 回调签名是 `{ padding ->`，
+但 `padding` **只在空状态分支被用到**（`.padding(padding)`）。
+有数据时走下面的 `LazyColumn`，`modifier = Modifier.fillMaxSize()`——`padding` 被丢弃。
+
+`MainActivity` 调了 `enableEdgeToEdge()`，所有页面都要自己处理 insets。
+`ChatListScreen` 是**全项目唯一一个漏掉 `innerPadding` 的 Scaffold 页面**
+（HomeScreen / EditScreen / ChatScreen 都用了）。跟一个正常页面比，差异一目了然。
+
+难在自己能骗过自己：空状态看起来是对的，只有有数据时才暴露。
+
+**点历史记录一片空白**：导航链路上**只传了 `questionId`，`sessionId` 从来没传过**。
+自由会话的 `questionId` 是 null → ViewModel 调 `sessionForQuestion(null)`
+→ DAO 的 `findEmptyFreeSession` 带 `AND NOT EXISTS (SELECT 1 FROM chat_messages ...)`
+→ 只要会话有消息就查不到 → **新建一条空会话** → 空白。
+而且每点一次历史记录多插一条孤儿会话，越点越多。
+
+`ChatScreen` 的 ViewModel `key = "chat-$questionId"` 也必须加 sessionId，
+否则先后打开两个自由会话时 key 撞成同一个，显示的还是上一次的。
+
+顺带把「新对话」按钮改成**先建好会话再带 id 进**：
+早先靠聊天页现场建，而那条查询会复用已有的空会话，
+于是点「新对话」可能落进你半小时前开了没说话的那条；
+而且 id 事后才知道，没法用来做 ViewModel 的 key。
+
+### 测试
+
+新增 `MarkdownDisplayMathTest` 12 条，覆盖跨行/单行/未闭合/闭合后正文/代码块/列表项。
+**并且验证过它能抓到这个 bug**：把「独占一行的 `$$`」改回丢弃，12 条里 7 条立即变红，
+确认后才恢复。这已经是本轮第二次做这个验证。
+
+单元测试 326 条全绿（原 314）。
+
+### 本轮的方法论教训
+
+**「一边正常一边坏」是最值钱的线索。** 题目区公式正常、聊天气泡坏，
+看着像布局问题，实际是**同一份解析器的两条输入路径**。
+找到「为什么这两边的输入形状不同」，根因就浮出来了——
+那答案是提示词里的一句约束差异，不在渲染层。
+
+派子代理做只读调研这一手很值：它逐条排除了缓存键、宽度约束、批量上限三个方向
+（都附了排除依据），把搜索空间从整个渲染管线缩到一个 `if`。
+
+### 未验证
+
+- **没有 adb 连接**，五项都只能靠用户装包实测。
+- `RichText` 的「3 倍占位框」是静态推断（`toSp` 语义 + 密度公式），
+  没有真机截图佐证。修完若公式仍显小，说明还有别的原因。
+- OMML/HTML/PDF 的 v0.0.10 改动同样待验。
+- `parseInline` 仍不认 `\(...\)` / `\[...\]` 两种定界符，
+  `RichText.kt:582` 的 `inlineMath` 正则至今是死代码。本轮没加——
+  等确认 `$$` 修复是否解决了用户的实际症状再说，避免一次改太多。

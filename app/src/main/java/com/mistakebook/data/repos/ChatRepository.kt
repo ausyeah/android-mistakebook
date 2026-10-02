@@ -78,7 +78,28 @@ class ChatRepository(
             chatDao.findEmptyFreeSession()?.let { return it }
         }
         val now = System.currentTimeMillis()
-        val id = chatDao.insertSession(
+        return ChatSession(
+            id = newSession(questionId),
+            questionId = questionId,
+            createdAt = now,
+            updatedAt = now
+        )
+    }
+
+    /**
+     * 已存在但一条消息都没有的自由会话。
+     *
+     * 「新对话」按钮要的就是它：复用而不是新建，否则点几次攒几条空会话。
+     */
+    suspend fun findEmptyFreeSession(): ChatSession? = chatDao.findEmptyFreeSession()
+
+    /** 强制新建一条空会话，返回 id。 */
+    suspend fun createFreeSession(): Long = newSession(null)
+
+    /** 新建一条会话并返回 id。 */
+    private suspend fun newSession(questionId: Long?): Long {
+        val now = System.currentTimeMillis()
+        return chatDao.insertSession(
             ChatSession(
                 questionId = questionId,
                 title = "",
@@ -86,7 +107,6 @@ class ChatRepository(
                 updatedAt = now
             )
         )
-        return ChatSession(id = id, questionId = questionId, createdAt = now, updatedAt = now)
     }
 
     /** 重命名。改完**锁定自动标题**，否则下次进会话会被首条消息摘要冲掉。 */
@@ -240,6 +260,19 @@ class ChatRepository(
 
     fun observeAttachments(messageId: Long): kotlinx.coroutines.flow.Flow<List<ChatAttachment>> =
         chatDao.observeAttachments(messageId)
+
+    /** 按 id 取一条会话。对应「从对话记录点进来」的场景。 */
+    suspend fun sessionById(id: Long): ChatSession? = chatDao.findSession(id)
+
+    suspend fun attachmentById(id: Long): ChatAttachment? = chatDao.findAttachment(id)
+
+    /**
+     * 附件图片 -> base64 data URL。给聊天气泡显示用。
+     *
+     * 走同一份 LRU 缓存：气泡每次重组都会读一次，不缓存就是反复 base64 一张几百 KB 的图。
+     */
+    suspend fun imageDataUrlOf(attachment: ChatAttachment): String? =
+        imageDataUrls.dataUrlOf(attachment)
 
     suspend fun insertAttachment(attachment: ChatAttachment): Long = chatDao.insertAttachment(attachment)
 

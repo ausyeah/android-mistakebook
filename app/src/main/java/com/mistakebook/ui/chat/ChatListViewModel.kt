@@ -50,12 +50,20 @@ class ChatListViewModel(
     /**
      * 首页/列表页进入「新对话」。
      *
-     * **不预先建会话**——直接跳到聊天页，由 ChatViewModel 调
-     * `sessionForQuestion(null)` 建（那里会复用已有的空会话）。
-     * 两边都建就会攒出一串空会话。
+     * **在这里就把会话建出来**，然后带着它的 id 进聊天页。
+     *
+     * 早先是 `onReady(null)`——不建会话，靠聊天页的
+     * `sessionForQuestion(null)` 现场建。问题在于那条查询会复用**已有的空会话**，
+     * 于是点「新对话」可能落进你半小时前开了没说话的那条；
+     * 而且聊天页拿到的 id 事后才知道，没法用来做 ViewModel 的 key。
+     *
+     * 建好再带 id 过去，两件事都解决了：`sessionForQuestion` 只在没给 id 时才兜底创建。
      */
-    fun startFreeSession(onReady: (Long?) -> Unit) {
-        onReady(null)
+    fun startFreeSession(onReady: (Long) -> Unit) {
+        viewModelScope.launch {
+            val id = repository.findEmptyFreeSession()?.id ?: repository.createFreeSession()
+            onReady(id)
+        }
     }
 
     fun rename(id: Long, title: String) {

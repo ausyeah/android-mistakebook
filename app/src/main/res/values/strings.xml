@@ -401,4 +401,7 @@
     <string name="export_format_pdf_short">PDF</string>
     <string name="export_format_html_short">HTML</string>
     <string name="export_format_docx_short">DOCX</string>
+
+    <string name="chat_image_unreadable">（图片无法显示）</string>
+    <string name="chat_image_content_description">发送的图片</string>
 </resources>

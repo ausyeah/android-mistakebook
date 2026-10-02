@@ -21,6 +21,7 @@ import com.mistakebook.net.llm.ChatRequest
 import com.mistakebook.net.llm.ChatStreamEvent
 import com.mistakebook.net.llm.ImageUrl
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.Channel
@@ -70,6 +71,14 @@ data class ChatUiState(
     val title: String = "",
     val messages: List<ChatMessage> = emptyList(),
 
+    /**
+     * 消息 id -> 该消息里图片的 data URL 列表。
+     *
+     * 只给**用户自己发的**消息用：AI 不会回图，而历史里更早的图片
+     * 也不该在打开会话时全部 base64 一遍。
+     */
+    val bubbleImages: Map<Long, List<String>> = emptyMap(),
+
     /** 输入框内容。首问会预填但不自动发送。 */
     val input: String = "",
 
@@ -84,8 +93,26 @@ data class ChatUiState(
      */
     val omittedCount: Int = 0,
 
-    /** 本次回复被 max_tokens 截断。要区别于正常结束提示用户。 */
+    /**
+     * 本次回复被 max_tokens 截断。要区别于正常结束提示用户。
+     *
+     * 一次性的弹窗提醒，详见 [truncatedMessageId]。
+     */
     val truncated: Boolean = false,
+
+    /**
+     * 被截断的那条助手消息 id。
+     *
+     * ## 为什么不只用弹窗
+     *
+     * 弹窗只在**这一轮**生成时弹一次。用户往回翻时看到的那条残缺回答，
+     * 界面上和完整回答长得一模一样——他不知道下面少了东西，
+     * 只能靠「记得刚才弹过窗」来判断。
+     *
+     * 所以正文末尾再挂一个常驻标记（[R.string.chat_truncated_badge]，
+     * 这条字符串早就写好了却一直没人用）。
+     */
+    val truncatedMessageId: Long? = null,
 
     /** 未配置 API Key——UI 弹引导而不是显示「失败」。 */
     val needsApiKey: Boolean = false,
@@ -115,7 +142,10 @@ class ChatViewModel(
     private val stream: ChatCompletionStream,
     private val settingsStore: SettingsStore,
     private val preparer: ChatAttachmentPreparer,
-    private val questionId: Long?
+    private val questionId: Long?,
+
+    /** 从对话记录进来时直接指定会话；null = 新开或按题目定位。 */
+    private val sessionId: Long? = null
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(ChatUiState())
@@ -132,9 +162,34 @@ class ChatViewModel(
     /** 待发附件的本地自增 id。 */
     private var attachmentSeq = 0L
 
+    /** 气泡图片的加载任务，新消息到达时取消旧的。 */
+    private var bubbleImageJob: Job? = null
+
+    /**
+     * 本轮被截断的那条助手消息。
+     *
+     * 定义在 collectStream 里接收完事件后写入 state，
+     * 不直接在 Flow 里改 state（那会造成无限循环）。
+     */
+    private var truncatedMessageId: Long? = null
+
     init {
         viewModelScope.launch {
-            val session = repository.sessionForQuestion(questionId)
+            // 从对话记录点进来时会话已经存在，直接按 id 用；
+            // 只有「从首页/题目页新开」才需要创建或复用。
+            //
+            // 早先这里无条件 `sessionForQuestion(questionId)`：自由会话的 questionId
+            // 是 null，于是去查「那条空的自由会话」，而 DAO 的查询带
+            // `AND NOT EXISTS (SELECT 1 FROM chat_messages ...)`——
+            // 只要那条会话有消息就查不到，于是**每次点历史记录都新建一条空会话**，
+            // 进去是一片空白，而且越点越多。
+            val session = if (sessionId != null) {
+                repository.sessionById(sessionId)
+                    // 会话被删了（列表里刚删掉就点进来）：退回新建，不要卡在空白页
+                    ?: repository.sessionForQuestion(questionId)
+            } else {
+                repository.sessionForQuestion(questionId)
+            }
             // 进程上次被杀时那条消息永远停在 STREAMING，不收拾的话界面会一直转圈，
             // 而且用户没有任何办法让它停下来。
             repository.recoverStaleStreaming(session.id)
@@ -152,7 +207,46 @@ class ChatViewModel(
                     messages = messages,
                     canRetry = messages.lastOrNull()?.status == MessageStatus.FAILED
                 )
+                loadBubbleImages(messages)
             }
+        }
+    }
+
+    /**
+     * 把用户消息里的图片读成 data URL，供气泡显示。
+     *
+     * ## 为什么要单独加载
+     *
+     * 消息表里只存 `attachmentIdsJson`，图片本身在 `chat_attachments`。
+     * 气泡早先**只渲染 `message.content`**，附件从来没进过界面——
+     * 用户发出去图、自己这边看不见，但模型那边看得到，
+     * 于是表现成「图片发不出去」。
+     *
+     * 走 `ChatImageDataUrls` 的 LRU 缓存，重复重组不会反复 base64。
+     */
+    private fun loadBubbleImages(messages: List<ChatMessage>) {
+        val targets = messages.filter { it.role == ChatRole.USER && it.attachmentIdsJson.isNotBlank() }
+        if (targets.isEmpty()) {
+            if (_state.value.bubbleImages.isNotEmpty()) {
+                _state.value = _state.value.copy(bubbleImages = emptyMap())
+            }
+            return
+        }
+        bubbleImageJob?.cancel()
+        bubbleImageJob = viewModelScope.launch(Dispatchers.IO) {
+            val loaded = mutableMapOf<Long, List<String>>()
+            targets.forEach { message ->
+                val urls = message.attachmentIds()
+                    .mapNotNull { repository.attachmentById(it) }
+                    .filter { it.kind == AttachmentKind.IMAGE && it.status == AttachmentStatus.READY }
+                    .mapNotNull { attachment -> repository.imageDataUrlOf(attachment) }
+                if (urls.isNotEmpty()) loaded[message.id] = urls
+            }
+            // 中途可能已经切走或又发了一条，以最新的消息列表为准
+            val current = _state.value.messages.map { it.id }.toSet()
+            _state.value = _state.value.copy(
+                bubbleImages = loaded.filterKeys { it in current }
+            )
         }
     }
 
@@ -180,7 +274,8 @@ class ChatViewModel(
             _state.value = _state.value.copy(
                 input = "",
                 pendingAttachments = emptyList(),
-                truncated = false
+                truncated = false,
+                truncatedMessageId = null
             )
             runOnce(profile, text, ready.mapNotNull { it.prepared }, isRetry = false)
         }
@@ -319,6 +414,7 @@ class ChatViewModel(
                         // length = 被 max_tokens 截断。它和「模型胡乱输出」在下游一样，
                         // 但处理方式不同：要提示用户换个更大的模型或分次问。
                         wasTruncated = event.finishReason == FINISH_REASON_LENGTH
+                        if (wasTruncated) truncatedMessageId = assistantId
                     }
 
                     is ChatStreamEvent.Failed -> {
@@ -354,6 +450,7 @@ class ChatViewModel(
             _state.value = _state.value.copy(
                 isStreaming = false,
                 truncated = wasTruncated,
+                    truncatedMessageId = if (wasTruncated) truncatedMessageId else null,
                 canRetry = status == MessageStatus.FAILED
             )
             errorText?.let { _events.trySend(ChatEvent.Error(it)) }

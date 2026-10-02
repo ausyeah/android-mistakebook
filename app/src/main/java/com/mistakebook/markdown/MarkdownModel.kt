@@ -77,6 +77,17 @@ object MarkdownParser {
         var inCode = false
         val code = StringBuilder()
 
+        // 跨行 `$$` 公式的状态。
+        //
+        // 早先这里只有「`$$` 与内容同一行」这一种形状：`$$x=1$$`。
+        // 遇到独占一行的 `$$` 时算出空 latex，然后**什么都不加**——
+        // 整块推导被静默丢弃，中间那行掉进段落分支以裸 LaTeX 显示。
+        //
+        // 为什么题目区没事、气泡有事：识别链路的提示词禁止在公式内换行，
+        // 所以它给过来的 `$$` 永远是单行；聊天的提示词只说「独立成行用 $$...$$」，
+        // 而 LLM 输出 `$$\n\begin{aligned}...\n\end{aligned}\n$$` 是常规写法，必然踩中。
+        var displayMath: StringBuilder? = null
+
         fun flushParagraph() {
             if (paragraph.isNotBlank()) {
                 blocks += paragraphBlock(paragraph.toString().trim())
@@ -86,7 +97,25 @@ object MarkdownParser {
 
         lines.forEach { rawLine ->
             val line = rawLine.trimEnd()
+            val openMath = displayMath
+
             when {
+                // 正在公式块里：先找闭合的 `$$`，找到就把剩下半行也收进来
+                openMath != null -> {
+                    val closeAt = line.indexOf("$$")
+                    if (closeAt < 0) {
+                        openMath.appendLine(line)
+                    } else {
+                        openMath.append(line.substring(0, closeAt))
+                        val latex = openMath.toString().trim()
+                        if (latex.isNotEmpty()) blocks += Block.Math(latex, true)
+                        displayMath = null
+                        // 闭合 `$$` 之后同一行剩下的内容是正文，不能丢
+                        val rest = line.substring(closeAt + 2)
+                        if (rest.isNotBlank()) paragraph.append(rest)
+                    }
+                }
+
                 line.trimStart().startsWith("```") -> {
                     if (inCode) {
                         blocks += Block.Code(code.toString().trimEnd())
@@ -102,10 +131,23 @@ object MarkdownParser {
 
                 line.isBlank() -> flushParagraph()
 
+                // 独占一行的 `$$`：进入公式块，攒到下一个独占的 `$$` 为止
+                line.trim() == "\$\$" -> {
+                    flushParagraph()
+                    displayMath = StringBuilder()
+                }
+
                 line.trimStart().startsWith("$$") -> {
                     flushParagraph()
-                    val latex = line.trim().removePrefix("$$").removeSuffix("$$").trim()
-                    if (latex.isNotEmpty()) blocks += Block.Math(latex, true)
+                    val closeAt = line.indexOf("$$", 2)
+                    if (closeAt > 2) {
+                        val latex = line.trim().removePrefix("$$").substring(0, closeAt - 2).trim()
+                        if (latex.isNotEmpty()) blocks += Block.Math(latex, true)
+                        val rest = line.substring(closeAt + 2).trim()
+                        if (rest.isNotBlank()) paragraph.append(rest)
+                    } else {
+                        displayMath = StringBuilder(line.trim().removePrefix("$$"))
+                    }
                 }
 
                 line.matches(Regex("^\\s*[-*_]{3,}\\s*$")) -> {
@@ -153,6 +195,16 @@ object MarkdownParser {
             }
         }
         flushParagraph()
+        // 没闭合的 `$$`：照样产出块。
+        //
+        // 流式输出时正文尾端正停在 `$$x = ` 这种半截状态，之后每个新 chunk
+        // 都会重跑整个解析。如果这里把没闭合的丢弃，那条公式在生成期间
+        // 永远不显示，生成结束才突然冒出来——而如果模型真没写闭合符，
+        // 它就永远不显示。两种都不可接受：有内容就渲染。
+        displayMath?.let { open ->
+            val latex = open.toString().trim()
+            if (latex.isNotEmpty()) blocks += Block.Math(latex, true)
+        }
         if (inCode && code.isNotBlank()) blocks += Block.Code(code.toString().trimEnd())
     }
 
