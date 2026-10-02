@@ -8,14 +8,12 @@ import com.mistakebook.data.prefs.SettingsSnapshot
 import com.mistakebook.di.AppContainer
 import com.mistakebook.domain.ErrorReason
 import com.mistakebook.domain.MasteryStatus
-import com.mistakebook.print.DocxExporter
 import com.mistakebook.print.ExportCardBuilder
 import com.mistakebook.print.ExportFormat
 import com.mistakebook.print.ExportOptions
 import com.mistakebook.print.ExportPublisher
 import com.mistakebook.print.ExportResult
 import com.mistakebook.print.HtmlExporter
-import com.mistakebook.print.HtmlPdfExporter
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -37,7 +35,7 @@ data class PrintUiState(
     val blankRedo: Boolean = true,
     val blankHeight: Int = 100,
     /** 选中的导出格式。 */
-    val format: ExportFormat = ExportFormat.PDF,
+    val format: ExportFormat = ExportFormat.HTML,
     val generating: Boolean = false,
     val result: ExportPublisher.Output? = null,
     val skipped: List<String> = emptyList(),
@@ -74,7 +72,7 @@ class PrintViewModel(private val container: AppContainer) : ViewModel() {
     private val showAnswer = MutableStateFlow(false)
     private val blankRedo = MutableStateFlow(true)
     private val blankHeight = MutableStateFlow(100)
-    private val format = MutableStateFlow(ExportFormat.PDF)
+    private val format = MutableStateFlow(ExportFormat.HTML)
     private val generating = MutableStateFlow(false)
     private val result = MutableStateFlow<ExportPublisher.Output?>(null)
     private val skipped = MutableStateFlow<List<String>>(emptyList())
@@ -214,20 +212,11 @@ class PrintViewModel(private val container: AppContainer) : ViewModel() {
             )
 
             val target = container.exportPublisher.createTempFile(chosen)
+            // 只剩 HTML 一种格式，`when` 也就不需要了。
+            // PDF 由用户在浏览器里用系统打印功能生成（比 WebView 打印管线更好控制），
+            // DOCX 已删除——OMML 在多数阅读器里效果很差。
             val run = runCatching {
-                when (chosen) {
-// PDF 走「HTML → WebView 打印」，不再是手写 Canvas 排版。
-                    // 公式用 KaTeX 模式——设备 WebView 版本不保证支持 MathML。
-                    ExportFormat.PDF -> HtmlPdfExporter(
-                        context = container.appContext,
-                        htmlExporter = HtmlExporter(container.mathRenderer)
-                    ).export(doc, target)
-
-                    ExportFormat.HTML -> HtmlExporter(container.mathRenderer)
-                        .export(doc, target)
-
-                    ExportFormat.DOCX -> DocxExporter(container.mathRenderer).export(doc, target)
-                }
+                HtmlExporter(container.mathRenderer).export(doc, target)
             }
             generating.value = false
             run.onSuccess { exported ->
@@ -241,9 +230,8 @@ class PrintViewModel(private val container: AppContainer) : ViewModel() {
         }
     }
 
-    fun setFormat(value: ExportFormat) {
-        format.value = value
-    }
+    // setFormat 已随格式选择器一起删除：只剩 HTML 一种格式，没有可切的了。
+    // 保留这个方法的话会诱使人以为还能切换格式。
 
     fun consumeResult() {
         result.value = null

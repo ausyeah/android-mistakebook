@@ -61,6 +61,11 @@ class HtmlExporter(private val mathRenderer: MathRenderer) {
                 append("<h1>").append(escape(doc.title)).append("</h1>")
                 append("<p class=\"meta\">共 ").append(doc.cards.size)
                 append(" 道题 · 导出于 ").append(formatTime(doc.generatedAt)).append("</p>")
+                // 打印提示只在**屏幕**上显示，不进纸。
+                //
+                // 打印时 @media print 会把元素藏起来——用户要的是干净的纸，
+                // 而这行提示对他没用了（他正在打印，说明已经会用浏览器打印了）。
+                append("<p class=\"print-hint\">需要 PDF？用浏览器的打印功能（菜单里选「打印」）即可。</p>")
 
                 doc.cards.forEach { card ->
                     try {
@@ -263,6 +268,13 @@ class HtmlExporter(private val mathRenderer: MathRenderer) {
          * 所以默认隐藏答案解析栏由 CSS 控制，且分页时不把一道题切成两页。
          */
         val CSS = """
+            /* 打印提示：只在屏幕上出现，打印时藏起来 */
+            .print-hint {
+              color: #888;
+              font-size: 12px;
+              margin: 0 0 16px;
+            }
+
             @page { size: A4; margin: 16mm 14mm; }
             * { box-sizing: border-box; }
             body {
@@ -309,6 +321,8 @@ class HtmlExporter(private val mathRenderer: MathRenderer) {
             @media print {
               body { padding: 0; max-width: none; }
               .card { border-color: #ddd; }
+              /* 屏幕上的操作提示不进纸 */
+              .print-hint { display: none; }
             }
         """.trimIndent()
     }

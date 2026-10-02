@@ -31,6 +31,30 @@ import java.io.File
  * 而它们分散在三个文件里时，迟早有人只改其中一处，
  * 结果是「分享出去的东西打不开」或者「文件没有后缀，系统认不出类型」。
  */
+/**
+ * 导出格式。
+ *
+ * ## 为什么只剩 HTML 一种
+ *
+ * 曾经有三种，逐个说清楚为什么砍掉：
+ *
+ * - **PDF**（HTML → WebView → 系统打印管线）：实测「PDF 写出失败或超时」，
+ *   走的是 `PrintDocumentAdapter` 传 null 回调那条未文档化的路径，
+ *   稳定性和可预期性都远不如 HTML。生成的 PDF 也不比「浏览器打印」更好。
+ * - **DOCX**（手写 zip + OOXML + OMML）：用户实测「效果很差」。
+ *   OMML 在 Google Docs 与部分手机端阅读器支持不好，
+ *   而我们又不能为了兼容退回位图（那样 Word 里就是一堆图片、不能编辑）。
+ *
+ * **HTML 是唯一稳定的一种**：自包含（图片 base64 内嵌、公式原生 MathML）、
+ * 浏览器渲染可靠、可以选中搜索、离线能看。
+ *
+ * 需要 PDF 时用**浏览器的打印功能**（`Ctrl+P` / 分享 → 打印 → 另存为 PDF）。
+ * 浏览器打印的排版质量比 WebView 打印管线更好，而且页边距、缩放都能调。
+ * 界面上有一行小字引导用户这么做。
+ *
+ * 所以枚举从三个值变一个，`PrintViewModel` 里的 `when` 也就只剩一个分支——
+ * 之前那个「三格式共用同一份内容模型」的架构依然成立，只是退化成了单一格式。
+ */
 enum class ExportFormat(
     val extension: String,
     val mimeType: String,
@@ -39,25 +63,17 @@ enum class ExportFormat(
     /**
      * 短名，用于按钮与提示文案。
      *
-     * 不能直接用 [labelRes]：那个带括号说明（如「PDF（打印用）」），
+     * 不能直接用 [labelRes]：那个带括号说明（如「HTML（推荐）」），
      * 塞进「已选 3 题 · 生成 X」里会长得把按钮拉开。
-     *
-     * 三条文案原本都写死了「PDF」——加了格式选择器之后忘了参数化，
-     * 用户选了 HTML 却看到「生成 PDF」。
      */
     val shortLabelRes: Int
 ) {
-    PDF("pdf", "application/pdf", com.mistakebook.R.string.export_format_pdf, com.mistakebook.R.string.export_format_pdf_short),
-
     /** 单文件自包含：图片走 base64 data URL，公式走原生 MathML。 */
-    HTML("html", "text/html", com.mistakebook.R.string.export_format_html, com.mistakebook.R.string.export_format_html_short),
-
-    /** Word 文档。公式优先走原生 OMML，转不了内嵌位图。 */
-    DOCX(
-        "docx",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        com.mistakebook.R.string.export_format_docx,
-        com.mistakebook.R.string.export_format_docx_short
+    HTML(
+        "html",
+        "text/html",
+        com.mistakebook.R.string.export_format_html,
+        com.mistakebook.R.string.export_format_html_short
     );
 
     /** 导出用的文件名（不含扩展名）。 */

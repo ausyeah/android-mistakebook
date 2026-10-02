@@ -145,9 +145,7 @@ fun PrintScreen(container: AppContainer, onBack: () -> Unit) {
                 onIncludeImage = viewModel::setIncludeImage,
                 onShowAnswer = viewModel::setShowAnswer,
                 onBlankRedo = viewModel::setBlankRedo,
-                onBlankHeight = viewModel::setBlankHeight,
-                format = state.format,
-                onFormat = viewModel::setFormat
+                onBlankHeight = viewModel::setBlankHeight
             )
 
             if (state.questions.isEmpty()) {
@@ -339,12 +337,10 @@ private fun PrintOptionsPanel(
     showAnswer: Boolean,
     blankRedo: Boolean,
         blankHeight: Int,
-        format: ExportFormat,
     onIncludeImage: (Boolean) -> Unit,
     onShowAnswer: (Boolean) -> Unit,
     onBlankRedo: (Boolean) -> Unit,
-        onBlankHeight: (Int) -> Unit,
-        onFormat: (ExportFormat) -> Unit
+        onBlankHeight: (Int) -> Unit
 ) {
     Card(
         modifier = Modifier
@@ -379,66 +375,34 @@ private fun PrintOptionsPanel(
                 BlankHeightRow(height = blankHeight, onChange = onBlankHeight)
             }
             Spacer(Modifier.height(10.dp))
-            FormatRow(format = format, onChange = onFormat)
+            PdfViaBrowserHint()
         }
     }
 }
 
-  /**
-   * 导出格式选择。
-   *
-   * 用三个卡片而不是下拉框：三种格式的**用途差很大**（打印 / 分享 / 交给 Word 编辑），
-   * 下拉框里一行字说不清，选错了用户开始导出才发现。
-   */
-  @Composable
-  private fun FormatRow(format: ExportFormat, onChange: (ExportFormat) -> Unit) {
-      Column {
-          Text(
-              text = stringResource(R.string.export_format_title),
-              style = MaterialTheme.typography.labelMedium,
-              color = MaterialTheme.colorScheme.onSurfaceVariant
-          )
-          Spacer(Modifier.height(6.dp))
-          Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-              ExportFormat.entries.forEach { candidate ->
-                  val selected = candidate == format
-                  Surface(
-                      shape = RoundedCornerShape(8.dp),
-                      color = if (selected) {
-                          MaterialTheme.colorScheme.primaryContainer
-                      } else {
-                          MaterialTheme.colorScheme.surfaceVariant
-                      },
-                      border = if (selected) {
-                          androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.primary)
-                      } else {
-                          null
-                      },
-                      modifier = Modifier
-                          .weight(1f)
-                          .clickable { onChange(candidate) }
-                  ) {
-                      Box(
-                          modifier = Modifier.padding(horizontal = 8.dp, vertical = 10.dp),
-                          contentAlignment = Alignment.Center
-                      ) {
-                          Text(
-                              text = stringResource(candidate.labelRes),
-                              style = MaterialTheme.typography.labelSmall,
-                              color = if (selected) {
-                                  MaterialTheme.colorScheme.onPrimaryContainer
-                              } else {
-                                  MaterialTheme.colorScheme.onSurfaceVariant
-                              },
-                              maxLines = 2,
-                              textAlign = TextAlign.Center
-                          )
-                      }
-                  }
-              }
-          }
-      }
-  }
+/**
+ * 小字提示：如何把 HTML 变成 PDF。
+ *
+ * ## 为什么不自己生成 PDF
+ *
+ * 已经取消了 App 内生成 PDF 的路径。它走 `WebView.createPrintDocumentAdapter`，
+ * 且因为两个回调的构造器是 package-private，只能传 `null` ——
+ * “写完没写完”无法直接知道，只能靠文件大小猜。实测结果就是
+ * 「PDF 写出失败或超时」。
+ *
+ * 而浏览器的打印管线是成熟功能，页边距、缩放、页眉都能调，
+ * 且 WebView 的渲染本身就是浏览器——它能把我们的 MathML 渲染得最好。
+ *
+ * 所以只导出 HTML，把「打印成 PDF」这一步交给用户手动做。
+ */
+@Composable
+private fun PdfViaBrowserHint() {
+    Text(
+        text = stringResource(R.string.print_pdf_hint),
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+}
 
 @Composable
 private fun OptionSwitch(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
