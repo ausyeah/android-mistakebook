@@ -262,6 +262,19 @@ private fun segmentMathKeys(text: String): List<String> =
     parseInline(text).filterIsInstance<InlineSpan.Math>()
         .map { "i:${it.latex}" }
 
+/**
+ * 一张表格。
+ *
+ * 单元格用**纯 [Text]** 而非 [RichText]：公式渲染要 WebView 往返 + 位图，
+ * 而表格单元格宽度固定且很窄，塞一张公式图进去必然被压到看不清甚至溢出错位。
+ *
+ * 提示词已要求模型不要在表格里写 LaTeX（见 `ChatPrompts.SYSTEM`），
+ * 但模型不一定听。所以这里加一层兜底：把单元格里的 `$…$` **降级成可读的纯文本**，
+ * 而不是原样显示美元符号包着的源码。
+ *
+ * 注意是**降级**不是渲染——`$\frac{1}{2}$` 变成 `1/2`，
+ * 至少用户看得懂内容，好过看到 `$\frac{1}{2}$` 这串噪声。
+ */
 @Composable
 private fun TableBlock(block: MarkdownParser.Block.Table) {
     val columnCount = block.rows.maxOf { it.size }.coerceAtLeast(1)
@@ -274,7 +287,7 @@ private fun TableBlock(block: MarkdownParser.Block.Table) {
             Row(modifier = Modifier.fillMaxWidth()) {
                 for (column in 0 until columnCount) {
                     Text(
-                        text = row.getOrElse(column) { "" },
+                        text = tableCellToPlainText(row.getOrElse(column) { "" }),
                         style = MaterialTheme.typography.bodySmall,
                         fontWeight = if (rowIndex == 0) FontWeight.Medium else null,
                         color = MaterialTheme.colorScheme.onSurface,
@@ -289,6 +302,38 @@ private fun TableBlock(block: MarkdownParser.Block.Table) {
             }
         }
     }
+}
+
+/**
+ * 表格单元格文本：剥掉 Markdown 强调与行内公式标记，并去掉 LaTeX 反斜杠命令。
+ *
+ * 纯函数，可单测。
+ */
+internal fun tableCellToPlainText(raw: String): String {
+    var text = raw.trim()
+    // 先取公式内容（`$x$` / `$$x$$`），把美元符号丢掉
+    text = text.replace(Regex("""\$\$([^$]+)\$\$"""), "$1")
+    text = text.replace(Regex("""\$([^$]+)\$"""), "$1")
+    // **落单的那个**也去掉。
+    //
+    // 流式输出到一半时表格单元格可能只收到 `$x^2`（闭合标记还没到），
+    // 上面的正则要求成对，匹配不上。而单个 `$` 在纯文本里只会变成噪声。
+    // 放到最后做，免得把已经配好对的公式内容里的 `$` 也吃掉。
+    if (text.count { it == '$' } % 2 == 1) {
+        text = text.replace("$", "")
+    }
+    // 强调标记：表格里不需要斜体/粗体语义，去掉反引号与星号
+    text = text.replace(Regex("""`+([^`]*)`+"""), "$1")
+    text = text.replace("**", "").replace("*", "")
+
+    // **顺序要紧**：分式先转成可读形式，再剥剩下的命令反斜杠。
+    // 反过来 `\frac{1}{2}` 会先变成 `frac{1}{2}`，那条规则就再也匹配不到了。
+    text = text.replace(Regex("""\\d?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}"""), "$1/$2")
+    // 剩下的是识别不出的命令名，去掉反斜杠：`\alpha` → `alpha`
+    text = text.replace(Regex("""\\([a-zA-Z]+)"""), "$1")
+    // 剩下的花括号在纯文本里没有意义，去掉
+    text = text.replace(Regex("""\{([^}]*)\}"""), "$1")
+    return text.trim()
 }
 
 /** 一张公式图（独立成行）。display=true 用于 $$...$$，false 用于被提成的过高行内公式。 */

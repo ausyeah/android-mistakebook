@@ -400,7 +400,19 @@ class ChatViewModel(
             stream.complete(profile, request).collect { event ->
                 when (event) {
                     is ChatStreamEvent.Thinking -> {
-                        if (event.text.isNotEmpty()) thinking.append(event.text)
+                        if (event.text.isNotEmpty()) {
+                            thinking.append(event.text)
+                            // **思考阶段也必须刷。**
+                            //
+                            // 早先只有 Delta 分支会 flush，而推理模型的输出顺序是
+                            // 「全部思考 → 才开始正文」——于是整个思考阶段一个字符都不显示，
+                            // 要等第一条正文到达才一次性冒出来。而那时正文已开始，
+                            // ThinkingBlock 的 streaming 判定（正文非空即视为结束）
+                            // 已经把它折叠了，用户永远看不到「边生成边思考」。
+                            //
+                            // 这正是用户要的：思考中展开、结束收起。
+                            if (System.currentTimeMillis() - lastWriteAt >= WRITE_THROTTLE_MS) flush()
+                        }
                     }
 
                     is ChatStreamEvent.Delta -> {
