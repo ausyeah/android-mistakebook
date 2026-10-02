@@ -12,6 +12,22 @@ import kotlinx.coroutines.flow.Flow
  *
  * 约定：statusName / reasonName 传枚举 name（与 TypeConverter 写入库中的值一致），
  * subjectFilter 传 0 表示不限学科，keyword 传空串表示不搜索。
+ *
+ * ## 搜索范围
+ *
+ * 搜**题干、标题、答案、解析、选项 JSON、笔记**六处。
+ *
+ * 早先只搜 `stem`，于是两类常用场景都搜不到：
+ * - 「这题的答案是 B」——题干里根本没有「B」这个答案
+ * - 「三角函数」——那是自动生成的 `title`，题干写的是题目原文
+ * - 搜解析里才出现的概念（如「拉格朗日乘数」）
+ *
+ * `optionsJson` 直接 LIKE 也能命中选项文字：存的是 JSON 数组，
+ * 里面是选项的原文，LIKE 是子串匹配，用户搜「常数」就能命中「C. 常数」。
+ * 代价是可能匹配到转义字符——那只是多搜出几条，不是漏搜。
+ *
+ * **两处查询必须同步改**（列表与计数）。只改一处的话，
+ * 列表显示 3 条而角标写「共 12 条」，用户会以为漏了几条。
  */
 @Dao
 interface QuestionDao {
@@ -24,7 +40,15 @@ interface QuestionDao {
           AND (:subjectFilter = 0 OR subjectId = :subjectFilter)
           AND (:notebookFilter = 0 OR notebookId = :notebookFilter)
           AND (:reasonName = '' OR errorReason = :reasonName)
-          AND (:keyword = '' OR stem LIKE '%' || :keyword || '%')
+          AND (
+            :keyword = ''
+            OR stem LIKE '%' || :keyword || '%'
+            OR title LIKE '%' || :keyword || '%'
+            OR answer LIKE '%' || :keyword || '%'
+            OR analysis LIKE '%' || :keyword || '%'
+            OR optionsJson LIKE '%' || :keyword || '%'
+            OR note LIKE '%' || :keyword || '%'
+          )
         ORDER BY updatedAt DESC
         LIMIT :limit OFFSET :offset
         """
@@ -47,7 +71,15 @@ interface QuestionDao {
           AND (:subjectFilter = 0 OR subjectId = :subjectFilter)
           AND (:notebookFilter = 0 OR notebookId = :notebookFilter)
           AND (:reasonName = '' OR errorReason = :reasonName)
-          AND (:keyword = '' OR stem LIKE '%' || :keyword || '%')
+          AND (
+            :keyword = ''
+            OR stem LIKE '%' || :keyword || '%'
+            OR title LIKE '%' || :keyword || '%'
+            OR answer LIKE '%' || :keyword || '%'
+            OR analysis LIKE '%' || :keyword || '%'
+            OR optionsJson LIKE '%' || :keyword || '%'
+            OR note LIKE '%' || :keyword || '%'
+          )
         """
     )
     fun observeFilteredCount(
