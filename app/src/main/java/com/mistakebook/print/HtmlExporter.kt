@@ -33,15 +33,29 @@ import java.time.format.DateTimeFormatter
  */
 class HtmlExporter(private val mathRenderer: MathRenderer) {
 
-    suspend fun export(doc: ExportDoc, target: File): ExportResult =
-        withContext(Dispatchers.IO) {
-            val skipped = mutableListOf<String>()
-            val body = buildString {
+    /**
+     * 公式的渲染方式。
+     *
+     * - [MATHML]：原生 MathML。文字、可搜索、无 JS、离线可看——**分享出去的 HTML 用它**。
+     * - [KATEX]：走 assets 里的 KaTeX。需要在 WebView 里打开，**PDF 路径用它**——
+     *   不知道设备的 WebView 版本支不支持 MathML（MathML Core 要 Chrome 109+），
+     *   而 KaTeX 在 [com.mistakebook.math.MathRenderer] 里已经用了好久。
+     */
+    enum class FormulaMode { MATHML, KATEX }
+
+    /** 只生成 HTML，不写文件。[HtmlPdfExporter] 直接复用这一份。 */
+    suspend fun buildHtml(doc: ExportDoc, mode: FormulaMode = FormulaMode.MATHML): HtmlDocument {
+        val skipped = mutableListOf<String>()
+        val body = buildString {
                 append(DOCTYPE)
                 append("<html lang=\"zh-CN\"><head>")
                 append("<meta charset=\"utf-8\">")
                 append("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
                 append("<title>").append(escape(doc.title)).append("</title>")
+                if (mode == FormulaMode.KATEX) {
+                    append("""<link rel="stylesheet" href="katex.min.css">""")
+                    append("""<script src="katex.min.js"></script>""")
+                }
                 append("<style>").append(CSS).append("</style>")
                 append("</head><body>")
                 append("<h1>").append(escape(doc.title)).append("</h1>")
@@ -50,21 +64,47 @@ class HtmlExporter(private val mathRenderer: MathRenderer) {
 
                 doc.cards.forEach { card ->
                     try {
-                        append(renderCard(card, doc, skipped))
+                        append(renderCard(card, doc, skipped, mode))
                     } catch (error: Throwable) {
                         // 单题坏掉不拖垮整批
                         android.util.Log.e("HtmlExporter", "题目 ${card.questionId} 渲染失败", error)
                         skipped += card.header.take(40)
                     }
                 }
+                if (mode == FormulaMode.KATEX) {
+                    append(KATEX_BOOTSTRAP)
+                }
                 append("</body></html>")
             }
-            target.parentFile?.mkdirs()
-            target.writeText(body, Charsets.UTF_8)
-            ExportResult(file = target, skipped = skipped)
-        }
+        return HtmlDocument(html = body, skipped = skipped)
+    }
 
-    private suspend fun renderCard(card: ExportCard, doc: ExportDoc, skipped: MutableList<String>): String =
+    /** 写文件。分享用的 HTML 走这里，用原生 MathML（自包含、无 JS、离线可看）。 */
+    suspend fun export(doc: ExportDoc, target: File): ExportResult = withContext(Dispatchers.IO) {
+        val built = buildHtml(doc, FormulaMode.MATHML)
+        target.parentFile?.mkdirs()
+        target.writeText(built.html, Charsets.UTF_8)
+        ExportResult(file = target, skipped = built.skipped)
+    }
+
+    /**
+     * 一次 HTML 构建的产物。
+     *
+     * 拆出来而不是让 `buildHtml` 直接写文件，是因为 PDF 路径要拿到 HTML 喂给 WebView，
+     * 同时**也要拿到「哪些题渲染失败了」**——两条路径共用一次渲染结果。
+     *
+     * 早先的写法是把 `skipped` 存成实例字段再从 `export` 读回来：
+     * 编译器不报错，但并发导出两个任务会互相覆盖，且 `skipped` 属于哪次调用
+     * 完全取决于调用顺序。这种「用实例状态当返回值」在重构时最容易漏掉调用点。
+     */
+    data class HtmlDocument(val html: String, val skipped: List<String>)
+
+    private suspend fun renderCard(
+        card: ExportCard,
+        doc: ExportDoc,
+        skipped: MutableList<String>,
+        mode: FormulaMode
+    ): String =
         buildString {
             append("<section class=\"card\"")
             card.subjectName?.let { append(" data-subject=\"").append(escape(it)).append("\"") }
@@ -73,7 +113,7 @@ class HtmlExporter(private val mathRenderer: MathRenderer) {
 
             if (card.stem.any { it is RichToken.TextToken }) {
                 append("<div class=\"stem\">")
-                append(renderTokens(card.stem))
+                append(renderTokens(card.stem, mode))
                 append("</div>")
             }
 
@@ -92,19 +132,19 @@ class HtmlExporter(private val mathRenderer: MathRenderer) {
             if (card.options.isNotEmpty()) {
                 append("<ol class=\"options\" type=\"A\">")
                 card.options.forEach { option ->
-                    append("<li>").append(renderTokens(tokenizeWithMath(option.text))).append("</li>")
+                    append("<li>").append(renderTokens(tokenizeWithMath(option.text), mode)).append("</li>")
                 }
                 append("</ol>")
             }
 
             if (card.hasAnswer) {
                 append("<div class=\"answer\"><span class=\"tag\">答案</span>")
-                append(renderTokens(card.answer))
+                append(renderTokens(card.answer, mode))
                 append("</div>")
             }
             if (card.hasAnalysis) {
                 append("<div class=\"analysis\"><span class=\"tag\">解析</span>")
-                append(renderTokens(card.analysis))
+                append(renderTokens(card.analysis, mode))
                 append("</div>")
             }
 
@@ -118,16 +158,21 @@ class HtmlExporter(private val mathRenderer: MathRenderer) {
         }
 
     /** token 序列 -> HTML。文本转义，公式走 MathML。 */
-    private suspend fun renderTokens(tokens: List<RichToken>): String = buildString {
+    private suspend fun renderTokens(tokens: List<RichToken>, mode: FormulaMode): String = buildString {
         tokens.forEach { token ->
             when (token) {
                 is RichToken.TextToken -> append(escape(token.text))
-                is RichToken.MathToken -> append(renderFormula(token))
+                is RichToken.MathToken -> append(renderFormula(token, mode))
             }
         }
     }
 
-    private suspend fun renderFormula(token: RichToken.MathToken): String {
+    private suspend fun renderFormula(token: RichToken.MathToken, mode: FormulaMode): String {
+        if (mode == FormulaMode.KATEX) {
+            // 留给页面上的 KaTeX 脚本渲染。data-tex 逃义后就是原始 LaTeX。
+            val display = if (token.display) "1" else "0"
+            return """<span class="tex" data-tex="${escape(token.latex)}" data-display="$display"></span>"""
+        }
         val ml = mathRenderer.toMathMl(token.latex, token.display)
         if (ml != null) {
             // MathML 自带语义，浏览器直接渲染；alt/title 里留 LaTeX 原文兜底
@@ -184,6 +229,32 @@ class HtmlExporter(private val mathRenderer: MathRenderer) {
     private companion object {
         const val DOCTYPE = "<!DOCTYPE html>"
 
+        /**
+         * KaTeX 模式的页面脚本。
+         *
+         * 只把 `<span class="tex">` 里的 LaTeX 渲染成 KaTeX，不做其他事。
+         * 公式宽度由 KaTeX 自己量，而行高由内联 CSS 控制——
+         * 两者分工才不会出现「公式很大纸上小」这类不协调。
+         */
+        val KATEX_BOOTSTRAP = """
+<script>
+  document.querySelectorAll('span.tex').forEach(function (el) {
+    var latex = el.getAttribute('data-tex') || '';
+    var display = el.getAttribute('data-display') === '1';
+    try {
+      katex.render(latex, el, {
+        displayMode: display,
+        throwOnError: false,
+        strict: false,
+        output: 'html'
+      });
+    } catch (e) {
+      el.textContent = latex;
+    }
+  });
+</script>
+        """.trimIndent()
+
         /** 单张内联图片上限 2MB。 */
         const val MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024
 
@@ -230,6 +301,11 @@ class HtmlExporter(private val mathRenderer: MathRenderer) {
             }
             math { font-size: 1.05em; }
             math[display="block"] { margin: 10px 0; }
+            /* 打印时用 KaTeX 的展开样式：行内公式不能换行，块公式中央对齐 */
+            .katex { font-size: 1.06em; }
+            .katex-display { margin: 12px 0; text-align: center; }
+            .katex-display > .katex { text-align: center; }
+            span.tex { white-space: nowrap; }
             @media print {
               body { padding: 0; max-width: none; }
               .card { border-color: #ddd; }

@@ -34,15 +34,31 @@ import java.io.File
 enum class ExportFormat(
     val extension: String,
     val mimeType: String,
-    val labelRes: Int
+    val labelRes: Int,
+
+    /**
+     * 短名，用于按钮与提示文案。
+     *
+     * 不能直接用 [labelRes]：那个带括号说明（如「PDF（打印用）」），
+     * 塞进「已选 3 题 · 生成 X」里会长得把按钮拉开。
+     *
+     * 三条文案原本都写死了「PDF」——加了格式选择器之后忘了参数化，
+     * 用户选了 HTML 却看到「生成 PDF」。
+     */
+    val shortLabelRes: Int
 ) {
-    PDF("pdf", "application/pdf", com.mistakebook.R.string.export_format_pdf),
+    PDF("pdf", "application/pdf", com.mistakebook.R.string.export_format_pdf, com.mistakebook.R.string.export_format_pdf_short),
 
     /** 单文件自包含：图片走 base64 data URL，公式走原生 MathML。 */
-    HTML("html", "text/html", com.mistakebook.R.string.export_format_html),
+    HTML("html", "text/html", com.mistakebook.R.string.export_format_html, com.mistakebook.R.string.export_format_html_short),
 
-    /** 原生 Word 文档，公式走 OMML（可双击编辑）。 */
-    DOCX("docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", com.mistakebook.R.string.export_format_docx);
+    /** Word 文档。公式优先走原生 OMML，转不了内嵌位图。 */
+    DOCX(
+        "docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        com.mistakebook.R.string.export_format_docx,
+        com.mistakebook.R.string.export_format_docx_short
+    );
 
     /** 导出用的文件名（不含扩展名）。 */
     fun fileName(stamp: String): String = "错题本_$stamp"
@@ -235,18 +251,13 @@ class ExportCardBuilder(private val subjectNames: Map<Long, String>) {
 
     fun build(question: Question, options: ExportOptions, index: Int): ExportCard {
         val subjectName = question.subjectId?.let { subjectNames[it] }
-        val points = question.knowledgePoints
-            .takeIf { it.isNotEmpty() }?.joinToString("、").orEmpty()
-        val safe = question.difficulty.coerceIn(1, 5)
 
-        val header = buildString {
-            append(index).append(". ")
-            append(plainText(question.displayTitle))
-            append(" · ").append(subjectName ?: "未分类")
-            append(" · ").append(question.errorReason.label)
-            append(" · ").append("★".repeat(safe)).append("☆".repeat(5 - safe))
-            if (points.isNotBlank()) append(" · ").append(plainText(points))
-        }
+        // 题头**只留顺序题号**。
+        //
+        // 原来还带标题、学科、错因、难度星、知识点，一行到尾。
+        // 用户实测认为「标注过多不够简洁」——纸上大量空白被这一行吃掉，
+        // 而这些信息在应用里都能看到。三种格式统一取这个判据。
+        val header = "$index."
 
         val imagePath = question.printImagePath
         return ExportCard(

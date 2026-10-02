@@ -205,16 +205,39 @@ class LatexToOmmlTest {
     // ---------------------------------------------------------- left/right
 
     @Test
-    fun `left right 的括号被丢掉只取内容`() {
+    fun `left right 产生真正的分隔符组`() {
+        // 早先这里把括号整个丢掉，只留内容，于是 `\left(\frac12\right)`
+        // 显示成没有括号的分式。测试原来还把这个 bug 钉成了「正确行为」。
         val xml = convert("""\left( x + 1 \right)""")
         assertNotNull(xml)
-        assertTrue(xml!!.contains("<m:t>x</m:t>"))
-        assertTrue("括号本身不该出现在正文里", !xml.contains("<m:t>(</m:t>"))
+        assertTrue("应为分隔符组 m:d", xml!!.contains("<m:d>"))
+        assertTrue("左括号字符", xml.contains("""<m:begChr m:val="("/>"""))
+        assertTrue("右括号字符", xml.contains("""<m:endChr m:val=")"/>"""))
+        assertTrue("内容要在 m:e 里", xml.contains("<m:t>x</m:t>"))
     }
 
     @Test
-    fun `left right 带花括号`() {
-        assertNotNull(convert("""\left\{ x \right\}"""))
+    fun `left right 的括号类型必须原样保留`() {
+        // m:d 省略 dPr 时默认是圆括号（ECMA-376 22.1.2.12），
+        // 所以 begChr/endChr 不能省，否则 `\left[` 会显示成圆括号。
+        val bracket = convert("""\left[ x \right]""")
+        assertNotNull(bracket)
+        assertTrue(bracket!!.contains("""<m:begChr m:val="["/>"""))
+        assertTrue(bracket.contains("""<m:endChr m:val="]"/>"""))
+
+        val brace = convert("""\left\{ x \right\}""")
+        assertNotNull(brace)
+        assertTrue(brace!!.contains("""<m:begChr m:val="{"/>"""))
+        assertTrue(brace.contains("""<m:endChr m:val="}"/>"""))
+    }
+
+    @Test
+    fun `left 里的分式不丢`() {
+        // 这条曾经必然丢内容：readLeftDelimiter 的前身直接返回空串
+        val xml = convert("""\left(\frac{1}{2}\right)""")
+        assertNotNull(xml)
+        assertTrue("分式结构要留下", xml!!.contains("<m:f>"))
+        assertTrue("分子要留下", xml.contains("<m:t>1</m:t>"))
     }
 
     // ---------------------------------------------------------- 不支持环境
@@ -287,5 +310,71 @@ class LatexToOmmlTest {
         val xml = convert("""\sum_{i=1}^{n} i""")
         assertNotNull(xml)
         assertTrue(xml!!.contains("<m:nary>"))
+    }
+
+    // ---------------------------------------------------------- 大算符
+
+    /**
+     * 回归：早先的 `bigOp` 把参数全丢了，输出三个空标签
+     * `<m:sub/><m:sup/><m:e/>`——`\sum_{i=1}^n x` 里的 `i=1`、`n`、`x` 一起消失。
+     *
+     * 这条比转换失败更危险：失败会回退到位图，看起来正常；
+     * 而丢参数会**静默给出错误公式**，用户根本发现不了。
+     */
+    @Test
+    fun `大算符必须保留上下限和操作数`() {
+        val xml = convert("""\sum_{i=1}^{n} x_i""")
+        assertNotNull(xml)
+        assertTrue(xml!!.contains("<m:nary>"))
+        assertTrue("∑ 字符", xml.contains("""<m:chr m:val="∑"/>"""))
+        assertTrue("下限 i=1 不能丢", xml.contains("<m:sub>") && xml.contains("<m:t>i=1</m:t>"))
+        assertTrue("上限 n 不能丢", xml.contains("<m:sup>") && xml.contains("<m:t>n</m:t>"))
+        assertTrue("操作数 x 不能丢", xml.contains("<m:e>") && xml.contains("<m:t>x</m:t>"))
+    }
+
+    @Test
+    fun `大算符操作数的下标不被拆出去`() {
+        // \sum x_i 里 i 属于 x。若操作数只取 x，剩下的 _i 会变成外层兄弟节点，
+        // 渲染成 (∑ x)_i
+        val xml = convert("""\sum x_i""")
+        assertNotNull(xml)
+        assertTrue("操作数应带上自己的下标", xml!!.contains("<m:sSub>"))
+        assertTrue("下标内容是 i", xml.contains("<m:sub><m:r><m:t>i</m:t></m:r></m:sub>"))
+    }
+
+    @Test
+    fun `大算符不会把后面的加法吞成操作数`() {
+        // a + \sum x + b：操作数只取紧跟的一个原子 x
+        val xml = convert("""a + \sum x + b""")
+        assertNotNull(xml)
+        assertTrue("后面的 b 必须在 nary 之外", xml!!.indexOf("<m:t>b</m:t>") > xml.indexOf("</m:nary>"))
+    }
+
+    @Test
+    fun `积分带上下限`() {
+        val xml = convert("""\int_0^1 f(x)dx""")
+        assertNotNull(xml)
+        assertTrue(xml!!.contains("""<m:chr m:val="∫"/>"""))
+        assertTrue("下限 0", xml.contains("<m:sub><m:r><m:t>0</m:t></m:r></m:sub>"))
+        assertTrue("上限 1", xml.contains("<m:sup><m:r><m:t>1</m:t></m:r></m:sup>"))
+        // 操作数是紧跟的一个「词」，括号不是词的组成字符，所以 f(x)dx 整块进来
+        assertTrue("操作数 f", xml.contains("<m:e><m:r><m:t>f(x)dx</m:t></m:r></m:e>"))
+    }
+
+    @Test
+    fun `没有操作数的大算符不产出空 nary`() {
+        // 产出空的 <m:e/> 只会让 Word 显示一个孤零零的符号，
+        // 不如什么都不出（外面会回退到位图）
+        val xml = convert("""\sum""")
+        assertTrue("空操作数应放弃转换", xml == null || !xml.contains("<m:nary>"))
+    }
+
+    @Test
+    fun `花括号分组不产生括号`() {
+        // LaTeX 的 {...} 是纯分组。早先套了个 m:d，而 m:d 省略 dPr 时默认圆括号，
+        // 于是 \frac{1}{2} 显示成 (1)/(2)。
+        val xml = convert("""\frac{1}{2}""")
+        assertNotNull(xml)
+        assertTrue("分组不该引入分隔符组", !xml!!.contains("<m:d>"))
     }
 }

@@ -1066,3 +1066,149 @@ docx 就是 zip + XML。最少四份套件：
   `kotlinx` 会抛 `Invalid escaped char 'p'` → 整个 JSON 解析失败 → 静默降级为
   「题干 = 原始 OCR、答案解析为空」。这解释不了截图里那道题（它有答案有解析），
   但可能就是库里其他几道「AI 整理失败」的原因。待确认后再加字母覆盖。
+
+---
+
+## v0.0.10 — 导出四修：PDF 改走浏览器排版、DOCX 公式修复、题头精简、文案参数化
+
+### 1. PDF 不再手写排版，改成「HTML → WebView 打印」
+
+用户实测 v0.0.9 的 PDF：「公式都对，但高低大小各种不协调」，
+并建议「先输出 html 再转换成 pdf，似乎只有 html 效果最好」。
+
+**采纳了。** 原来的 `PdfExporter` 用 `PdfDocument` + `Canvas` 自己断行、
+自己算公式缩放、自己分页。这条路要同时照顾基线对齐、行高、公式字号缩放、
+分页截断，任何一处算错就全局失调，而且**很难看出是哪一处错了**。
+浏览器天生把这件事做对，用户也验证过 HTML 效果最好。
+
+新增 `HtmlPdfExporter`：`HtmlExporter` 出 HTML → 塞进 `WebView` →
+`createPrintDocumentAdapter` → `ParcelFileDescriptor`。
+`PdfExporter.kt`（697 行）连同只测它的 `PdfLineHeightTest.kt` 一并删除。
+保留一份已知排版有问题的死代码，只会让「PDF 还有测试」这个错觉继续存在。
+
+**内容没有分叉**：三种格式仍共用同一份 `ExportDoc`（见 v0.0.9 的 `ExportModel`）。
+只有「怎么排版」分叉——而且那本来就该由各自的渲染器负责。
+
+#### 为什么 PDF 里的公式用 KaTeX 而不是 MathML
+
+分享出去的 HTML 用**原生 MathML**（文字、可搜索、无 JS、离线可看）。
+但 PDF 走的是本进程的 WebView，**它的版本不保证支持 MathML**——
+MathML Core 要 Chrome 109+（2023 年初）。而 `assets/katex/math.html`
+已经证明 KaTeX 在这类设备的 WebView 上跑了很久。
+
+所以 `HtmlExporter.FormulaMode` 分 `MATHML` / `KATEX`：
+自包含的分享文件用前者，本进程打印用后者。**不赌设备 WebView 版本。**
+
+#### 两个 API 坑
+
+- `PrintDocumentAdapter.LayoutResultCallback` / `WriteResultCallback`
+  的构造器是 **package-private**，第三方根本 `new` 出来。
+  只能传 `null`。但「`onWrite` 传 null 回调是不是同步的」没有文档背书，
+  本机也没设备可验——所以 [HtmlPdfExporter.awaitStablePdf] 按
+  「文件大小连续 3 次采样不变」兜一层。同步异步都不会误判，多花 600ms 可接受。
+- `@page { margin }` 与 `PrintAttributes.setMinMargins` **只能设一处**，
+  两处都设会叠加成双倍边距。选 CSS，WebView 打印管线认它。
+
+### 2. DOCX 公式：根因不是 OMML，是装配管道
+
+用户：「渲染出来的 docx 不能正常渲染 latex 公式」。
+子代理逐条对照 ECMA-376 XSD 核对后：**OMML 结构 8 项全合法**
+（`m:oMath` 作 `w:p` 直属子元素是对的，放进 `w:r` 反而错；
+`m:f` / `m:sSup` / `m:nary` 的子元素顺序都对；
+`m:r` 不需要 `rPr`；`xmlns:m` 声明在根元素上即可）。
+
+我在动手前写下的判断是「OMML 不行就改走位图」——**这个判断是错的**，
+而且如果照做也救不了：位图回退走的是**同一条坏管道**。
+
+真正的问题是 [DocxExporter] 的 `paragraph()`：它无条件把入参塞进 `<w:t>`。
+而 `renderTokens()` 返回的**不是纯文本**，是 `<m:oMath>…</m:oMath>`
+或一整个 `<w:p>` 图片段。两种后果：
+
+- 题干/答案/解析：OMML 的尖括号被转义成实体，Word 还原后**显示成一串 XML 标签**。
+  这正是用户看到的现象。
+- 选项：`<w:t>` 里出现子元素，`w:CT_Text` 是 `simpleContent` → **schema 违规**，
+  Word 弹「文档已损坏」并触发修复。
+- 位图：`<w:p>` 套 `<w:p>` → 同样 schema 违规，图片也出不来。
+
+**为什么 41 条 OMML 测试全绿**：`DocxPackageTest` 自己手搓 `documentBody`，
+**从不调用 `renderCard` / `renderTokens` / 段落拼装**。
+测试绕开了出事的那段代码，等于没测。这是本项目第三次栽在同一类坑上
+（见 BatchProtocolTest、BatchLayoutParseTest）。
+
+修法：**用类型让错误路径编译不过**，而不是靠人记得调用顺序。
+新增 `DocxParagraphs.Fragment`（`Text` / `Math` / `DisplayMath` / `Image`
+四个**不同的类型**）+ `DocxParagraphs.emit()`。
+「这段该不该进 `w:t`」由 `emit` 判断，调用方没有机会拼错。
+`textParagraph()` 加 `require(text.none { it == '<' || it == '>' })` 兜底。
+
+`DocxParagraphs` 刻意做成**纯 Kotlin**（图片尺寸以 EMU 预先算好传进来），
+就是为了能在 JVM 上单测。新增 `DocxParagraphsTest` 9 条，覆盖的正是
+「公式/图片不落进 `w:t`」「段落不嵌套」「图片 id 唯一」。
+
+**并且验证过这条测试能抓到 bug**：把 `emit` 里的 `Fragment.Math` 改回
+`textRun(fragment.xml, ...)`，测试立即变红，确认后才恢复。
+本项目的规矩是「测试先证明自己有用，再合」。
+
+### 3. 顺手修的三个 OMML 语义 bug（修好管道后才暴露出来）
+
+- `group()`：LaTeX 的 `{...}` 是纯分组，但代码套了个 `m:d`。
+  而 `m:d` 省略 `dPr` 时按 ECMA-376 §22.1.2.12 默认 `(` `)` →
+  **`\frac{1}{2}` 显示成 `(1)/(2)`**。改为直接返回内容。
+- `bigOp()`：完全丢弃参数，输出 `<m:sub/><m:sup/><m:e/>` 三个空标签 →
+  `\sum_{i=1}^n x` 里的 `i=1`、`n`、`x` **全部消失**。
+  这条比转换失败危险得多：失败会回退到位图（看起来正常），
+  丢参数会**静默给出错误公式**，用户不可能发现。现在吃掉下限/上限/操作数，
+  操作数取「紧跟的一个原子（含它自己的上下标）」——
+  否则 `\sum x_i` 会渲染成 `(∑ x)_i`。
+- `readDelimiterCommand()`：直接返回空串，`\left( ... \right)` 的括号连同内容一起消失。
+  改为输出真正的 `m:d`，并**显式写 `begChr`/`endChr`**（省略 `dPr` 时默认是圆括号，
+  `\left[` 会显示成圆括号）。
+
+两条 `\left\right` 的旧测试当时**把这个 bug 钉成了「正确行为」**
+（测试名就叫「left right 的括号被丢掉只取内容」）。已改成断言正确行为。
+
+### 4. 题头只剩顺序题号
+
+用户：「题目前的标注过多不够简洁（只要顺序题号）」。
+
+原来 `ExportCardBuilder` 把标题、学科、错因、难度星、知识点串一行到尾巴。
+现在 `header = "$index."`，三种格式统一。理由写在代码注释里：
+这些信息在应用里都看得到，纸上大量空白被这一行吃掉不划算。
+
+### 5. 三条文案把「PDF」写死了
+
+用户：「目前三种打印规格生成结束的提示都是PDF，包括生成按钮也是」。
+
+`print_generate` / `print_selected_format` / `print_done_title` 三个字符串
+**字面量写着「PDF」**。加了格式选择器之后忘了参数化——
+用户选了 HTML，按钮上还是「生成 PDF」。
+
+新增 `ExportFormat.shortLabelRes`（不带括号说明的短名），
+文案改成 `生成 %1$s` / `已选 %1$d 题 · 生成 %2$s` / `%1$s 已生成`。
+
+### 本轮反复出现的同一个错误
+
+> **注释里写了正确设计 ≠ 代码按它做。**
+
+- `DocxExporter.renderTokens` 的 KDoc 原话是「公式**不能**塞进 `w:t`——
+  所以公式单独生成 `m:oMath` 兄弟节点」。作者（我）想清楚了，
+  写在注释里，然后函数照样返回拼好的字符串，调用方照样塞进 `w:t`。
+- `LatexToOmml` 里 `convert` 的注释说「不支持的返回 null 让它走位图回退」，
+  而 `bigOp` 恰恰是**「成功返回了错误内容」**——不失败，所以回退从不触发。
+
+两处的共同点：**用一个"失败就回退"的兜底掩盖了"成功产出垃圾"**。
+兜底只在抛异常时生效，而垃圾输出不抛异常。
+
+对策：能靠类型表达的，不靠注释；能靠测试钉的，不靠注释；
+新增路径**先写那条能证明自己有用的测试**。
+
+### 未验证 / 已知代价
+
+- **没有 adb 连接**，HTML→PDF 管线与 DOCX 修复都只能靠用户装包实测。
+  `createPrintDocumentAdapter` 传 null 回调的同步性尤其需要真机确认。
+- OMML 在 Google Docs 与部分手机端阅读器支持不好（Word 桌面版 / WPS 正常）。
+  这是当初选 OMML 的已知代价，与本次 bug 无关。转不了公式会自动回退位图。
+- `LatexToOmmlTest` 里对 `\int_0^1 f(x)dx` 的期望是「操作数吃掉 `f(x)dx` 整块」。
+  视觉上对（显示成 `∫₀¹ f(x)dx`），但严格说 `dx` 属于整体而非被求积函数。
+  想要更准得实现完整的 TeX 盒子模型，收益不抵成本，先记着。
+- `LatexEscapes.AMBIGUOUS = "trnbf"` 覆盖不全的问题仍未处理（v0.0.9 遗留）。

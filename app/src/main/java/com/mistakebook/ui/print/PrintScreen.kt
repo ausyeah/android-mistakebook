@@ -78,6 +78,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 fun PrintScreen(container: AppContainer, onBack: () -> Unit) {
     val viewModel: PrintViewModel = containerViewModel(container) { PrintViewModel(it) }
     val state by viewModel.uiState.collectAsState()
+    // 三条文案原本都写死了「PDF」，选了 HTML 也显示「生成 PDF」。
+    val formatName = stringResource(state.format.shortLabelRes)
     val context = LocalContext.current
 
     Scaffold(
@@ -113,7 +115,8 @@ fun PrintScreen(container: AppContainer, onBack: () -> Unit) {
                     Text(
                         text = stringResource(
                             R.string.print_selected_format,
-                            state.selected.size
+                            state.selected.size,
+                            formatName
                         )
                     )
                 }
@@ -179,7 +182,7 @@ fun PrintScreen(container: AppContainer, onBack: () -> Unit) {
         val output = state.result!!
         AlertDialog(
             onDismissRequest = viewModel::consumeResult,
-            title = { Text(stringResource(R.string.print_done_title)) },
+            title = { Text(stringResource(R.string.print_done_title, formatName)) },
             text = {
                 Column {
                     Text(

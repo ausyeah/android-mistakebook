@@ -178,11 +178,11 @@
     <string name="print_show_answer">显示答案与解析</string>
     <string name="print_blank_redo">留白重做模式</string>
     <string name="print_blank_height">重做区高度</string>
-    <string name="print_generate">生成 PDF</string>
-    <string name="print_selected_format">已选 %1$d 题 · 生成 PDF</string>
+    <string name="print_generate">生成 %1$s</string>
+    <string name="print_selected_format">已选 %1$d 题 · 生成 %2$s</string>
     <string name="print_empty">没有可打印的题目</string>
     <string name="print_generating">正在生成 PDF…</string>
-    <string name="print_done_title">PDF 已生成</string>
+    <string name="print_done_title">%1$s 已生成</string>
     <string name="print_share">分享</string>
     <string name="print_open">打开</string>
     <string name="print_skipped_format">跳过的题目：%1$s</string>
@@ -397,4 +397,8 @@
     <string name="chat_math_failed_title">有公式没渲染出来</string>
     <string name="chat_math_failed_body">下面这几个公式的 LaTeX 源文有问题，已显示为小字体。可以在编辑页点「检查」一键修复。</string>
     <string name="chat_math_failed_count">%1$d 处公式未渲染</string>
+
+    <string name="export_format_pdf_short">PDF</string>
+    <string name="export_format_html_short">HTML</string>
+    <string name="export_format_docx_short">DOCX</string>
 </resources>

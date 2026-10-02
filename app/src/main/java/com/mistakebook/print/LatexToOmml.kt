@@ -52,18 +52,29 @@ object LatexToOmml {
 
         private fun startsWith(text: String): Boolean = src.startsWith(text, pos)
 
-        /** 解析到当前层结束（`}` 或字符串结尾）。 */
-        fun parseRun(): String {
+        /**
+         * 解析到当前层结束（`}` 或字符串结尾）。
+         *
+         * @param stopAtRightDelimiter 停在 `\right` 前，并把它的分隔符字符记进
+         *   [rightChar]。给 `\left(...\right)` 用——否则括号配不上对。
+         * @param stopAtClosing 停在这个闭括号前并**不**消费它（由调用方消费，
+         *   因为 `\left(a,b\right)` 的右括号不是 `}`）。
+         */
+        fun parseRun(stopAtRightDelimiter: Boolean = false, stopAtClosing: Char? = null): String {
             val out = StringBuilder()
             while (pos < src.length) {
                 val ch = src[pos]
                 when {
+                    stopAtClosing != null && ch == stopAtClosing -> return out.toString()
                     ch == '}' -> return out.toString()
                     ch == '{' -> {
                         pos++
                         val inner = parseRun()
                         if (peek() == '}') pos++
-                        out.append(group(inner))
+                        // LaTeX 的 `{...}` 是**纯分组**，不产生任何字符。
+                        // 早先这里套了个 `m:d`，而 `m:d` 省略 `dPr` 时默认圆括号，
+                        // 于是 `\frac{1}{2}` 显示成 `(1)/(2)`。
+                        out.append(inner)
                     }
 
                     ch == '^' -> {
@@ -80,7 +91,16 @@ object LatexToOmml {
                         out.append(script(base, readScriptArg(), sup = false))
                     }
 
-                    ch == '\\' -> out.append(readCommand())
+                    ch == '\\' -> {
+                        // `\right` 必须由 `\left` 那边消费掉，不能当作独立命令处理
+                        if (stopAtRightDelimiter && isCommand("right")) {
+                            pos += 1 + "right".length
+                            rightChar = readDelimiterChar()
+                            return out.toString()
+                        }
+                        out.append(readCommand())
+                    }
+
                     else -> {
                         // 连续的字母数字合成一个 run：`x + 1` 里的 `x` 不应被拆成
                         // `x` / `+` / `1` 三个 run，否则 `xy^2` 里的 `y` 上标会把 `xy` 整个当成基，
@@ -146,8 +166,10 @@ object LatexToOmml {
                 "frac" -> fraction()
                 "dfrac", "tfrac" -> fraction()
                 "sqrt" -> radical()
-                "left" -> readDelimiterCommand()
-                "right" -> readDelimiterCommand()
+                "left" -> readLeftDelimiter()
+                // `\right` 由 readLeftDelimiter 一起吃掉了。能走到这里说明是孤立的
+                // `\right`（前面没有 `\left`），丢掉它比崩掉好。
+                "right" -> ""
                 "cdot" -> run("·")
                 "times" -> run("×")
                 "div" -> run("÷")
@@ -166,6 +188,8 @@ object LatexToOmml {
                 "sum" -> bigOp("∑")
                 "prod" -> bigOp("∏")
                 "int" -> bigOp("∫")
+                "iint" -> bigOp("∬")
+                "oint" -> bigOp("∮")
                 "rightarrow", "to" -> run("→")
                 "leftarrow" -> run("←")
                 "Rightarrow" -> run("⇒")
@@ -264,13 +288,126 @@ object LatexToOmml {
             return "<m:rad><m:radPr><m:degHide m:val=\"1\"/></m:radPr><m:deg/><m:e>$body</m:e></m:rad>"
         }
 
-        /** `\left( ... \right)`。括号本身丢掉，只取里面内容。 */
-        private fun readDelimiterCommand(): String {
-            // `\left.` / `\right.` 表示无括号
-            if (pos < src.length && src[pos] != '{') {
-                pos++
+        /**
+     * `\left` 的分隔符命令 -> 对应的括号字符。
+     *
+     * `readDelimiterChar` 先把命令过一遍 [readCommand] 变成 OMML 再剥回来，很绕；
+     * 这里直接在字符层映射，省掉一次「生成 XML 再解析出字面量」的往返。
+     */
+    private val DELIMITER_ALIASES = mapOf(
+        "langle" to "⟨", "rangle" to "⟩",
+        "lceil" to "⌈", "rceil" to "⌉",
+        "lfloor" to "⌊", "rfloor" to "⌋",
+        "lbrace" to "{", "rbrace" to "}",
+        "lvert" to "|", "rvert" to "|"
+    )
+
+    /** `\right` 读到的闭括号字符，由 `parseRun(stopAtRightDelimiter = true)` 填。 */
+    private var rightChar: String? = null
+
+    /** 当前位置是不是 `\name`。 */
+    private fun isCommand(name: String): Boolean = startsWith("\\$name")
+
+    /**
+         * `\left( ... \right)`。
+         *
+         * 之前这里直接返回空串，括号连同里面全部内容一起消失——
+         * `\left(\frac12\right)` 显示成没有括号的分式，与原式不符。
+         *
+         * 现在输出真正的 `m:d`（分隔符组）。注意 `m:d` 的 `begChr`/`endChr`
+         * **必须显式写**：省略 `dPr` 时 ECMA-376 §22.1.2.12 规定默认是 `(` 和 `)`，
+         * 于是 `\left[` 会被渲染成圆括号。
+         */
+        private fun readLeftDelimiter(): String {
+            // 注意这里**不能**再 pos++：`readCommand` 已经把 \left 这四个字母吃掉了，
+            // 再跳一次会连分隔符字符一起跳过，于是 \left( 变成 beginChr="x"。
+            val begin = readDelimiterChar() ?: return ""
+            rightChar = null
+            val body = parseRun(stopAtRightDelimiter = true)
+            val end = rightChar ?: ""
+            rightChar = null
+            return if (begin.isEmpty() && end.isEmpty() && body.isBlank()) {
+                ""
+            } else {
+                "<m:d><m:dPr><m:begChr m:val=\"$begin\"/><m:endChr m:val=\"$end\"/></m:dPr>" +
+                    "<m:e>$body</m:e></m:d>"
             }
-            return ""
+        }
+
+        /**
+         * 读 `\left` / `\right` 后面的分隔符字符，**返回裸字符**（不是 OMML 片段）。
+         *
+         * 返回 `null` 表示没有可读的分隔符；返回空串表示「显式无括号」（`\left.`）。
+         *
+         * 这里必须给裸字符：`m:begChr m:val` 要的是一个字面量，
+         * 塞进 `<m:r><m:t>` 就会让 Word 显示出一串 XML 标签。
+         */
+        private fun readDelimiterChar(): String? {
+            skipSpaces()
+            if (pos >= src.length) return null
+            if (src[pos] == '\\') {
+                pos++ // 反斜杠
+                if (pos >= src.length) return null
+                // `\langle` 这种字母命令
+                if (src[pos].isLetter()) {
+                    val name = StringBuilder()
+                    while (pos < src.length && src[pos].isLetter()) { name.append(src[pos]); pos++ }
+                    return DELIMITER_ALIASES[name.toString()] ?: "?"
+                }
+                // `\{` `\|` 这种转义字面量。
+                // 不能走上面那条：`{` 不是字母，名字会读成空串，
+                // 查表落空后 begChr 会变成 "?"，\left\{ 显示成一个问号。
+                val ch = src[pos]
+                pos++
+                return escapeXml(ch.toString())
+            }
+            return when (val ch = src[pos]) {
+                // `.` 是「无括号」
+                '.' -> { pos++; "" }
+                else -> { pos++; escapeXml(ch.toString()) }
+            }
+        }
+
+        /**
+         * 读**一个原子**作为大算符的操作数，并把它自带的上下标一并吃掉。
+         *
+         * 这是 `\sum_{i=1}^n x_i` 里 `x_i` 的 `i` 不被拆出去的原因：
+         * 若只取 `x`，剩下的 `_i` 会变成外层兄弟节点，渲染成 `(∑ x)_i`。
+         */
+        private fun readOperandAtom(): String {
+            skipSpaces()
+            if (pos >= src.length) return ""
+            val atom = when {
+                src[pos] == '{' || src[pos] == '(' -> {
+                    val close = if (src[pos] == '{') '}' else ')'
+                    pos++
+                    val inner = parseRun(stopAtClosing = close)
+                    if (peek() == close) pos++
+                    inner
+                }
+                src[pos] == '\\' -> readCommand()
+                else -> {
+                    val word = StringBuilder()
+                    while (pos < src.length) {
+                        val c = src[pos]
+                        if (c.isWhitespace() || c == '{' || c == '}' ||
+                            c == '^' || c == '_' || c == '\\'
+                        ) break
+                        word.append(c)
+                        pos++
+                    }
+                    if (word.isEmpty()) { pos++; "" } else run(escapeXml(word.toString()))
+                }
+            }
+            // 原子自己的上下标
+            var result = atom
+            while (pos < src.length && (src[pos] == '^' || src[pos] == '_')) {
+                val isSup = src[pos] == '^'
+                pos++
+                val arg = readScriptArg()
+                result = if (result.isBlank()) "" else script(result, arg, isSup)
+            }
+            return result
         }
 
         private fun readBraceArg(): String {
@@ -332,14 +469,44 @@ object LatexToOmml {
             if (start < 0) return ""
             return text.substring(start)
         }
+
+        /**
+         * 大算符（求和、积分）。
+         *
+         * 早先的版本把参数整个丢了，输出 `<m:sub/><m:sup/><m:e/>` 三个空标签——
+         * `\sum_{i=1}^n x` 里的 `i=1`、`n`、`x` **全部消失**，只剩一个孤零零的 ∑。
+         * 比转换失败更糟：失败会回退到位图，看起来正常；这个会静默给出错误公式。
+         *
+         * 必须住在 [Parser] 里：它要接着往下读下限、上限、操作数。
+         */
+        private fun bigOp(symbol: String): String {
+            skipSpaces()
+            val sub = if (peek() == '_') { pos++; readScriptArg() } else ""
+            skipSpaces()
+            val sup = if (peek() == '^') { pos++; readScriptArg() } else ""
+            val operand = readOperandAtom()
+            if (operand.isBlank()) return ""
+            return "<m:nary><m:naryPr><m:chr m:val=\"$symbol\"/><m:limLoc m:val=\"undOvr\"/></m:naryPr>" +
+                "<m:sub>$sub</m:sub><m:sup>$sup</m:sup><m:e>$operand</m:e></m:nary>"
+        }
     }
 
-    /** 一段普通文本 -> 一个 run。 */
-    private fun run(text: String): String = "<m:r><m:t>$text</m:t></m:r>"
-
-    /** `m:d`（分隔符组）用于让括号随内容撑高。 */
-    private fun group(inner: String): String =
-        if (inner.isBlank()) "" else "<m:d><m:e>$inner</m:e></m:d>"
+    /**
+     * 一段普通文本 -> 一个 run。
+     *
+     * `xml:space="preserve"` **只在首尾有空白时加**：`\quad` / `\qquad` 展开来
+     * 就是纯空格，省了会被 Word 当成可忽略的排版空白吃掉，两者看起来一样长。
+     * 反过来无条件加会让每个 run 都多出 23 个字符的噪声，也没解决问题。
+     */
+    private fun run(text: String): String {
+        val padded = text.firstOrNull()?.isWhitespace() == true ||
+            text.lastOrNull()?.isWhitespace() == true
+        return if (padded) {
+            "<m:r><m:t xml:space=\"preserve\">$text</m:t></m:r>"
+        } else {
+            "<m:r><m:t>$text</m:t></m:r>"
+        }
+    }
 
     /** 上标 `m:sSup` / 下标 `m:sSub`。[arg] 是解析好的上标/下标内容。 */
     private fun script(base: String, arg: String, sup: Boolean): String {
@@ -349,10 +516,7 @@ object LatexToOmml {
         return if (arg.isBlank()) base else "<$kind><m:e>$base</m:e><$tag>$arg</$tag></$kind>"
     }
 
-    /** 大算符（求和、积分）带下标/上标位。 */
-    private fun bigOp(symbol: String): String =
-        "<m:nary><m:naryPr><m:chr m:val=\"$symbol\"/><m:limLoc m:val=\"undOvr\"/></m:naryPr>" +
-            "<m:sub/><m:sup/><m:e/></m:nary>"
+
 
     /** XML 文本转义。OMML 里 `<` `>` `&` 必须是实体，否则 Word 直接报文档损坏。 */
     fun escapeXml(raw: String): String = buildString(raw.length) {

@@ -65,19 +65,26 @@ class DocxExporter(private val mathRenderer: MathRenderer) {
         doc: ExportDoc,
         media: MutableList<MediaEntry>
     ): String = buildString {
-        append(paragraph(escapeXml(card.header), bold = true, sizeHalfPt = 30))
-        append(paragraph(escapeXml(renderTokens(card.stem, media)), sizeHalfPt = 24))
+        append(DocxParagraphs.textParagraph(escapeXml(card.header), bold = true, sizeHalfPt = 30))
+        append(DocxParagraphs.emit(renderTokens(card.stem, media), sizeHalfPt = 24))
 
         // 附图优先，打原图兜底——与 PDF、HTML 两条路保持一致
         if (doc.options.includeImage && card.imagePath.isNotBlank()) {
             File(card.imagePath).takeIf { it.exists() }?.let { file ->
                 val bytes = runCatching { file.readBytes() }.getOrNull()
                 if (bytes != null && bytes.size <= MAX_IMAGE_BYTES) {
-                    val rid = addMedia(media, bytes, detectImageKind(bytes))
-                    append(imageParagraph(rid, bytes, 2_400_000L))
+                    val spec = registerImage(media, bytes, 2_400_000L, detectImageKind(bytes))
                     append(
-                        paragraph(
-                            escapeXml(if (card.imageIsFigure) "题目附图" else "原题照片"),
+                        DocxParagraphs.imageParagraph(
+                            spec.relId,
+                            spec.cxEmu,
+                            spec.cyEmu,
+                            spec.docPrId
+                        )
+                    )
+                    append(
+                        DocxParagraphs.textParagraph(
+                            if (card.imageIsFigure) "题目附图" else "原题照片",
                             sizeHalfPt = 18,
                             colorHex = "808080",
                             align = "center"
@@ -88,17 +95,27 @@ class DocxExporter(private val mathRenderer: MathRenderer) {
         }
 
         card.options.forEach { option ->
-            val text = renderTokens(tokenizeWithMath(option.text), media)
-            append(paragraph("${escapeXml(option.label)}. $text", sizeHalfPt = 22))
+            append(
+                DocxParagraphs.emit(
+                    listOf(DocxParagraphs.Fragment.Text(escapeXml("${option.label}. "))) +
+                        renderTokens(tokenizeWithMath(option.text), media),
+                    sizeHalfPt = 22
+                )
+            )
         }
 
         if (card.hasAnswer) {
-            append(paragraph("答案：${escapeXml(renderTokens(card.answer, media))}", sizeHalfPt = 22))
+            append(
+                DocxParagraphs.emit(
+                    listOf(DocxParagraphs.Fragment.Text(escapeXml("答案："))) + renderTokens(card.answer, media),
+                    sizeHalfPt = 22
+                )
+            )
         }
         if (card.hasAnalysis) {
             append(
-                paragraph(
-                    "解析：${escapeXml(renderTokens(card.analysis, media))}",
+                DocxParagraphs.emit(
+                    listOf(DocxParagraphs.Fragment.Text(escapeXml("解析："))) + renderTokens(card.analysis, media),
                     sizeHalfPt = 22,
                     colorHex = "444444"
                 )
@@ -113,50 +130,55 @@ class DocxExporter(private val mathRenderer: MathRenderer) {
     }
 
     /**
-     * token 序列 -> 段落内容。
+     * token 序列 -> 段落片段。
      *
-     * 公式**不能**塞进 `w:t`——那会让 Word 把它当普通文字，
-     * 显示成一串 `<m:f>` 之类的标签。所以公式单独生成 `m:oMath` 兄弟节点。
+     * 注意这里**不再拼字符串**。早先它返回一个含 `<m:oMath>` / `<w:p>` 的字符串，
+     * 调用方无条件塞进 `<w:t>`，两条路（原生公式、位图回退）一起完蛋。
+     * 返回结构化片段，「这段该进 `w:t` 还是当兄弟节点」由 [DocxParagraphs.emit] 判断。
      */
-    private suspend fun renderTokens(tokens: List<RichToken>, media: MutableList<MediaEntry>): String =
-        buildString {
-            tokens.forEach { token ->
-                when (token) {
-                    is RichToken.TextToken -> append(escapeXml(token.text))
-                    is RichToken.MathToken -> {
-                        append(ommlOrImage(token, media))
-                        append(' ')
-                    }
+    private suspend fun renderTokens(
+        tokens: List<RichToken>,
+        media: MutableList<MediaEntry>
+    ): List<DocxParagraphs.Fragment> = buildList {
+        tokens.forEach { token ->
+            when (token) {
+                is RichToken.TextToken -> add(DocxParagraphs.Fragment.Text(escapeXml(token.text)))
+                is RichToken.MathToken -> {
+                    addAll(mathFragments(token, media))
+                    add(DocxParagraphs.Fragment.Text(" "))
                 }
             }
         }
+    }
 
-    /** 原生 OMML，失败则内嵌位图。 */
-    private suspend fun ommlOrImage(
+    /** 原生 OMML 优先，转不了内嵌位图，再不行显示 LaTeX 源码。 */
+    private suspend fun mathFragments(
         token: RichToken.MathToken,
         media: MutableList<MediaEntry>
-    ): String {
+    ): List<DocxParagraphs.Fragment> {
         val omml = LatexToOmml.convert(token.latex, token.display)
         if (omml != null) {
             val body = "<m:oMath>$omml</m:oMath>"
-            return if (token.display) "<m:oMathPara>$body</m:oMathPara>" else body
+            return listOf(
+                if (token.display) DocxParagraphs.Fragment.DisplayMath(body) else DocxParagraphs.Fragment.Math(body)
+            )
         }
-        // 回退：渲染成位图。alt 留 LaTeX 原文，至少还能搜到。
+        // 回退：渲染成位图
         val rendered: RenderedMath? = runCatching {
             mathRenderer.render(token.latex, token.display)
         }.getOrNull()
         val bitmap = rendered?.bitmap
         if (bitmap != null) {
-            val bytes = bitmapToPng(bitmap) ?: return latexFallback(token.latex)
-            val rid = addMedia(media, bytes, "png")
-            return imageParagraph(rid, bytes, if (token.display) 3_600_000L else 1_800_000L)
+            val bytes = bitmapToPng(bitmap)
+            if (bytes != null) {
+                val maxWidth = if (token.display) 3_600_000L else 1_800_000L
+                val spec = registerImage(media, bytes, maxWidth, "png")
+                return listOf(DocxParagraphs.Fragment.Image(spec.relId, spec.cxEmu, spec.cyEmu, spec.docPrId))
+            }
         }
-        return latexFallback(token.latex)
+        // 连位图都拿不到：显示 LaTeX 源码，比空白强
+        return listOf(DocxParagraphs.Fragment.Text(escapeXml("［${token.latex}］")))
     }
-
-    /** 连位图都拿不到：显示 LaTeX 源码，比空白强。 */
-    private fun latexFallback(latex: String): String =
-        paragraph("［${escapeXml(latex)}］", sizeHalfPt = 20, colorHex = "AA0000")
 
     // ------------------------------------------------------------ 部件
 
@@ -247,34 +269,17 @@ class DocxExporter(private val mathRenderer: MathRenderer) {
     // ------------------------------------------------------------ 段落与图片
 
     /**
-     * @param sizeHalfPt 字号，**半磅**。Word 的 `w:sz` 用半磅，24 = 12pt。
-     */
-    private fun paragraph(
-        text: String,
-        bold: Boolean = false,
-        sizeHalfPt: Int = 24,
-        colorHex: String? = null,
-        align: String? = null
-    ): String {
-        val props = buildString {
-            if (align != null) append("""<w:jc w:val="$align"/>""")
-        }
-        val runProps = buildString {
-            if (bold) append("<w:b/>")
-            append("""<w:sz w:val="$sizeHalfPt"/><w:szCs w:val="$sizeHalfPt"/>""")
-            if (colorHex != null) append("""<w:color w:val="$colorHex"/>""")
-        }
-        return """<w:p><w:pPr>$props<w:rPr>$runProps</w:rPr></w:pPr>""" +
-            """<w:r><w:rPr>$runProps</w:rPr><w:t xml:space="preserve">$text</w:t></w:r></w:p>"""
-    }
-
-    /**
-     * 内嵌图片段落。
+     * 读图片像素尺寸，算出 EMU 宽高后登记进媒体表。
      *
-     * 宽高用 **EMU**（1 px @96dpi = 9525 EMU）。这里只给宽度，
-     * 高度按原图比例算——给错比例会让照片被拉变形。
+     * 只给宽度，高度按原图比例算——给错比例会让照片被拉变形。
+     * 宽高**在导出侧**算好，是为了让 [DocxParagraphs] 保持成纯 Kotlin（可单测）。
      */
-    private fun imageParagraph(relId: String, bytes: ByteArray, maxWidthEmu: Long): String {
+    private fun registerImage(
+        media: MutableList<MediaEntry>,
+        bytes: ByteArray,
+        maxWidthEmu: Long,
+        kind: String
+    ): ImageSpec {
         val (width, height) = runCatching {
             val options = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
             android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
@@ -284,29 +289,29 @@ class DocxExporter(private val mathRenderer: MathRenderer) {
         }.getOrDefault(1L to 1L)
 
         val scale = minOf(1.0, maxWidthEmu.toDouble() / (width * EMU_PER_PX))
-        val cx = (width * EMU_PER_PX * scale).toLong()
-        val cy = (height * EMU_PER_PX * scale).toLong()
+        return ImageSpec(
+            relId = addMedia(media, bytes, kind),
+            cxEmu = (width * EMU_PER_PX * scale).toLong(),
+            cyEmu = (height * EMU_PER_PX * scale).toLong(),
+            docPrId = nextDrawingId()
+        )
+    }
 
-        return """
-<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:drawing>
-  <wp:inline distT="0" distB="0" distL="0" distR="0">
-    <wp:extent cx="$cx" cy="$cy"/>
-    <wp:docPr id="0" name="Picture"/>
-    <a:graphic>
-      <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
-        <pic:pic>
-          <pic:nvPicPr><pic:cNvPr id="0" name="Picture"/><pic:cNvPicPr/></pic:nvPicPr>
-          <pic:blipFill><a:blip r:embed="$relId"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>
-          <pic:spPr>
-            <a:xfrm><a:off x="0" y="0"/><a:ext cx="$cx" cy="$cy"/></a:xfrm>
-            <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
-          </pic:spPr>
-        </pic:pic>
-      </a:graphicData>
-    </a:graphic>
-  </wp:inline>
-</w:drawing></w:r></w:p>
-        """.trimIndent()
+    private data class ImageSpec(val relId: String, val cxEmu: Long, val cyEmu: Long, val docPrId: Int)
+
+    /**
+     * `wp:docPr` / `pic:cNvPr` 的 id 必须**文档内唯一**。
+     *
+     * 原来硬编码成 `"0"`，XSD 只校验 `unsignedInt` 所以过得了 schema 检查，
+     * 但语义上违规——Word 一般容忍，WPS 可能只认第一张。
+     *
+     * 乘 2 是因为每张图要发两个 id（`docPr` 与 `cNvPr`，规范各自独立编号）。
+     */
+    private var drawingId = 0
+
+    private fun nextDrawingId(): Int {
+        drawingId++
+        return drawingId * 2
     }
 
     private fun bitmapToPng(bitmap: Bitmap): ByteArray? = runCatching {

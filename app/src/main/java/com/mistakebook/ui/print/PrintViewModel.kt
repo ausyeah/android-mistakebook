@@ -15,7 +15,7 @@ import com.mistakebook.print.ExportOptions
 import com.mistakebook.print.ExportPublisher
 import com.mistakebook.print.ExportResult
 import com.mistakebook.print.HtmlExporter
-import com.mistakebook.print.PdfExporter
+import com.mistakebook.print.HtmlPdfExporter
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -216,8 +216,12 @@ class PrintViewModel(private val container: AppContainer) : ViewModel() {
             val target = container.exportPublisher.createTempFile(chosen)
             val run = runCatching {
                 when (chosen) {
-                    ExportFormat.PDF -> PdfExporter(container.appContext, container.mathRenderer)
-                        .export(doc, target) { _, _ -> }
+// PDF 走「HTML → WebView 打印」，不再是手写 Canvas 排版。
+                    // 公式用 KaTeX 模式——设备 WebView 版本不保证支持 MathML。
+                    ExportFormat.PDF -> HtmlPdfExporter(
+                        context = container.appContext,
+                        htmlExporter = HtmlExporter(container.mathRenderer)
+                    ).export(doc, target)
 
                     ExportFormat.HTML -> HtmlExporter(container.mathRenderer)
                         .export(doc, target)
