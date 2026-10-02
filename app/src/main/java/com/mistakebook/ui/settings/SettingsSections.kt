@@ -184,7 +184,11 @@ internal fun FirstRunHint(textRes: Int) {
  * 用户经常要对照看（改了配置再测一次，比一比快慢）。
  */
 @Composable
-internal fun TestResultBanner(message: String, ok: Boolean) {
+internal fun TestResultBanner(
+    message: String,
+    ok: Boolean,
+    modifier: Modifier = Modifier.fillMaxWidth()
+) {
     val container = if (ok) {
         MaterialTheme.colorScheme.primaryContainer
     } else {
@@ -198,7 +202,7 @@ internal fun TestResultBanner(message: String, ok: Boolean) {
     Surface(
         shape = MaterialTheme.shapes.small,
         color = container,
-        modifier = Modifier.fillMaxWidth()
+        modifier = modifier
     ) {
         Row(
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
@@ -227,26 +231,53 @@ internal fun TestResultBanner(message: String, ok: Boolean) {
  * 但没给宽度约束，加载态的「测试中…」会把整行布局挤变形。
  */
 @Composable
-internal fun TestButton(text: String, loading: Boolean, onClick: () -> Unit) {
-    Box(modifier = Modifier.height(BUTTON_HEIGHT)) {
-        if (loading) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.Center,
-                modifier = Modifier.fillMaxSize()
-            ) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(16.dp),
-                    strokeWidth = 2.dp
-                )
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    text = stringResource(R.string.settings_testing),
-                    style = MaterialTheme.typography.bodySmall
-                )
+internal fun TestButton(
+    text: String,
+    loading: Boolean,
+    onClick: () -> Unit,
+    /**
+     * 这个按钮自己的测试结果。
+     *
+     * **结果必须跟着按钮走。** 早先两个测试共用一对 `testResult` / `testOk`，
+     * 而横幅统一渲染在大模型那一组的底部——点 MinerU 的按钮，
+     * 结果却显示在几屏之外的另一个分组里，用户根本对不上是哪个按钮的结果。
+     * 而且两个测试还会互相覆盖：后测的那个把先测的结果冲掉。
+     */
+    result: String? = null,
+    resultOk: Boolean = false
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Box(modifier = Modifier.height(BUTTON_HEIGHT)) {
+            if (loading) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center,
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = stringResource(R.string.settings_testing),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            } else {
+                Button(onClick = onClick) { Text(text) }
             }
-        } else {
-            Button(onClick = onClick) { Text(text) }
+        }
+        // 结果在按钮右边，不另起一行——换行会让按钮下方留一大片空白
+        result?.let { message ->
+            TestResultBanner(
+                message = message,
+                ok = resultOk,
+                modifier = Modifier.weight(1f)
+            )
         }
     }
 }
@@ -421,6 +452,16 @@ internal fun ProfileRow(
     onFetchModels: (LlmProfile) -> Unit,
     onTest: (LlmProfile) -> Unit,
     testing: Boolean = false,
+
+    /**
+     * 这个配置自己的测试结果。
+     *
+     * 早先所有结果共用一对字段、统一渲染在大模型分组的**最底部**——
+     * 那个位置和「测试」按钮之间隔着输入框与「可用模型」按钮，
+     * 用户分不清眼前这行字是自己点的哪个测试的结果。
+     */
+    result: String? = null,
+    resultOk: Boolean = false,
     fetchingModels: Boolean = false,
     pickedModel: String? = null,
     onPickedModelConsumed: () -> Unit = {}
@@ -555,6 +596,11 @@ internal fun ProfileRow(
                             Text(stringResource(R.string.settings_test_llm))
                         }
                     }
+                }
+                // 结果紧跟在按钮下方（这一组是竖排布局，按钮已占满宽度）
+                result?.let { message ->
+                    Spacer(Modifier.height(8.dp))
+                    TestResultBanner(message = message, ok = resultOk)
                 }
             }
         }

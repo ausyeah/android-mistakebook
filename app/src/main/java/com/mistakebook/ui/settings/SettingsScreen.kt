@@ -188,6 +188,8 @@ fun SettingsScreen(container: AppContainer, onBack: () -> Unit) {
                         },
                         onTest = viewModel::testLlm,
                         testing = state.testingLlm,
+                        result = state.llmTestResult,
+                        resultOk = state.llmTestOk,
                         fetchingModels = state.loadingModels,
                         pickedModel = state.pickedModel,
                         onPickedModelConsumed = viewModel::consumePickedModel
@@ -200,10 +202,6 @@ fun SettingsScreen(container: AppContainer, onBack: () -> Unit) {
                 ) {
                     Icon(Icons.Default.Add, contentDescription = null)
                     Text(stringResource(R.string.settings_add_profile))
-                }
-                state.testResult?.let { message ->
-                    Spacer(Modifier.height(10.dp))
-                    TestResultBanner(message = message, ok = state.testOk)
                 }
                 if (!state.snapshot.llmConfigured) {
                     Spacer(Modifier.height(8.dp))

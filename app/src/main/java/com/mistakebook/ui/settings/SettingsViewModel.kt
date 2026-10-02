@@ -20,8 +20,19 @@ data class SettingsUiState(
     val snapshot: SettingsSnapshot = SettingsSnapshot(),
     val testingMineru: Boolean = false,
     val testingLlm: Boolean = false,
-    val testResult: String? = null,
-    val testOk: Boolean = false,
+
+    /**
+     * 各自的测试结果，**刻意不合并成一个字段**。
+     *
+     * 早先只有一对 `testResult` / `testOk`，MinerU 和大模型两个测试共用——
+     * 于是点 MinerU 的测试按钮，结果却渲染在大模型那一组的下方
+     * （两组在页面上相距好几屏，用户根本对不上是哪个按钮的结果）。
+     * 而且两个测试还会互相覆盖：先测完大模型再测 MinerU，大模型的结果被冲掉。
+     */
+    val mineruTestResult: String? = null,
+    val mineruTestOk: Boolean = false,
+    val llmTestResult: String? = null,
+    val llmTestOk: Boolean = false,
     val loadingModels: Boolean = false,
     val models: List<String> = emptyList(),
     val modelsError: String? = null,
@@ -33,11 +44,24 @@ data class SettingsUiState(
 
 // 测试连接的瞬时状态
 private data class TestState(
+    val flags: TestFlags,
+    val llmResult: String?,
+    val llmOk: Boolean
+) {
+    val testingMineru: Boolean get() = flags.testingMineru
+    val testingLlm: Boolean get() = flags.testingLlm
+    val loadingModels: Boolean get() = flags.loadingModels
+    val mineruResult: String? get() = flags.mineruResult
+    val mineruOk: Boolean get() = flags.mineruOk
+}
+
+/** 两个「正在测试」标志 + MinerU 的结果 + 拉模型列表的标志。 */
+private data class TestFlags(
     val testingMineru: Boolean = false,
     val testingLlm: Boolean = false,
-    val result: String? = null,
-    val ok: Boolean = false,
-    val loadingModels: Boolean = false
+    val loadingModels: Boolean = false,
+    val mineruResult: String? = null,
+    val mineruOk: Boolean = false
 )
 
 class SettingsViewModel(private val container: AppContainer) : ViewModel() {
@@ -47,8 +71,10 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
     private val testingMineru = MutableStateFlow(false)
     private val testingLlm = MutableStateFlow(false)
     private val loadingModels = MutableStateFlow(false)
-    private val testResult = MutableStateFlow<String?>(null)
-    private val testOk = MutableStateFlow(false)
+    private val mineruTestResult = MutableStateFlow<String?>(null)
+    private val mineruTestOk = MutableStateFlow(false)
+    private val llmTestResult = MutableStateFlow<String?>(null)
+    private val llmTestOk = MutableStateFlow(false)
     private val models = MutableStateFlow<List<String>>(emptyList())
     private val modelsError = MutableStateFlow<String?>(null)
     private val pickedModel = MutableStateFlow<String?>(null)
@@ -56,9 +82,15 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
 
     val uiState: StateFlow<SettingsUiState> = combine(
         store.settings,
-        combine(testingMineru, testingLlm, testResult, testOk, loadingModels) { a, b, c, d, e ->
-            TestState(a, b, c, d, e)
-        },
+        // combine 的类型化重载最多到 5 个参数，而这里有 7 个。
+        // 套一层：两个测试各自合成一个，再合成 TestState。
+        combine(
+            combine(
+                testingMineru, testingLlm, loadingModels,
+                mineruTestResult, mineruTestOk
+            ) { a, b, c, d, e -> TestFlags(a, b, c, d, e) },
+            combine(llmTestResult, llmTestOk) { result, ok -> result to ok }
+        ) { flags, llm -> TestState(flags, llm.first, llm.second) },
         combine(models, modelsError, pickedModel) { list, error, picked ->
             Triple(list, error, picked)
         },
@@ -69,8 +101,10 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
             testingMineru = test.testingMineru,
             testingLlm = test.testingLlm,
             loadingModels = test.loadingModels,
-            testResult = test.result,
-            testOk = test.ok,
+            mineruTestResult = test.mineruResult,
+            mineruTestOk = test.mineruOk,
+            llmTestResult = test.llmResult,
+            llmTestOk = test.llmOk,
             models = modelsPair.first,
             modelsError = modelsPair.second,
             pickedModel = modelsPair.third,
@@ -128,8 +162,8 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
             val key = store.snapshotNow().mineruKey
             val result = container.mineruClient.testConnection(key)
             testingMineru.value = false
-            testOk.value = result is com.mistakebook.net.ApiResult.Success
-            testResult.value = if (result is com.mistakebook.net.ApiResult.Success) {
+            mineruTestOk.value = result is com.mistakebook.net.ApiResult.Success
+            mineruTestResult.value = if (result is com.mistakebook.net.ApiResult.Success) {
                 SUCCESS
             } else {
                 result.errorOrNull()?.serverMessage ?: FAILED
@@ -151,12 +185,12 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
     fun testLlm(draft: LlmProfile) {
         viewModelScope.launch {
             testingLlm.value = true
-            testResult.value = null
+            llmTestResult.value = null
             // 至少要有域名和 Key 才能测；模型名可以为空（测的就是「能不能拿到模型」）
             if (draft.baseUrl.isBlank() || draft.apiKey.isBlank()) {
                 testingLlm.value = false
-                testOk.value = false
-                testResult.value = "请先填写接口地址和 API Key"
+                llmTestOk.value = false
+                llmTestResult.value = "请先填写接口地址和 API Key"
                 return@launch
             }
             val probe = draft.normalized()
@@ -167,8 +201,8 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
             val modelCount = (listResult as? ApiResult.Success)?.data?.size ?: 0
             if (listResult is ApiResult.Failure) {
                 testingLlm.value = false
-                testOk.value = false
-                testResult.value = describeError(listResult.error, "连接失败") + "（${listMs}ms）"
+                llmTestOk.value = false
+                llmTestResult.value = describeError(listResult.error, "连接失败") + "（${listMs}ms）"
                 return@launch
             }
             // 第二步：模型本身能否真正出字。模型名为空时跳过——
@@ -182,7 +216,7 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
             val probeMs = elapsedMs(probeStarted)
             testingLlm.value = false
 
-            testResult.value = when {
+            llmTestResult.value = when {
                 probe.model.isBlank() -> "接口可达 · 响应 ${listMs}ms · 共 $modelCount 个可用模型" +
                     "（填上模型名可再测首字响应）"
 
@@ -192,7 +226,7 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
                 else -> "接口可达（${listMs}ms，已拉到 $modelCount 个模型），但模型 ${probe.model} " +
                     describeError((probeOutcome as ApiResult.Failure).error, "无响应")
             }
-            testOk.value = probeOutcome is ApiResult.Success && probe.model.isNotBlank()
+            llmTestOk.value = probeOutcome is ApiResult.Success && probe.model.isNotBlank()
         }
     }
 
@@ -262,8 +296,12 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
     private fun elapsedMs(startNanos: Long): Long =
         (System.nanoTime() - startNanos) / 1_000_000
 
-    fun clearTestResult() {
-        testResult.value = null
+    fun clearMineruTestResult() {
+        mineruTestResult.value = null
+    }
+
+    fun clearLlmTestResult() {
+        llmTestResult.value = null
     }
 
     fun clearTrash() {
