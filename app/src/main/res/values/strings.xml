@@ -386,4 +386,15 @@
     <string name="export_failed">导出失败：%1$s</string>
     <string name="export_skipped">有 %1$d 道题排版失败已跳过</string>
     <string name="export_page_count">共 %1$d 页</string>
+
+    <!-- ========== 思考过程（v0.0.9） ========== -->
+    <string name="chat_thinking_header">思考过程</string>
+    <string name="chat_thinking_expand">展开思考过程</string>
+    <string name="chat_thinking_collapse">收起思考过程</string>
+    <string name="chat_thinking_ongoing">正在思考…</string>
+    <string name="chat_thinking_chars">%1$d 字</string>
+    <string name="chat_empty_reply">模型未返回内容。可能是拒答，也可能是模型名填错了。</string>
+    <string name="chat_math_failed_title">有公式没渲染出来</string>
+    <string name="chat_math_failed_body">下面这几个公式的 LaTeX 源文有问题，已显示为小字体。可以在编辑页点「检查」一键修复。</string>
+    <string name="chat_math_failed_count">%1$d 处公式未渲染</string>
 </resources>

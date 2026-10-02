@@ -70,7 +70,16 @@ data class Choice(
 @Serializable
 data class ChoiceMessage(
     val role: String = "",
-    val content: String = ""
+    val content: String = "",
+
+    /**
+     * 非流式路径下的思考过程。
+     *
+     * 流式与非流式的字段名**不同**（流式在 `delta` 里，非流式在 `message` 里），
+     * 所以两边都要单独声明。只改一边的结果是——
+     * 模型支持流式时看起来正常，端点不支持需要降级到非流式时思考流失。
+     */
+    @SerialName("reasoning_content") val reasoningContent: String = ""
 )
 
 @Serializable

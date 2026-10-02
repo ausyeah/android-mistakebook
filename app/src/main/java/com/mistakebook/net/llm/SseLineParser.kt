@@ -18,6 +18,9 @@ sealed interface SseEvent {
      */
     data class Chunk(
         val text: String,
+
+        /** 思考过程增量。与 [text] 分开，上层才能分别渲染。 */
+        val thinking: String = "",
         val finishReason: String? = null,
         val promptTokens: Int = 0,
         val completionTokens: Int = 0
@@ -85,6 +88,7 @@ class SseLineParser(private val json: Json = Json { ignoreUnknownKeys = true }) 
         val choice = chunk.choices.firstOrNull()
         return SseEvent.Chunk(
             text = choice?.delta?.content.orEmpty(),
+            thinking = choice?.delta?.reasoningOrNull().orEmpty(),
             finishReason = choice?.finishReason,
             promptTokens = usage?.promptTokens ?: 0,
             completionTokens = usage?.completionTokens ?: 0

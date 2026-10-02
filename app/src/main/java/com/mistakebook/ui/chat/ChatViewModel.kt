@@ -267,6 +267,7 @@ class ChatViewModel(
         )
 
         val buffer = StringBuilder()
+        val thinking = StringBuilder()
         var lastWriteAt = 0L
         var status = MessageStatus.DONE
         var errorText: String? = null
@@ -274,18 +275,39 @@ class ChatViewModel(
         var completionTokens = 0
         var wasTruncated = false
 
-        // 局部挂起函数：把「攒着的增量」写进库里。
+        fun joinThinkingAndAnswer(answer: String, thought: String): String = when {
+            thought.isBlank() -> answer
+            answer.isBlank() -> ChatThinking.tags(thought)
+            else -> ChatThinking.tags(thought) + "\n\n" + answer
+        }
+
+        /**
+         * 把「攒着的增量」写进库。
+         *
+         * 思考过程与正文**用 `<think>` 标记隔开、共用一列**，而不是加两个数据库字段：
+         * - 不需要 DB 迁移（迁移要写 SQL、升版本号，是这个项目最容易翻车的一步）；
+         * - `<think>…</think>` 是 DeepSeek / Qwen 的**通用约定**，
+         *   导出的对话在别家前端里也能被正确识别成思考过程。
+         *
+         * 正文先到、思考后到（或反过来）都能拼对：思考永远放在最前面。
+         */
         suspend fun flush() {
-            if (buffer.isEmpty()) return
-            val snapshot = buffer.toString()
+            if (buffer.isEmpty() && thinking.isEmpty()) return
+            val answer = buffer.toString()
+            val thought = thinking.toString()
             buffer.setLength(0)
+            thinking.setLength(0)
             lastWriteAt = System.currentTimeMillis()
-            repository.appendAssistantContent(assistantId, snapshot)
+            repository.appendAssistantContent(assistantId, joinThinkingAndAnswer(answer, thought))
         }
 
         try {
             stream.complete(profile, request).collect { event ->
                 when (event) {
+                    is ChatStreamEvent.Thinking -> {
+                        if (event.text.isNotEmpty()) thinking.append(event.text)
+                    }
+
                     is ChatStreamEvent.Delta -> {
                         buffer.append(event.text)
                         if (System.currentTimeMillis() - lastWriteAt >= WRITE_THROTTLE_MS) flush()

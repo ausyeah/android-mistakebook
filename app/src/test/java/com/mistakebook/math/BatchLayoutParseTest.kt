@@ -2,200 +2,181 @@ package com.mistakebook.math
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.floatOrNull
-import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.longOrNull
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * 批量渲染返回值的解包与结构校验。
+ * 批量协议解析测试。
  *
- * ## 这里锁的是本轮真机上定位到的那个 bug
- * 真机 logcat 原文：
- * ```
- * W/MathRenderer: 批量布局解析失败, 原始返回(截断):
- *   "{\"w\":2016,\"h\":1180,\"items\":[{\"k\":\"i:X\",\"x\":0,\"y\":42,\"w\":77,\"h\":170,\"fs\":112},...
- * ```
- * 返回值**最外层是引号、内部引号被转义**——这是 `evaluateJavascript`
- * 对字符串返回值多加的那一层 JSON 编码。
- * 旧代码直接拿它去构造 JSONObject，解析字符串字面量必然失败，
- * `parseBatchLayout` 恒返回 null，所有公式退回 LaTeX 源码。
+ * ## 这组测试为什么重写过
  *
- * ## 为什么用 kotlinx.serialization 而不是 org.json
- * 生产代码里 `parseBatchLayout` 用的是 `org.json`，但那是 **Android 的类**，
- * 在 JVM 单元测试里只有打桩实现：要么抛 `RuntimeException`，
- * 要么（开了 returnDefaultValues）静默返回默认值。
- * 两种都会让测试变成测「打桩行为」而不是测真实逻辑。
- * 这里改用 kotlinx.serialization 走同一份数据——
- * 真正出 bug 的是**解包那一层**，它是纯 Kotlin、在单测里完全可测。
+ * 上一版在测试里**自己复制了一份 `unwrap()`**，注释还写着「与 MathRenderer 里的实现保持一致」，
+ * 然后 `parseObject(unwrap(asJavascriptString))` ——**先在测试里解包，再喂给解析逻辑**。
+ *
+ * 结果是这个 bug 一路绿灯通过 CI：
+ * 生产代码是 `BatchProtocol.parse(raw)` 直接吃**没解包**的字符串，恒返回 null，
+ * 界面上所有公式都回退成 LaTeX 源码，从 v0.0.5 起。
+ *
+ * 根因是那句注释：「与实现保持一致」——**测试复制的不是行为，是实现**。
+ * 实现改了它不会响，而它还绿着。
+ *
+ * 现在改成：**测试直接调生产代码，输入就用真机拿到的双层编码形态**。
+ * 少一次调用、漏了就会红。
  */
 class BatchLayoutParseTest {
 
-    /** 与 [MathRenderer] 里的实现保持一致。 */
-    private fun unwrap(raw: String): String {
-        val text = raw.trim()
-        if (text.length >= 2 && text.startsWith("\"") && text.endsWith("\"")) {
-            return runCatching { Json.parseToJsonElement(text).jsonPrimitive.content }
-                .getOrDefault(text)
-        }
-        return text
-    }
-
-    /** 真机日志里 `renderBatch` 返回值的内部 JSON 形态。 */
+    /** 真机日志里 `renderBatch` 返回值的**内部** JSON 形态。 */
     private val innerJson =
         """{"w":2016,"h":3152,"items":[""" +
             """{"k":"i:A, B","x":0,"y":42,"w":272,"h":172,"fs":112},""" +
             """{"k":"i:n","x":0,"y":305,"w":81,"h":172,"fs":112},""" +
-            """{"k":"i:P^{-1}AP = A","x":0,"y":568,"w":437,"h":172,"fs":112}]}"""
-
-    /** evaluateJavascript 回调实际收到的东西：JSON 字符串字面量。 */
-    private val asJavascriptString: String = Json.encodeToString(
-        kotlinx.serialization.json.JsonPrimitive.serializer(),
-        kotlinx.serialization.json.JsonPrimitive(innerJson)
-    )
-
-    private fun parseObject(json: String): JsonObject = Json.parseToJsonElement(json).jsonObject
+            """{"k":"d:\\frac{1}{2}","x":12,"y":520,"w":640,"h":300,"fs":96}""" +
+            """]}"""
 
     /**
-     * 取整数字段。
+     * **生产路径的入口**：`evaluateJavascript` 回调拿到的就是它。
      *
-     * `intOrNull` 返回可空值，直接参与算术会满屏 `!!`。
-     * 这里收口：字段缺失或不是整数时直接失败，并把字段名带进错误信息——
-     * 「静默返回 0」会让这类断言变成恒真。
+     * `math.html` 用 `JSON.stringify(...)` 返回一个 JS 字符串，
+     * `evaluateJavascript` 会再 JSON 编码一层 —— 外面多一对引号。
      */
-    private fun JsonObject.int(key: String): Int =
-        this[key]?.jsonPrimitive?.intOrNull
-            ?: error("字段 $key 缺失或不是整数（拿到的值：${this[key]}）")
+    /** 把内部 JSON 包成“evaluateJavascript 回调收到的字符串字面量”。 */
+    private fun asJavascriptString(inner: String): String =
+        Json.encodeToString(JsonPrimitive.serializer(), JsonPrimitive(inner))
 
-    private fun JsonObject.text(key: String): String =
-        this[key]?.jsonPrimitive?.content
-            ?: error("字段 $key 缺失或不是字符串（拿到的值：${this[key]}）")
+    private val asJavascriptString: String = asJavascriptString(innerJson)
 
-    private fun JsonObject.float(key: String): Float =
-        this[key]?.jsonPrimitive?.floatOrNull
-            ?: error("字段 $key 缺失或不是数字（拿到的值：${this[key]}）")
+    // ------------------------------------------------------------ 双层编码
 
     @Test
-    fun `payload really carries an extra json encoding layer`() {
-        // 前置断言：这份载荷确实「被多包了一层」。
-        // 没有这条，下面的解包测试就可能变成恒真。
-        assertTrue("真机载荷应以引号加转义开头", asJavascriptString.startsWith("\"{\\"))
+    fun `返回值确实多带一层 json 编码`() {
         assertTrue(
-            "载荷内部应含被转义的引号",
-            asJavascriptString.contains("\\\"")
+            "前提就不成立，说明这条测试在验证一个不存在的问题",
+            asJavascriptString.startsWith("\"") && asJavascriptString.endsWith("\"")
         )
     }
 
     @Test
-    fun `unwrapRestoresTheInnerJson`() {
-        assertEquals(innerJson, unwrap(asJavascriptString))
+    fun `parse 直接吃双层编码的字符串也能解出来`() {
+        // **这条是回归测试的核心。**
+        // 以前这里写的是 `parseObject(unwrap(asJavascriptString))`，
+        // 于是「生产代码忘了解包」这件事永远测不出来。
+        val layout = BatchProtocol.parse(asJavascriptString)
+        assertNotNull("双层编码的返回值必须能被解析——不能指望调用方记得解包", layout)
+        assertEquals(2016, layout!!.sheetWidth)
+        assertEquals(3152, layout.sheetHeight)
+        assertEquals(3, layout.entries.size)
     }
 
     @Test
-    fun `unwrapLeavesPlainJsonUntouched`() {
-        // 兼容两种形态：万一某些 WebView 版本不额外编码，也不能被误剥
-        assertEquals(innerJson, unwrap(innerJson))
+    fun `本来就没编码的字符串也能解`() {
+        val layout = BatchProtocol.parse(innerJson)
+        assertNotNull(layout)
+        assertEquals(2016, layout!!.sheetWidth)
     }
 
     @Test
-    fun `unwrapLeavesMalformedInputAsIsSoCallerCanReportIt`() {
-        assertEquals("not json at all", unwrap("not json at all"))
-        assertEquals("", unwrap("   "))
+    fun `解包还原出内部 json`() {
+        assertEquals(innerJson, BatchProtocol.unwrap(asJavascriptString))
     }
 
-    /** 端到端：解包后能解析出全部条目，且字段与真机日志一致。 */
     @Test
-    fun `batchLayoutParsesAllEntriesAfterUnwrap`() {
-        val obj = parseObject(unwrap(asJavascriptString))
-        assertEquals(2016, obj.int("w"))
-        assertEquals(3152, obj.int("h"))
-        val items = obj["items"]!!.jsonArray
-        assertEquals(3, items.size)
-        assertEquals("i:A, B", items[0].jsonObject.text("k"))
-        assertEquals(42, items[0].jsonObject.int("y"))
-        assertEquals(305, items[1].jsonObject.int("y"))
-        assertEquals(568, items[2].jsonObject.int("y"))
-        assertEquals(112, items[0].jsonObject.int("fs"))
+    fun `解包对本来正常的输入是恒等的`() {
+        assertEquals(innerJson, BatchProtocol.unwrap(innerJson))
     }
 
-    /**
-     * 纵坐标必须单调递增，且行间留白够。
-     *
-     * 真机日志里相邻条目的 y 是 42 / 305 / 568，条目高 172，
-     * 步长 263 —— 行间留白 91 设备像素。留白不够的话，
-     * 分式下标、根号的钩会流进下一张切片。
-     */
     @Test
-    fun `entryRowsAreMonotonicAndSeparated`() {
-        val items = parseObject(unwrap(asJavascriptString))["items"]!!.jsonArray
+    fun `解包对畸形输入原样返回好让上层报错`() {
+        assertEquals("not json at all", BatchProtocol.unwrap("not json at all"))
+        assertEquals("", BatchProtocol.unwrap("   "))
+    }
+
+    @Test
+    fun `单条路径与批量路径走同一个解包`() {
+        // 两条路径的载荷结构不同，但**外层编码方式一样**，
+        // 所以解包必须是同一个函数，不能各写一份。
+        val single = """{"w":2016,"h":1180,"fs":112,"err":0}"""
+        val singleAsString = asJavascriptString(single)
+        assertEquals(single, BatchProtocol.unwrap(singleAsString))
+        assertNotNull(BatchProtocol.parse(innerJson))
+    }
+
+    // ------------------------------------------------------------ 布局语义
+
+    @Test
+    fun `全部条目都被解析出来`() {
+        val obj = BatchProtocol.parse(asJavascriptString)!!
+        assertEquals(3, obj.entries.size)
+        assertEquals(listOf("i:A, B", "i:n", "d:\\frac{1}{2}"), obj.entries.map { it.key })
+    }
+
+    @Test
+    fun `条目坐标单调且互不重叠`() {
+        // 批量切片全靠这些坐标算错就产出看不懂的残缺图
+        val entries = BatchProtocol.parse(asJavascriptString)!!.entries
         var previousBottom = -1
-        items.forEachIndexed { i, element ->
-            val o = element.jsonObject
-            val y = o.int("y")
-            assertTrue("第 $i 条的 y=$y 没有大于上一条的底 $previousBottom", y > previousBottom)
-            previousBottom = y + o.int("h")
-        }
-        val first = items[0].jsonObject
-        val second = items[1].jsonObject
-        val gap = second.int("y") - (first.int("y") + first.int("h"))
-        assertTrue("行间留白不足：$gap", gap > 0)
-    }
-
-    /**
-     * 切片必须落在长卷内——越界说明 JS 侧量的宽度和 Android 侧 layout 的宽度不一致。
-     * 越界会让 `slice()` 拿到 null，公式又变成空白。
-     */
-    @Test
-    fun `entriesStayInsideSheetBounds`() {
-        val obj = parseObject(unwrap(asJavascriptString))
-        val sheetW = obj.int("w")
-        val sheetH = obj.int("h")
-        obj["items"]!!.jsonArray.forEachIndexed { i, element ->
-            val o = element.jsonObject
-            assertTrue("第 $i 条 x+w=${o.int("x") + o.int("w")} 超出长卷宽 $sheetW",
-                o.int("x") + o.int("w") <= sheetW)
-            assertTrue("第 $i 条 y+h=${o.int("y") + o.int("h")} 超出长卷高 $sheetH",
-                o.int("y") + o.int("h") <= sheetH)
+        entries.forEach { entry ->
+            assertTrue("y 必须单调不减: ${entry.key}", entry.y >= previousBottom)
+            assertTrue("高度必须为正: ${entry.key}", entry.height > 0)
+            previousBottom = entry.y + entry.height
         }
     }
 
-    /**
-     * fs 是设备像素字号，Android 侧按「目标字号 / fs」等比缩放。
-     *
-     * 注意 dpr **可以是小数**（本机实测 3.5，很常见），
-     * 所以 fs 不必是 BASE_PX 的整数倍——早先写成「必须是整数倍」是条假断言。
-     */
     @Test
-    fun `fontPxMatchesDevicePixelRatio`() {
-        val o = parseObject(unwrap(asJavascriptString))["items"]!!
-            .jsonArray[0].jsonObject
-        val dpr = o.float("fs") / BASE_FONT_PX
-        assertTrue("dpr=$dpr 不在合理区间", dpr >= 1.0f && dpr <= 6.0f)
-        // 钉住真机实测值，防止以后悄悄改了缩放基准
-        assertEquals(3.5f, dpr, 1e-3f)
+    fun `条目都落在长卷范围内`() {
+        val layout = BatchProtocol.parse(asJavascriptString)!!
+        layout.entries.forEach { entry ->
+            assertTrue("${entry.key} 越界右边", entry.x + entry.width <= layout.sheetWidth)
+            assertTrue("${entry.key} 越界下边", entry.y + entry.height <= layout.sheetHeight)
+            assertTrue("${entry.key} 负坐标", entry.x >= 0 && entry.y >= 0)
+        }
     }
 
-    /** 单条路径的载荷是同一种形态，必须同样能解包。 */
     @Test
-    fun `singlePathPayloadUnwrapsTheSameWay`() {
-        val single = """{"w":77,"h":170,"fs":112}"""
-        val encoded = Json.encodeToString(
-            kotlinx.serialization.json.JsonPrimitive.serializer(),
-            kotlinx.serialization.json.JsonPrimitive(single)
-        )
-        val obj = parseObject(unwrap(encoded))
-        assertEquals(77, obj.int("w"))
-        assertEquals(170, obj.int("h"))
-        assertEquals(112f, obj.float("fs"), 1e-3f)
+    fun `字号取设备像素值`() {
+        val layout = BatchProtocol.parse(asJavascriptString)!!
+        assertEquals(112f, layout.entries[0].fontPx)
+        assertEquals(96f, layout.entries[2].fontPx)
     }
 
-    private companion object {
-        /** 与 math.html 里的 `BASE_PX` 保持一致。 */
-        const val BASE_FONT_PX = 32f
+    // ------------------------------------------------------------ 非法输入
+
+    @Test
+    fun `空输入返回 null`() {
+        assertNull(BatchProtocol.parse(""))
+        assertNull(BatchProtocol.parse("   "))
+    }
+
+    @Test
+    fun `宽度或高度非正返回 null`() {
+        // 宁可判失败回退源码，也不要拿一份错的坐标去切片——
+        // 后者会产出「看起来像公式的残缺图」，比显示源码糟得多
+        assertNull(BatchProtocol.parse("""{"w":0,"h":100,"items":[]}"""))
+        assertNull(BatchProtocol.parse("""{"w":100,"h":-1,"items":[]}"""))
+    }
+
+    @Test
+    fun `缺 items 返回 null`() {
+        assertNull(BatchProtocol.parse("""{"w":100,"h":100}"""))
+    }
+
+    @Test
+    fun `畸形条目被跳过而不是让整批失败`() {
+        val bad = """{"w":100,"h":100,"items":[{"k":"i:a","x":0,"y":0,"w":10,"h":10,"fs":20},"garbage",""" +
+            """{"k":"i:b","x":0,"y":20,"w":10,"h":10,"fs":20}]}"""
+        val layout = BatchProtocol.parse(bad)
+        assertNotNull("一条坏数据不该拖垮整批", layout)
+        assertEquals(2, layout!!.entries.size)
+    }
+
+    @Test
+    fun `双层编码的畸形输入也返回 null 而不是崩`() {
+        val badString = asJavascriptString("{不是 json")
+        assertNull(BatchProtocol.parse(badString))
     }
 }

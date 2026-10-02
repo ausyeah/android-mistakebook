@@ -80,6 +80,9 @@ import com.mistakebook.ui.common.ApiKeyRequiredDialog
 import com.mistakebook.ui.common.RichText
 import com.mistakebook.ui.common.containerViewModel
 import kotlinx.coroutines.launch
+import androidx.compose.material.icons.filled.Psychology
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 
 /** 列表末尾的哨兵项。**必须有**——否则消息正好排满时没有可滚余量，结论会被藏在屏幕外。 */
 private const val SENTINEL_INDEX = -1
@@ -460,16 +463,30 @@ private fun MessageBubble(
             modifier = Modifier.widthIn(max = 320.dp)
         ) {
             Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-                RichText(
-                    text = message.content,
-                    mathRenderer = mathRenderer,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = if (isUser) {
-                        MaterialTheme.colorScheme.onPrimaryContainer
-                    } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    }
-                )
+                // 思考过程与正文用 `<think>` 标记存在同一列里，界面拆开渲染。
+                // 正文为空但有思考时也要渲染思考块，否则就是一个空气泡。
+                val (thinking, answer) = remember(message.content) {
+                    ChatThinking.split(message.content)
+                }
+                if (thinking.isNotBlank()) {
+                    ThinkingBlock(
+                        text = thinking,
+                        streaming = message.status == MessageStatus.STREAMING && answer.isBlank()
+                    )
+                    if (answer.isNotBlank()) Spacer(Modifier.height(8.dp))
+                }
+                if (answer.isNotBlank() || thinking.isBlank()) {
+                    RichText(
+                        text = answer,
+                        mathRenderer = mathRenderer,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (isUser) {
+                            MaterialTheme.colorScheme.onPrimaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        }
+                    )
+                }
                 if (message.status == MessageStatus.STREAMING) {
                     Spacer(Modifier.height(6.dp))
                     // 光标：流式时末尾的小圆点
@@ -547,6 +564,77 @@ private fun StatusRow(
                 contentDescription = stringResource(R.string.chat_delete_message),
                 modifier = Modifier.size(14.dp),
                 tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+/**
+ * 思考过程的可折叠段落。
+ *
+ * ## 为什么默认收起
+ *
+ * 思考过程可能很长而信息量不大，展开占的正是答案的位置。
+ * 用户想看的是结论，想查推导时再展开。
+ *
+ * ## 正在思考时保持展开，结束后自动收起
+ *
+ * 模型还在输出时自动收起，页面会不停跳而且看不到「它在想什么」；
+ * 一直展开着，正文一出来就被推到屏幕外。两种做法各错一半，
+ * 所以按状态切换：思考中展开、结束收起，各一次，不反复横跳。
+ */
+@Composable
+private fun ThinkingBlock(text: String, streaming: Boolean) {
+    var expanded by remember { mutableStateOf(streaming) }
+    LaunchedEffect(streaming) { expanded = streaming }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.6f))
+            .clickable { expanded = !expanded }
+            .padding(horizontal = 10.dp, vertical = 8.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                Icons.Default.Psychology,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = stringResource(R.string.chat_thinking_header),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f)
+            )
+            Text(
+                text = if (streaming) {
+                    stringResource(R.string.chat_thinking_ongoing)
+                } else {
+                    stringResource(R.string.chat_thinking_chars, text.length)
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.width(4.dp))
+            Icon(
+                imageVector = if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                contentDescription = stringResource(
+                    if (expanded) R.string.chat_thinking_collapse else R.string.chat_thinking_expand
+                ),
+                modifier = Modifier.size(18.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        if (expanded && text.isNotBlank()) {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = text,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
     }

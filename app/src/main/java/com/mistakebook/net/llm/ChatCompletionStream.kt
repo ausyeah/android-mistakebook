@@ -31,6 +31,15 @@ sealed interface ChatStreamEvent {
     data class Delta(val text: String) : ChatStreamEvent
 
     /**
+     * 增量**思考过程**。与 [Delta] 分开传，上层才能分别渲染。
+     *
+     * 早先的实现**直接丢掉了它**——推理模型把思考放在 `reasoning_content`，
+     * 与 `content` 完全分开。结果是用户看到一个只有蓝点、没有内容的空气泡，
+     * 而模型确实已经思考了。
+     */
+    data class Thinking(val text: String) : ChatStreamEvent
+
+    /**
      * 结束。
      *
      * @param finishReason `stop` 正常；**`length` 表示被 max_tokens 截断**。
@@ -138,6 +147,10 @@ class ChatCompletionStream(
                         }
                     }
 
+                    is RawEvent.Thinking -> {
+                        if (event.text.isNotEmpty()) emit(ChatStreamEvent.Thinking(event.text))
+                    }
+
                     is RawEvent.Ended -> {
                         ended = true
                         emit(ChatStreamEvent.Done(event.promptTokens, event.completionTokens, event.finishReason))
@@ -173,6 +186,7 @@ class ChatCompletionStream(
 
     private sealed interface RawEvent {
         data class Delta(val text: String) : RawEvent
+        data class Thinking(val text: String) : RawEvent
         data class Ended(val promptTokens: Int, val completionTokens: Int, val finishReason: String?) : RawEvent
         data class Failed(val error: ApiError) : RawEvent
     }
@@ -245,6 +259,7 @@ class ChatCompletionStream(
                 null, SseEvent.Ignore -> Unit
 
                 is SseEvent.Chunk -> {
+                    event.thinking.takeIf { it.isNotEmpty() }?.let { emit(RawEvent.Thinking(it)) }
                     event.text.takeIf { it.isNotEmpty() }?.let { emit(RawEvent.Delta(it)) }
                     // finish_reason / usage 只在特定帧出现，取**最后一个非空值**
                     event.finishReason?.let { finishReason = it }
@@ -278,6 +293,9 @@ class ChatCompletionStream(
             emit(RawEvent.Failed(ApiError(ApiErrorKind.BAD_RESPONSE, "模型未返回任何结果")))
             return
         }
+        // 降级到非流式后思考也要输出：否则用户会看到「模型不回答」
+        choice.message?.reasoningContent?.takeIf { it.isNotBlank() }
+            ?.let { emit(RawEvent.Thinking(it)) }
         choice.message?.content?.takeIf { it.isNotEmpty() }?.let { emit(RawEvent.Delta(it)) }
         emit(
             RawEvent.Ended(
@@ -322,6 +340,8 @@ class ChatCompletionStream(
             return@flow
         }
         val choice = parsed.choices.first()
+        choice.message?.reasoningContent?.takeIf { it.isNotBlank() }
+            ?.let { emit(ChatStreamEvent.Thinking(it)) }
         val text = choice.message?.content.orEmpty()
         if (text.isNotEmpty()) emit(ChatStreamEvent.Delta(text))
         emit(

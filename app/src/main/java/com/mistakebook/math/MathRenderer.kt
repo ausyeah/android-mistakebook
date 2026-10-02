@@ -231,7 +231,7 @@ class MathRenderer(context: Context) {
                     val script = "toMathML(${jsonString(trimmed)}, $displayMode)"
                     val raw = awaitJavascript(view, script) ?: return@withLock null
                     // evaluateJavascript 对字符串返回值会再 JSON 编码一层，必须剥掉
-                    val text = unwrapJavascriptJson(raw)
+                    val text = BatchProtocol.unwrap(raw)
                     if (text.isEmpty()) return@withLock null
                     val obj = runCatching { Json.parseToJsonElement(text).jsonObject }.getOrNull()
                         ?: return@withLock null
@@ -430,32 +430,12 @@ class MathRenderer(context: Context) {
     }
 
     /**
-     * 剥掉 `evaluateJavascript` 对**字符串**返回值多加的那一层 JSON 编码。
-     *
-     * `render()` / `renderBatch()` 都用 `JSON.stringify(...)` 返回，
-     * 而 evaluateJavascript 会把这个字符串再 JSON 编码一次，回调收到的是形如
-     * `"{\"w\":2016,...}"` 的**字符串字面量**。不剥这层直接 `JSONObject(raw)` 必然失败。
-     *
-     * 抽出来共用，是因为这个坑踩过一次：单条路径 [parseSize] 一直处理了它，
-     * 后来加的批量路径忘了，于是整个批量结果被判为 null、所有公式退回 LaTeX 源码，
-     * 表现为「公式完全渲染不出来」。两条路径必须走同一个解包函数。
-     */
-    private fun unwrapJavascriptJson(raw: String): String {
-        val text = raw.trim()
-        if (text.length >= 2 && text.startsWith("\"") && text.endsWith("\"")) {
-            return runCatching { Json.parseToJsonElement(text).jsonPrimitive.content }
-                .getOrDefault(text)
-        }
-        return text
-    }
-
-    /**
      * 解析 `render()` 返回的 `{"w":..,"h":..,"fs":..}`（单位已是设备像素）。
      */
     private data class Size(val width: Int, val height: Int, val fontPx: Float, val err: Int = 0)
 
     private fun parseSize(raw: String): Size? {
-        val text = unwrapJavascriptJson(raw)
+        val text = BatchProtocol.unwrap(raw)
         if (text.isEmpty()) return null
         val obj = runCatching { Json.parseToJsonElement(text).jsonObject }.getOrNull() ?: return null
         val w = obj[SingleProtocol.WIDTH]?.jsonPrimitive?.content?.toFloatOrNull()?.toInt() ?: return null

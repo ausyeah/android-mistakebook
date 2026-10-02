@@ -38,6 +38,25 @@ import kotlinx.serialization.json.jsonPrimitive
  */
 internal object BatchProtocol {
 
+    /**
+     * 剥掉 `evaluateJavascript` 对**字符串**返回值多加的那一层 JSON 编码。
+     *
+     * `math.html` 里 `render()` / `renderBatch()` / `toMathML()` 都用 `JSON.stringify(...)`
+     * 返回（一个 JS 字符串），而 `evaluateJavascript` 会把它再 JSON 编码一次，
+     * 回调收到的是形如 `"{\"w\":2016,...}"` 的**字符串字面量**。
+     * 不剥这层直接 `parseToJsonElement` 得到的是 `JsonPrimitive`，取 `.jsonObject` 必失败。
+     *
+     * 已经包成字符串的才剥；本来就是对象的（测试直接喂内部 JSON）原样返回。
+     */
+    fun unwrap(raw: String): String {
+        val text = raw.trim()
+        if (text.length >= 2 && text.startsWith("\"") && text.endsWith("\"")) {
+            return runCatching { json.parseToJsonElement(text).jsonPrimitive.content }
+                .getOrDefault(text)
+        }
+        return text
+    }
+
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
     /**
@@ -107,7 +126,19 @@ internal object BatchProtocol {
      */
     fun parse(raw: String): Layout? {
         if (raw.isBlank()) return null
-        val root = runCatching { json.parseToJsonElement(raw).jsonObject }.getOrNull() ?: return null
+        // **必须在 parse 内部解包**，不能指望调用方记得调 [unwrap]。
+        //
+        // 这个坑踩过两次：
+        // 1. 第一次——单条路径 parseSize 处理了 evaluateJavascript 多加的那层 JSON 编码，
+        //    新加的批量路径忘了，于是所有公式被判为解析失败、退回 LaTeX 源码，
+        //    界面上「公式完全渲染不出来」。
+        // 2. 修法是「抽一个 unwrapJavascriptJson 出来共用」——但那等于把「记得调」
+        //    交给每个调用方。后来把 `parseBatchLayout` 换成 `BatchProtocol.parse` 时，
+        //    解包又漏了，从 v0.0.5 起界面上每一个公式都在走回退路径。
+        //
+        // 抽公共函数 ≠ 共用：**只有「漏不掉」才算真的共用**。所以解包放进 parse 里。
+        val text = unwrap(raw)
+        val root = runCatching { json.parseToJsonElement(text).jsonObject }.getOrNull() ?: return null
         val w = root.intOr(Key.SHEET_WIDTH)
         val h = root.intOr(Key.SHEET_HEIGHT)
         if (w <= 0 || h <= 0) return null
