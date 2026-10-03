@@ -646,7 +646,13 @@ private fun InlineText(
     )
 }
 
-private sealed interface InlineSpan {
+/**
+ * 行内片段。
+ *
+ * 提到文件顶层（原来是 `private`）是为了让 [parseInline] 能被单测引用——
+ * 测试源集看不到 `private`，而**测试里复制一份解析逻辑就等于没有测试**。
+ */
+sealed interface InlineSpan {
     data class Text(
         val text: String,
         val bold: Boolean = false,
@@ -660,7 +666,20 @@ private sealed interface InlineSpan {
 
 private val inlineMath = Regex("\\$\\$([^$]+)\\$\\$|\\$([^$]+)\\$")
 // 排版常量统一放在 com.mistakebook.math.MathLayout，屏幕与 PDF 共用同一套规则。
-private fun parseInline(input: String): List<InlineSpan> {
+/**
+ * 把一段文本解析成行内片段（文本 / 公式 / 图片，带粗斜体行内标记）。
+ *
+ * 提到文件顶层（原来 `private`）是为了可单测。见 [InlineSpan] 的说明。
+ *
+ * ## 性能：为什么不用 `substring` 逐段推进
+ *
+ * 原实现每轮循环做一次 `input.substring(cursor)`，而每轮只推进 1~2 个字符
+ * ——长度 n 的段落要切 n 次、每次切 O(n)，合计 **O(n²) 次字符复制**。
+ * 而流式期间这段代码每 500ms 对**每个段落**重跑一次。
+ *
+ * 现在改成按索引比较与切片，语义不变、分配降到 0。见下面几个局部函数。
+ */
+fun parseInline(input: String): List<InlineSpan> {
     val spans = mutableListOf<InlineSpan>()
     var cursor = 0
     var bold = false
@@ -675,26 +694,73 @@ private fun parseInline(input: String): List<InlineSpan> {
         }
     }
 
+    /**
+     * `input` 从 [cursor] 起的开头是否等于 [token]。
+     *
+     * ## 为什么不直接 `input.substring(cursor).startsWith(token)`
+     *
+     * 原来是每轮循环切一次剩余全文。而循环**每轮只推进 1~2 个字符**
+     * （走 `else` 分支时只推进 1），于是长度 n 的段落要切 n 次、
+     * 每次切出 O(n) 长度的串——**合计 O(n²) 次字符复制**。
+     *
+     * 纯文本段落（没有任何标记）是最坏情况：一段 2000 字的中文正文
+     * 就是 2000 次、共约 200 万次字符复制。而这段代码在流式期间
+     * 每 500ms 对**每个段落**重跑一次。
+     *
+     * 改成按索引比较：语义完全一致，分配降到 0。
+     */
+    fun startsWithAt(token: String): Boolean {
+        if (cursor + token.length > input.length) return false
+        for (i in token.indices) {
+            if (input[cursor + i] != token[i]) return false
+        }
+        return true
+    }
+
+    /** `input` 从 [cursor] 起、到 [end]（不含）为止的子串。 */
+    fun slice(from: Int, end: Int): String = input.substring(cursor + from, cursor + end)
+
+    /** 从 [cursor] 起第一个出现 [ch] 的**相对**下标；找不到返回 -1。 */
+    fun indexOfFrom(ch: Char, startRel: Int): Int =
+        input.indexOf(ch, cursor + startRel) - cursor
+
+    /**
+     * 从 cursor + [startRel] 起找第一个 `$$`，返回其**相对 cursor** 的下标；找不到返回 -1。
+     *
+     * 等价于原实现的 `rest.indexOf("$$", startRel)`，其中 rest 是 `input.substring(cursor)`。
+     */
+    fun indexOfPairFrom(startRel: Int): Int {
+        var i = cursor + startRel
+        val last = input.length - 2
+        while (i <= last) {
+            if (input[i] == '$' && input[i + 1] == '$') return i - cursor
+            i++
+        }
+        return -1
+    }
+
     while (cursor < input.length) {
-        val rest = input.substring(cursor)
         when {
-            rest.startsWith("**") -> {
+            startsWithAt("**") -> {
                 flush()
                 bold = !bold
                 cursor += 2
             }
 
-            rest.startsWith("`") -> {
+            startsWithAt("`") -> {
                 flush()
                 code = !code
                 cursor += 1
             }
 
-            rest.startsWith("$$") -> {
-                val end = rest.indexOf("$$", 2)
+            startsWithAt("$$") -> {
+                // 找**配对的第二个 `$$`**：即从 cursor+2 起的第一个 `$$`。
+                // 原实现是 rest.indexOf("$$", 2) —— rest 就是 input.substring(cursor)，
+                // 所以等价于从 cursor+2 起找长度为 2 的匹配。
+                val end = indexOfPairFrom(2)
                 if (end > 2) {
                     flush()
-                    spans += InlineSpan.Math(rest.substring(2, end).trim())
+                    spans += InlineSpan.Math(slice(2, end).trim())
                     cursor += end + 2
                 } else {
                     buffer.append('$')
@@ -702,11 +768,11 @@ private fun parseInline(input: String): List<InlineSpan> {
                 }
             }
 
-            rest.startsWith("$") -> {
-                val end = rest.indexOf('$', 1)
+            startsWithAt("$") -> {
+                val end = indexOfFrom('$', 1)
                 if (end > 1) {
                     flush()
-                    spans += InlineSpan.Math(rest.substring(1, end).trim())
+                    spans += InlineSpan.Math(slice(1, end).trim())
                     cursor += end + 1
                 } else {
                     buffer.append('$')
@@ -714,19 +780,22 @@ private fun parseInline(input: String): List<InlineSpan> {
                 }
             }
 
-            rest.startsWith("![") -> {
-                val match = Regex("!\\[([^\\]]*)\\]\\(([^)]+)\\)").find(rest)
-                if (match != null) {
+            startsWithAt("![") -> {
+                // 图片语法在 `![` 之后才可能是完整的一整段，
+                // 所以这里才允许切一次——命中的分支会立刻把 cursor 推过整张图，
+                // 不会像 `else` 那样逐字符推进。
+                val match = imageSpan.find(input, cursor)
+                if (match != null && match.range.first == cursor) {
                     flush()
                     spans += InlineSpan.Image(match.groupValues[2].trim(), match.groupValues[1])
-                    cursor += match.value.length
+                    cursor = match.range.last + 1
                 } else {
                     buffer.append(input[cursor])
                     cursor++
                 }
             }
 
-            rest.startsWith("*") && !rest.startsWith("**") -> {
+            startsWithAt("*") -> {
                 flush()
                 italic = !italic
                 cursor += 1
@@ -741,6 +810,14 @@ private fun parseInline(input: String): List<InlineSpan> {
     flush()
     return spans
 }
+
+/**
+ * 图片语法 `![alt](path)`。
+ *
+ * 提成 `val` 是为了不再每次进入该分支都新建一个 [Regex] 对象——
+ * 原实现在循环体内 `Regex("...").find(rest)`，每遇一个 `!` 就重新编译一次正则。
+ */
+private val imageSpan = Regex("!\\[([^\\]]*)\\]\\(([^)]+)\\)")
 
 /**
  * 公式批量渲染的最大尝试次数。
