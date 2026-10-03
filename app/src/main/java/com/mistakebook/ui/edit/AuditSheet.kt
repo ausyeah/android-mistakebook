@@ -36,6 +36,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.res.stringResource
+import com.mistakebook.R
 import com.mistakebook.pipeline.TextAudit
 import com.mistakebook.ui.theme.DeleteReveal
 import com.mistakebook.ui.theme.WarningAmber
@@ -73,15 +75,15 @@ fun AuditSheet(
                 .padding(bottom = 24.dp)
         ) {
             Text(
-                text = if (issues.isEmpty()) "检查结果" else "发现 ${issues.size} 处问题",
+                text = if (issues.isEmpty()) stringResource(R.string.edit_audit_title) else stringResource(R.string.edit_audit_issue_count_format, issues.size),
                 style = MaterialTheme.typography.titleMedium
             )
             Spacer(Modifier.height(4.dp))
             Text(
                 text = if (issues.isEmpty()) {
-                    "公式结构与括号配对都没发现问题。"
+                    stringResource(R.string.edit_audit_empty_description)
                 } else {
-                    "${fixable.size} 处可以一键还原，${issues.size - fixable.size} 处需要手工改。"
+                    stringResource(R.string.edit_audit_summary_format, fixable.size, issues.size - fixable.size)
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -96,7 +98,7 @@ fun AuditSheet(
                         tint = MaterialTheme.colorScheme.primary
                     )
                     Spacer(Modifier.width(8.dp))
-                    Text("没有发现问题", style = MaterialTheme.typography.bodyMedium)
+                    Text(stringResource(R.string.edit_audit_no_issues), style = MaterialTheme.typography.bodyMedium)
                 }
             } else {
                 LazyColumn(
@@ -111,7 +113,7 @@ fun AuditSheet(
                         onClick = { onApply(fixable) },
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("一键还原这 ${fixable.size} 处")
+                        Text(stringResource(R.string.edit_audit_apply_fixes_format, fixable.size))
                     }
                 }
             }
@@ -178,7 +180,7 @@ private fun AuditIssueRow(issue: TextAudit.Issue) {
 private fun DiffView(before: String, after: String) {
     Column {
         Text(
-            text = "当前：" + before,
+            text = stringResource(R.string.edit_audit_current_format, before),
             style = MaterialTheme.typography.bodySmall,
             fontFamily = FontFamily.Monospace,
             color = DeleteReveal
@@ -193,7 +195,7 @@ private fun DiffView(before: String, after: String) {
             )
             Spacer(Modifier.width(6.dp))
             Text(
-                text = "改为：" + after,
+                text = stringResource(R.string.edit_audit_replacement_format, after),
                 style = MaterialTheme.typography.bodySmall,
                 fontFamily = FontFamily.Monospace,
                 color = MaterialTheme.colorScheme.primary

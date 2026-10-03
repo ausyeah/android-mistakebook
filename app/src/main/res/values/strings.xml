@@ -153,6 +153,16 @@
     <string name="edit_delete_draft">删除本题</string>
     <string name="edit_saved_count_format">已保存 %1$d 题</string>
 
+    <!-- 编辑页文本审计 -->
+    <string name="edit_audit_title">检查结果</string>
+    <string name="edit_audit_issue_count_format">发现 %1$d 处问题</string>
+    <string name="edit_audit_empty_description">公式结构与括号配对都没发现问题。</string>
+    <string name="edit_audit_summary_format">%1$d 处可以一键还原，%2$d 处需要手工改。</string>
+    <string name="edit_audit_no_issues">没有发现问题</string>
+    <string name="edit_audit_apply_fixes_format">一键还原这 %1$d 处</string>
+    <string name="edit_audit_current_format">当前：%1$s</string>
+    <string name="edit_audit_replacement_format">改为：%1$s</string>
+
     <!-- 详情页 -->
     <string name="detail_title">题目详情</string>
     <string name="detail_edit">编辑</string>

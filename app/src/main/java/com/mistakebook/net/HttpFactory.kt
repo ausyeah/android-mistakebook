@@ -4,7 +4,7 @@ import com.mistakebook.BuildConfig
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import java.io.IOException
@@ -79,10 +79,10 @@ object HttpFactory {
         val element = runCatching { Json.parseToJsonElement(body) }.getOrNull() ?: return ""
         if (element !is JsonObject) return ""
         listOf("msg", "message", "error_msg", "detail").forEach { key ->
-            val value = element[key]?.jsonPrimitive?.contentOrNull ?: return@forEach
+            val value = (element[key] as? JsonPrimitive)?.contentOrNull ?: return@forEach
             if (value.isNotBlank() && value != "null") return value
         }
         val nested = element["error"] as? JsonObject
-        return nested?.get("message")?.jsonPrimitive?.contentOrNull.orEmpty()
+        return (nested?.get("message") as? JsonPrimitive)?.contentOrNull.orEmpty()
     }
 }

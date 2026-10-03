@@ -9,16 +9,23 @@ import com.mistakebook.di.AppContainer
 import com.mistakebook.domain.MasteryStatus
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import java.time.Duration
 import java.time.LocalDate
+import java.time.ZonedDateTime
 
 data class HomeUiState(
     val questions: List<Question> = emptyList(),
@@ -37,6 +44,30 @@ data class HomeUiState(
     val today: Long get() = LocalDate.now().toEpochDay()
 }
 
+internal fun matchesHomeSearch(question: Question, keyword: String): Boolean {
+    val query = keyword.trim()
+    if (query.isEmpty()) return true
+    return question.stem.contains(query, ignoreCase = true) ||
+        question.title.contains(query, ignoreCase = true) ||
+        question.answer.contains(query, ignoreCase = true) ||
+        question.analysis.contains(query, ignoreCase = true) ||
+        question.optionsJson.contains(query, ignoreCase = true) ||
+        question.note.contains(query, ignoreCase = true)
+}
+
+private fun currentLocalDateFlow() = flow {
+    while (true) {
+        val now = ZonedDateTime.now()
+        emit(now.toLocalDate())
+        delay(millisUntilNextLocalDay(now))
+    }
+}.distinctUntilChanged()
+
+internal fun millisUntilNextLocalDay(now: ZonedDateTime): Long {
+    val nextMidnight = now.toLocalDate().plusDays(1).atStartOfDay(now.zone)
+    return Duration.between(now, nextMidnight).toMillis().coerceAtLeast(1L)
+}
+
 @OptIn(ExperimentalCoroutinesApi::class, FlowPreview::class)
 class HomeViewModel(private val container: AppContainer) : ViewModel() {
 
@@ -47,6 +78,14 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
     private val keywordInput = MutableStateFlow("")
     private val page = MutableStateFlow(0)
     private val dueOnly = MutableStateFlow(false)
+    private val localDateRefreshes = MutableSharedFlow<Unit>(replay = 1, extraBufferCapacity = 1)
+
+    private val today = merge(
+        currentLocalDateFlow(),
+        localDateRefreshes.map { LocalDate.now() }
+    )
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, LocalDate.now())
 
     private data class Query(
         val status: MasteryStatus?,
@@ -70,7 +109,7 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
     }.combine(page) { query, pageIndex -> query.copy(page = pageIndex) }
 
     private fun questionsOf(query: Query) = if (query.dueOnly) {
-        repository.observeDue(LocalDate.now())
+        today.flatMapLatest { repository.observeDue(it) }
     } else {
         repository.observePage(
             filter = QuestionRepository.Filter(
@@ -84,18 +123,19 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     private val questions: StateFlow<List<Question>> = filter
-        .flatMapLatest { query -> questionsOf(query) }
-        .map { list ->
-            if (dueOnly.value) {
-                // 待复习是另一个数据源，学科/错题本/关键词只能在内存里补筛
-                list.filter { question ->
-                    (statusFilter.value == null || question.status == statusFilter.value) &&
-                        (subjectFilter.value == null || question.subjectId == subjectFilter.value) &&
-                        (notebookFilter.value == null || question.notebookId == notebookFilter.value) &&
-                        (keywordInput.value.isBlank() || question.stem.contains(keywordInput.value.trim()))
+        .flatMapLatest { query ->
+            questionsOf(query).map { list ->
+                if (!query.dueOnly) {
+                    list
+                } else {
+                    // 待复习来自独立数据源，组合筛选需在内存中保持与列表搜索一致。
+                    list.filter { question ->
+                        (query.status == null || question.status == query.status) &&
+                            (query.subjectId == null || question.subjectId == query.subjectId) &&
+                            (query.notebookId == null || question.notebookId == query.notebookId) &&
+                            matchesHomeSearch(question, query.keyword)
+                    }
                 }
-            } else {
-                list
             }
         }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
@@ -103,7 +143,7 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
     private val filteredCount: StateFlow<Int> = filter
         .flatMapLatest { query ->
             if (query.dueOnly) {
-                questionsOf(query).map { it.size }
+                questions.map { it.size }
             } else {
                 repository.observeCount(
                     QuestionRepository.Filter(
@@ -117,11 +157,13 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
         }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
 
+    private val dueCount = today.flatMapLatest { repository.observeDueCount(it) }
+
     val uiState: StateFlow<HomeUiState> = combine(
         questions,
         filteredCount,
         repository.observeTotalCount(),
-        repository.observeDueCount(LocalDate.now())
+        dueCount
     ) { list, filtered, total, due ->
         HomeUiState(
             questions = list,
@@ -167,6 +209,10 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
     fun setDueOnly(value: Boolean) {
         dueOnly.value = value
         page.value = 0
+    }
+
+    fun refreshLocalDate() {
+        localDateRefreshes.tryEmit(Unit)
     }
 
     fun loadMore() {

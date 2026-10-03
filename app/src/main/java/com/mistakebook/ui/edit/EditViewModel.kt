@@ -72,6 +72,8 @@ data class EditUiState(
     val notebooks: List<com.mistakebook.data.local.entities.Notebook> = emptyList(),
     val imageRefs: List<String> = emptyList(),
     val savedCount: Int = 0,
+    val savedQuestionIds: Map<Int, Long> = emptyMap(),
+    val dirtyDraftIndices: Set<Int> = emptySet(),
     /**
      * 手动录入模式：没有原图、没有识别文本可对照，保存后也不回填识别任务。
      * UI 据此隐藏「查看原始识别文本」等只对识别流程有意义的入口。
@@ -80,6 +82,29 @@ data class EditUiState(
 ) {
     val current: EditableDraft? get() = drafts.getOrNull(index)
     val canSave: Boolean get() = current?.stem?.isNotBlank() == true
+}
+
+internal fun parseSavedQuestionIds(value: String?, draftCount: Int): Map<Int, Long> {
+    if (draftCount <= 0) return emptyMap()
+    return value.orEmpty()
+        .split(',')
+        .mapIndexedNotNull { index, token ->
+            if (index >= draftCount) return@mapIndexedNotNull null
+            token.trim().toLongOrNull()?.takeIf { id -> id > 0 }?.let { index to it }
+        }
+        .toMap()
+}
+
+internal fun nextUnsavedDraftIndex(
+    draftCount: Int,
+    currentIndex: Int,
+    savedIndices: Set<Int>
+): Int? {
+    if (draftCount <= 0) return null
+    val current = currentIndex.coerceIn(0, draftCount - 1)
+    return (current + 1 until draftCount).firstOrNull { it !in savedIndices }
+        ?: (0 until current).firstOrNull { it !in savedIndices }
+        ?: current.takeIf { it !in savedIndices }
 }
 
 class EditViewModel(
@@ -102,6 +127,8 @@ class EditViewModel(
 
     private val _uiState = MutableStateFlow(EditUiState(loading = true, index = initialIndex))
     val uiState: StateFlow<EditUiState> = _uiState.asStateFlow()
+
+    private var saveInProgress = false
 
     init {
         viewModelScope.launch {
@@ -157,6 +184,7 @@ class EditViewModel(
             } else {
                 drafts.map { it.copy(notebookId = defaultNotebookId) }
             }
+            val savedQuestionIds = parseSavedQuestionIds(task.questionIdsJson, seeded.size)
             _uiState.value = EditUiState(
                 loading = false,
                 total = seeded.size,
@@ -169,7 +197,8 @@ class EditViewModel(
                 subjects = subjects,
                 notebooks = notebooks,
                 imageRefs = figureRefs,
-                savedCount = task.questionIdsJson?.split(",")?.count { it.isNotBlank() } ?: 0
+                savedCount = savedQuestionIds.size,
+                savedQuestionIds = savedQuestionIds
             )
         }
     }
@@ -221,9 +250,17 @@ class EditViewModel(
     fun updateCurrent(transform: (EditableDraft) -> EditableDraft) {
         val state = _uiState.value
         val current = state.current ?: return
+        val updatedDraft = transform(current)
         val updated = state.drafts.toMutableList()
-        updated[state.index] = transform(current)
-        _uiState.value = state.copy(drafts = updated)
+        updated[state.index] = updatedDraft
+        val dirtyIndices = if (
+            updatedDraft != current && state.index in state.savedQuestionIds
+        ) state.dirtyDraftIndices + state.index else state.dirtyDraftIndices
+        _uiState.value = state.copy(
+            drafts = updated,
+            dirtyDraftIndices = dirtyIndices,
+            savedCount = (state.savedQuestionIds.keys - dirtyIndices).size
+        )
     }
 
     fun setStem(value: String) = updateCurrent { it.copy(stem = value) }
@@ -311,63 +348,128 @@ class EditViewModel(
         val updated = state.drafts.map { draft ->
             draft.copy(figurePaths = draft.figurePaths - ref)
         }
+        val dirtyIndices = state.dirtyDraftIndices + state.savedQuestionIds.keys
         _uiState.value = state.copy(
             markdown = cleaned,
             imageRefs = state.imageRefs - ref,
-            drafts = updated
+            drafts = updated,
+            dirtyDraftIndices = dirtyIndices,
+            savedCount = (state.savedQuestionIds.keys - dirtyIndices).size
         )
     }
 
-    /** 保存当前题；全部保存完后回填任务并回调。 */
+    /** 保存当前题；全部草稿索引均已保存后才回填任务并回调。 */
     fun saveCurrent(onSaved: (Long) -> Unit) {
+        if (saveInProgress) return
         val state = _uiState.value
+        val index = state.index
         val draft = state.current ?: return
         if (!draft.isValid()) return
+        saveInProgress = true
         viewModelScope.launch {
-            val task = taskId?.let { container.captureTaskRepository.findById(it) }
-            val refinedJson = task?.refinedJson.orEmpty()
-            val now = System.currentTimeMillis()
-            val replaces = task?.replacesQuestionId
-            val id = if (replaces != null) {
-                overwrite(replaces, draft, state.markdown, now)
-            } else {
-                container.questionRepository.save(draft.toDomainDraft(state.markdown), now)
-            }
-            val current = _uiState.value
-            val remaining = current.drafts.size - (current.savedCount + 1)
-            _uiState.value = current.copy(
-                savedCount = current.savedCount + 1,
-                index = if (remaining > 0) (current.index + 1).coerceAtMost(current.drafts.size - 1) else current.index
-            )
-            if (remaining <= 0) {
-                if (isManualEntry) onSaved(id) else finishTask(listOf(id), refinedJson, onSaved)
+            try {
+                val task = taskId?.let { container.captureTaskRepository.findById(it) }
+                val id = persistDraft(
+                    index = index,
+                    draft = draft,
+                    markdown = state.markdown,
+                    savedQuestionIds = state.savedQuestionIds,
+                    replacesQuestionId = task?.replacesQuestionId,
+                    now = System.currentTimeMillis()
+                )
+                val latest = _uiState.value
+                val savedIds = latest.savedQuestionIds + (index to id)
+                persistQuestionIds(task?.id, savedIds, System.currentTimeMillis())
+                val dirtyIndices = if (latest.drafts.getOrNull(index) == draft) {
+                    latest.dirtyDraftIndices - index
+                } else {
+                    latest.dirtyDraftIndices + index
+                }
+                val completedIndices = savedIds.keys - dirtyIndices
+                val nextIndex = nextUnsavedDraftIndex(latest.drafts.size, index, completedIndices)
+                _uiState.value = latest.copy(
+                    savedQuestionIds = savedIds,
+                    dirtyDraftIndices = dirtyIndices,
+                    savedCount = completedIndices.size,
+                    index = if (latest.index == index) nextIndex ?: index else latest.index
+                )
+                if (nextIndex == null) {
+                    finishTask(savedIds, task?.refinedJson.orEmpty(), onSaved)
+                }
+            } finally {
+                saveInProgress = false
             }
         }
     }
 
     fun saveAll(onSaved: (Long) -> Unit) {
+        if (saveInProgress) return
+        saveInProgress = true
         viewModelScope.launch {
-            val task = taskId?.let { container.captureTaskRepository.findById(it) }
-            val refinedJson = task?.refinedJson.orEmpty()
-            val replaces = task?.replacesQuestionId
-            val state = _uiState.value
-            val now = System.currentTimeMillis()
-            val ids = mutableListOf<Long>()
-            state.drafts.forEach { draft ->
-                if (draft.isValid()) {
-                    // 重新识别：首题覆盖原题，其余照常新建
-                    ids += if (replaces != null && ids.isEmpty()) {
-                        overwrite(replaces, draft, state.markdown, now)
-                    } else {
-                        container.questionRepository.save(draft.toDomainDraft(state.markdown), now)
+            try {
+                val state = _uiState.value
+                val task = taskId?.let { container.captureTaskRepository.findById(it) }
+                val savedIds = state.savedQuestionIds.toMutableMap()
+                val dirtyIndices = state.dirtyDraftIndices.toMutableSet()
+                val now = System.currentTimeMillis()
+                state.drafts.forEachIndexed { index, draft ->
+                    if (draft.isValid()) {
+                        savedIds[index] = persistDraft(
+                            index = index,
+                            draft = draft,
+                            markdown = state.markdown,
+                            savedQuestionIds = savedIds,
+                            replacesQuestionId = task?.replacesQuestionId,
+                            now = now
+                        )
+                        persistQuestionIds(task?.id, savedIds, now)
+                        dirtyIndices.remove(index)
                     }
                 }
-            }
-            if (ids.isNotEmpty()) {
-                _uiState.value = state.copy(savedCount = ids.size)
-                finishTask(ids, refinedJson, onSaved)
+                val latest = _uiState.value
+                val changedDuringSave = latest.drafts.indices.filterTo(mutableSetOf()) { index ->
+                    latest.drafts[index] != state.drafts.getOrNull(index)
+                }
+                val remainingDirty = dirtyIndices + changedDuringSave
+                val completedIndices = savedIds.keys - remainingDirty
+                _uiState.value = latest.copy(
+                    savedQuestionIds = savedIds,
+                    dirtyDraftIndices = remainingDirty,
+                    savedCount = completedIndices.size
+                )
+                if (latest.drafts.isNotEmpty() && completedIndices.size == latest.drafts.size) {
+                    finishTask(savedIds, task?.refinedJson.orEmpty(), onSaved)
+                }
+            } finally {
+                saveInProgress = false
             }
         }
+    }
+
+    private suspend fun persistDraft(
+        index: Int,
+        draft: EditableDraft,
+        markdown: String,
+        savedQuestionIds: Map<Int, Long>,
+        replacesQuestionId: Long?,
+        now: Long
+    ): Long {
+        val existingId = savedQuestionIds[index]
+        return when {
+            existingId != null -> overwrite(existingId, draft, markdown, now)
+            savedQuestionIds.isEmpty() && replacesQuestionId != null ->
+                overwrite(replacesQuestionId, draft, markdown, now)
+            else -> container.questionRepository.save(draft.toDomainDraft(markdown), now)
+        }
+    }
+
+    private suspend fun persistQuestionIds(taskId: Long?, savedIds: Map<Int, Long>, now: Long) {
+        if (taskId == null || savedIds.isEmpty()) return
+        container.captureTaskRepository.attachQuestionIds(
+            id = taskId,
+            questionIds = savedIds,
+            now = now
+        )
     }
 
     /**
@@ -399,10 +501,16 @@ class EditViewModel(
      * 手动录入没有任务可回填（`taskId == null`），直接回调，
      * 否则会对着一个 null id 写数据库。
      */
-    private suspend fun finishTask(ids: List<Long>, originalRefinedJson: String, onSaved: (Long) -> Unit) {
+    private suspend fun finishTask(
+        savedQuestionIds: Map<Int, Long>,
+        originalRefinedJson: String,
+        onSaved: (Long) -> Unit
+    ) {
+        val orderedIds = savedQuestionIds.toSortedMap().values.toList()
+        val firstId = orderedIds.firstOrNull() ?: return
         val id = taskId
         if (id == null) {
-            onSaved(ids.first())
+            onSaved(firstId)
             return
         }
         val state = _uiState.value
@@ -410,11 +518,11 @@ class EditViewModel(
             id = id,
             markdown = state.markdown,
             refinedJson = originalRefinedJson,
-            questionCount = ids.size,
+            questionCount = orderedIds.size,
             now = System.currentTimeMillis()
         )
-        container.captureTaskRepository.attachQuestionIds(id, ids, System.currentTimeMillis())
-        onSaved(ids.first())
+        container.captureTaskRepository.attachQuestionIds(id, savedQuestionIds, System.currentTimeMillis())
+        onSaved(firstId)
     }
 
     private fun EditableDraft.isValid(): Boolean = stem.isNotBlank()

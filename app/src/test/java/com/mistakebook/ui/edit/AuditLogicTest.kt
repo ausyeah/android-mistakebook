@@ -89,12 +89,13 @@ class AuditLogicTest {
     @Test
     fun `rollbackRestoresTheOriginalExactly`() {
         val original = draft(stem = brokenStem, answer = "答案 \$\\left( a ight)\$")
-        val snapshot = original
-        val fixed = applyAuditFixes(original, runAudit(original))
-        assertTrue("确实改了东西", fixed.stem != original.stem || fixed.answer != original.answer)
-        // 撤销：把快照盖回去
-        assertEquals("撤销必须逐字符还原", snapshot.stem, snapshot.stem)
-        assertEquals("撤销必须逐字符还原", snapshot.answer, snapshot.answer)
+        val snapshot = original.copy()
+        var current = original
+        current = applyAuditFixes(current, runAudit(current))
+        assertTrue("确实改了东西", current.stem != original.stem || current.answer != original.answer)
+        // 撤销时将当前草稿整体替换回修复前快照。
+        current = snapshot
+        assertEquals("撤销必须还原整个草稿", original, current)
     }
 
     /**

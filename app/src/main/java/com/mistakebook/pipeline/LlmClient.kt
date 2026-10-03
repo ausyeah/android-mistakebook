@@ -30,7 +30,7 @@ import java.io.File
  * - 可选把原图以 base64 data URL 一并送入（多模态模型），长边压到 [longEdgePx]；
  * - **区分「被 max_tokens 截断」和「返回垃圾」**：前者 JSON 必然残缺，
  *   原先两者都落到 BAD_RESPONSE，导致上层只能笼统报「整理失败」；
- * - 瞬时错误（网络/限流/5xx）额外重试 1 次（2s 退避），鉴权与截断不重试。
+ * - 瞬时错误（网络/5xx）额外重试 1 次（2s 退避）；鉴权、限流、取消与截断不重试。
  */
 class LlmClient(private val api: LlmApi) {
 
@@ -66,33 +66,32 @@ class LlmClient(private val api: LlmApi) {
             LadderStep(jsonMode = false, reminder = false),
             LadderStep(jsonMode = false, reminder = true)
         )
-        var last: ApiResult.Failure? = null
+        var lastFailure: ApiResult.Failure? = null
+        var retryStep: LadderStep? = null
 
-        for (step in ladder) {
+        for ((index, step) in ladder.withIndex()) {
             val system = if (step.reminder) systemPrompt + JSON_ONLY_REMINDER else systemPrompt
             when (val result = sendOnce(profile, system, userPrompt, imagePart, step.jsonMode, maxTokens)) {
                 is ApiResult.Success -> return@withContext result
                 is ApiResult.Failure -> {
-                    // 截断不降级：重试多少次还是超长，直接把「超长」这个事实报上去，
-                    // 让上层分批或提示用户，比降级后再失败一次诚实得多。
                     if (result.error.serverMessage == TRUNCATED_MESSAGE) {
                         return@withContext result
                     }
-                    last = result
-                    // 鉴权/限流重试无意义，直接进下一级
-                    if (result.error.kind == ApiErrorKind.AUTH) break
+                    lastFailure = result
+                    if (shouldTryNextLlmVariant(result.error) && index < ladder.lastIndex) continue
+                    if (!shouldRetryLlmCall(result.error.kind)) return@withContext result
+                    retryStep = step
+                    break
                 }
             }
         }
 
-        // 阶梯走完还没成，对瞬时错误做一次退避重试
-        val failure = last ?: fail(ApiErrorKind.UNKNOWN, "大模型调用失败")
-        if (failure.error.kind == ApiErrorKind.CANCELLED) return@withContext failure
+        val step = retryStep
+            ?: return@withContext lastFailure ?: fail(ApiErrorKind.UNKNOWN, "大模型调用失败")
         delay(RETRY_BACKOFF_MS)
-        when (val retry = sendOnce(profile, systemPrompt + JSON_ONLY_REMINDER, userPrompt, imagePart, false, maxTokens)) {
-            is ApiResult.Success -> retry
-            is ApiResult.Failure -> retry
-        }
+        val retrySystem = if (step.reminder) systemPrompt + JSON_ONLY_REMINDER else systemPrompt
+        sendOnce(profile, retrySystem, userPrompt, imagePart, step.jsonMode, maxTokens)
+
     }
 
     private data class LadderStep(val jsonMode: Boolean, val reminder: Boolean)
@@ -267,4 +266,14 @@ class LlmClient(private val api: LlmApi) {
         const val TRUNCATED_MESSAGE =
             "题目太多，AI 输出超长被截断。请一次少导入几道题，或在编辑页分次整理。"
     }
+}
+
+internal fun shouldTryNextLlmVariant(error: ApiError): Boolean =
+    error.kind == ApiErrorKind.BAD_RESPONSE && error.detail == "HTTP 400"
+
+internal fun shouldRetryLlmCall(kind: ApiErrorKind): Boolean = when (kind) {
+    ApiErrorKind.AUTH,
+    ApiErrorKind.RATE_LIMIT,
+    ApiErrorKind.CANCELLED -> false
+    else -> true
 }

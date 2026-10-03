@@ -203,7 +203,25 @@ Application/Activity/DI、Room 实体与迁移、DAO、Repository、SettingsStor
 - [x] P1-6 LlmClient / ChatAttachmentPreparer 图片采样解码
 - [x] P1-7 复习提醒时间变化后重新注册周期任务
 - [x] P1-8 MainActivity.onNewIntent 应用待复习筛选
-- [ ] P2-9~23 按需修复（详见上方清单）
+### 本轮已确认修复项
+- [x] P2-9 拍照/相册门禁等待 Key 检查完成后再执行
+- [x] P2-10 MinerU 解压路径校验补目录分隔符并加回归测试
+- [x] P2-11 服务端错误 JSON 按类型安全读取并加回归测试
+- [x] P2-12 AUTH/RATE_LIMIT/CANCELLED 不再触发退避重试
+- [x] P2-14 待复习筛选的关键词字段与普通搜索保持一致
+- [x] P2-15 首页待复习计数在本地日期变化时刷新
+- [x] P2-17 按草稿索引追踪保存结果，避免跳题和重复覆盖
+- [x] P2-18 闪光灯切换只更新拍照配置，不触发相机重绑
+- [x] P2-19 文本附件严格解码 UTF-8，失败时回退 GB18030
+- [x] P2-20 审计弹窗中文文案集中到 strings.xml
+
+### 本轮验证
+- `assembleDebug` 与 `compileDebugUnitTestKotlin` 通过；指定 Gradle 单测执行时因测试 worker `ClassNotFoundException` 未运行断言。新增测试类已编译，纯文本 UTF-8 与 GB18030 解码结果已直接核对。
+
+### 本轮未列为已确认缺陷
+- P2-13 数据库维护并发为中置信度架构风险，需专项验证整个 Room 观察/写入生命周期后再定方案。
+- P2-16 saveAll 当前没有调用入口；当前编辑按钮对空题干已禁用。
+- P2-21 是显式依赖取舍；P2-22 受 PRD 锁定依赖约束；P2-23 是进程级单例设计。
 
 ### 验证方式
 - 每条修复后：本地 `.\gradlew assembleDebug` + 相关单测

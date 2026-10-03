@@ -115,6 +115,7 @@ fun CaptureScreen(
     }
 
     var flashMode by remember { mutableIntStateOf(FLASH_AUTO) }
+    var flashAvailable by remember { mutableStateOf<Boolean?>(null) }
     var lensFacing by remember { mutableIntStateOf(CameraSelector.LENS_FACING_BACK) }
     var capturing by remember { mutableStateOf(false) }
 
@@ -130,6 +131,16 @@ fun CaptureScreen(
     var showKeyGate by remember { mutableStateOf(false) }
     var mineruMissing by remember { mutableStateOf(false) }
     var llmMissing by remember { mutableStateOf(false) }
+    suspend fun checkRecognitionKeys(): Boolean {
+        val snapshot = runCatching { container.settingsStore.snapshotNow() }.getOrNull()
+        mineruMissing = snapshot?.mineruConfigured != true
+        llmMissing = snapshot?.llmConfigured != true
+        if (mineruMissing || llmMissing) {
+            showKeyGate = true
+            return false
+        }
+        return true
+    }
     val executor: ExecutorService = remember {
         Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "mistakebook-camera").apply { isDaemon = true }
@@ -152,16 +163,8 @@ fun CaptureScreen(
     ) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
         scope.launch {
-            val snapshot = container.settingsStore.snapshotNow()
-            if (!snapshot.mineruConfigured || !snapshot.llmConfigured) {
-                mineruMissing = !snapshot.mineruConfigured
-                llmMissing = !snapshot.llmConfigured
-                showKeyGate = true
-                return@launch
-            }
-        }
-        importing = true
-        scope.launch {
+            if (!checkRecognitionKeys()) return@launch
+            importing = true
             val files = container.imageImporter.importUris(listOf(uri))
             importing = false
             if (files.isEmpty()) {
@@ -192,6 +195,10 @@ fun CaptureScreen(
                 flashMode = flashMode,
                 lensFacing = lensFacing,
                 onBound = { cameraBound = it },
+                onFlashAvailability = { available ->
+                    flashAvailable = available
+                    if (!available) flashMode = FLASH_OFF
+                },
                 onError = { errorText = it }
             )
             GridOverlay(modifier = Modifier.fillMaxSize())
@@ -210,7 +217,10 @@ fun CaptureScreen(
                 .padding(horizontal = 16.dp, vertical = 28.dp),
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            IconButton(onClick = { flashMode = (flashMode + 1) % 3 }) {
+            IconButton(
+                onClick = { flashMode = (flashMode + 1) % 3 },
+                enabled = flashAvailable != false
+            ) {
                 Icon(
                     imageVector = when (flashMode) {
                         FLASH_ON -> Icons.Default.FlashOn
@@ -297,36 +307,33 @@ fun CaptureScreen(
                 enabled = !capturing && hasCameraPermission && cameraBound,
                 onClick = {
                     errorText = null
+                    capturing = true
                     scope.launch {
-                        val snapshot = container.settingsStore.snapshotNow()
-                        if (!snapshot.mineruConfigured || !snapshot.llmConfigured) {
-                            mineruMissing = !snapshot.mineruConfigured
-                            llmMissing = !snapshot.llmConfigured
-                            showKeyGate = true
+                        if (!checkRecognitionKeys()) {
+                            capturing = false
                             return@launch
                         }
-                    }
-                    capturing = true
-                    // 看门狗：任何未预料的回调丢失都不能让快门永久禁用
-                    scope.launch {
-                        delay(15_000)
-                        if (capturing) {
-                            capturing = false
-                            errorText = context.getString(R.string.capture_failed)
+                        // 看门狗：任何未预料的回调丢失都不能让快门永久禁用
+                        scope.launch {
+                            delay(15_000)
+                            if (capturing) {
+                                capturing = false
+                                errorText = context.getString(R.string.capture_failed)
+                            }
                         }
+                        takePhoto(
+                            context = context,
+                            executor = executor,
+                            imageCapture = imageCapture,
+                            flashMode = flashMode,
+                            enhance = enhancePhotos,
+                            onCaptured = { path -> onCropped(path) },
+                            onError = {
+                                capturing = false
+                                errorText = context.getString(R.string.capture_failed)
+                            }
+                        )
                     }
-                    takePhoto(
-                        context = context,
-                        executor = executor,
-                        imageCapture = imageCapture,
-                        flashMode = flashMode,
-                        enhance = enhancePhotos,
-                        onCaptured = { path -> onCropped(path) },
-                        onError = {
-                            capturing = false
-                            errorText = context.getString(R.string.capture_failed)
-                        }
-                    )
                 }
             )
             IconButton(onClick = onBack) {
@@ -425,6 +432,7 @@ private fun CameraPreview(
     flashMode: Int,
     lensFacing: Int,
     onBound: (Boolean) -> Unit,
+    onFlashAvailability: (Boolean) -> Unit,
     onError: (String) -> Unit
 ) {
     val context = LocalContext.current
@@ -432,8 +440,9 @@ private fun CameraPreview(
     val previewView = remember {
         PreviewView(context).apply { scaleType = PreviewView.ScaleType.FILL_CENTER }
     }
+    val latestFlashMode = androidx.compose.runtime.rememberUpdatedState(flashMode)
 
-    LaunchedEffect(lensFacing, flashMode) {
+    LaunchedEffect(lensFacing) {
         onBound(false)
         Log.i(TAG, "开始绑定相机 lens=$lensFacing flash=$flashMode")
         try {
@@ -447,8 +456,9 @@ private fun CameraPreview(
                         previewView,
                         imageCapture,
                         lensFacing,
-                        flashMode,
+                        latestFlashMode.value,
                         onBound,
+                        onFlashAvailability,
                         onError
                     )
                 } catch (error: Exception) {
@@ -461,6 +471,14 @@ private fun CameraPreview(
             Log.e(TAG, "获取 ProcessCameraProvider 失败", error)
             onBound(false)
             onError("${error::class.java.simpleName}: ${error.message}")
+        }
+    }
+
+    LaunchedEffect(flashMode) {
+        imageCapture.flashMode = when (flashMode) {
+            FLASH_ON -> ImageCapture.FLASH_MODE_ON
+            FLASH_OFF -> ImageCapture.FLASH_MODE_OFF
+            else -> ImageCapture.FLASH_MODE_AUTO
         }
     }
 
@@ -489,6 +507,7 @@ private fun bindCamera(
     lensFacing: Int,
     flashMode: Int,
     onBound: (Boolean) -> Unit,
+    onFlashAvailability: (Boolean) -> Unit,
     onError: (String) -> Unit
 ) {
     try {
@@ -516,6 +535,7 @@ private fun bindCamera(
         if (!hasFlash && imageCapture.flashMode == ImageCapture.FLASH_MODE_ON) {
             imageCapture.flashMode = ImageCapture.FLASH_MODE_OFF
         }
+        onFlashAvailability(hasFlash)
         Log.i(TAG, "相机绑定成功 lens=$lensFacing hasFlash=$hasFlash")
         onBound(true)
     } catch (error: Exception) {

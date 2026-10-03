@@ -63,12 +63,13 @@ class CaptureTaskRepository(private val dao: CaptureTaskDao) {
         )
     }
 
-    /** 保存入库后回填题目 id 列表（一次识别可产出多道题）。 */
-    suspend fun attachQuestionIds(id: Long, questionIds: List<Long>, now: Long) {
+    /** 按草稿索引回填题目 id，保留尚未保存的位置以支持中途恢复。 */
+    suspend fun attachQuestionIds(id: Long, questionIds: Map<Int, Long>, now: Long) {
+        val indexedIds = serializeQuestionIdsByIndex(questionIds) ?: return
         dao.update(
             (dao.findById(id) ?: return).copy(
-                questionId = questionIds.firstOrNull(),
-                questionIdsJson = questionIds.joinToString(","),
+                questionId = questionIds.minByOrNull { it.key }?.value,
+                questionIdsJson = indexedIds,
                 updatedAt = now
             )
         )
@@ -80,4 +81,9 @@ class CaptureTaskRepository(private val dao: CaptureTaskDao) {
         dao.failUnfinished(message, System.currentTimeMillis())
 
     suspend fun clearAll() = dao.clearAll()
+}
+
+internal fun serializeQuestionIdsByIndex(questionIds: Map<Int, Long>): String? {
+    val highestIndex = questionIds.keys.maxOrNull() ?: return null
+    return (0..highestIndex).joinToString(",") { questionIds[it]?.toString().orEmpty() }
 }

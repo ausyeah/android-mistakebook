@@ -27,6 +27,19 @@ data class MineruOutcome(
     val rawDir: File
 )
 
+internal fun isWithinDirectory(directory: File, candidate: File): Boolean {
+    val directoryPath = directory.canonicalFile.path
+    val boundary = if (directoryPath.endsWith(File.separatorChar)) {
+        directoryPath
+    } else {
+        directoryPath + File.separator
+    }
+    return candidate.canonicalFile.path.startsWith(
+        boundary,
+        ignoreCase = File.separatorChar == '\\'
+    )
+}
+
 /**
  * MinerU v4 本地文件上传链路（PRD 4.1）：
  * 申请上传地址 -> PUT 上传 -> 轮询 -> 下载 zip -> 解压 -> 图片与路径整理。
@@ -300,7 +313,7 @@ class MineruClient(
                 if (!entry.isDirectory) {
                     val out = File(targetDir, entry.name)
                     // 防 zip slip
-                    if (out.canonicalPath.startsWith(targetDir.canonicalPath)) {
+                    if (isWithinDirectory(targetDir, out)) {
                         out.parentFile?.mkdirs()
                         out.outputStream().use { zip.copyTo(it) }
                         if (entry.name.substringAfterLast('/') == "full.md") markdown = out

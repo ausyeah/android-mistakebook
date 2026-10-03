@@ -12,6 +12,52 @@ import com.mistakebook.domain.AttachmentKind
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.InputStream
+import java.util.UUID
+import java.nio.ByteBuffer
+import java.nio.charset.Charset
+import java.nio.charset.CodingErrorAction
+
+internal fun decodePlainText(bytes: ByteArray): String {
+    val gb18030 = Charset.forName("GB18030")
+    return decodeStrict(bytes, Charsets.UTF_8)
+        ?: decodeStrict(bytes, gb18030)
+        ?: String(bytes, gb18030)
+}
+
+private fun decodeStrict(bytes: ByteArray, charset: Charset): String? = runCatching {
+    charset.newDecoder()
+        .onMalformedInput(CodingErrorAction.REPORT)
+        .onUnmappableCharacter(CodingErrorAction.REPORT)
+        .decode(ByteBuffer.wrap(bytes))
+        .toString()
+}.getOrNull()
+
+internal fun copyLimited(input: InputStream, target: File, maxBytes: Long): Long {
+    try {
+        require(maxBytes > 0)
+        target.parentFile?.mkdirs()
+        var total = 0L
+        input.use { source ->
+            target.outputStream().buffered().use { output ->
+                val buffer = ByteArray(8192)
+                while (true) {
+                    val read = source.read(buffer)
+                    if (read < 0) break
+                    if (read == 0) continue
+                    total += read
+                    require(total <= maxBytes) { "文件太大：$total" }
+                    output.write(buffer, 0, read)
+                }
+            }
+        }
+        require(total > 0) { "文件为空" }
+        return total
+    } catch (error: Throwable) {
+        runCatching { target.delete() }
+        throw error
+    }
+}
 
 /**
  * 附件处理结果。
@@ -63,11 +109,10 @@ class ChatAttachmentPreparer(
             val extension = extensionFor(kind, fileName)
 
             runCatching {
-                val target = appFiles.chatFile(sessionId, fileName.substringBeforeLast('.'), extension)
+                val target = appFiles.chatFile(sessionId, UUID.randomUUID().toString(), extension)
                 val size = copyTo(uri, target)
-                require(size in 1..MAX_FILE_BYTES) { "文件太大：$size" }
                 when (kind) {
-                    AttachmentKind.IMAGE -> processImage(target, size, longEdgePx)
+                    AttachmentKind.IMAGE -> processImage(target, fileName, size, longEdgePx)
                     AttachmentKind.PDF -> processPdf(target, fileName, size)
                     AttachmentKind.TEXT -> processPlainText(target, fileName, size)
                     AttachmentKind.DOCX -> processDocx(target, fileName, size)
@@ -92,20 +137,16 @@ class ChatAttachmentPreparer(
 
     // ------------------------------------------------------------ 处理
 
-    private fun copyTo(uri: Uri, target: File): Long {
-        val input = context.contentResolver.openInputStream(uri)
-            ?: throw IllegalStateException("无法读取所选文件")
-        input.use { stream ->
-            target.outputStream().use { output -> stream.copyTo(output) }
-        }
-        return target.length()
-    }
+    private fun copyTo(uri: Uri, target: File): Long =
+        context.contentResolver.openInputStream(uri)?.let {
+            copyLimited(it, target, MAX_FILE_BYTES)
+        } ?: throw IllegalStateException("无法读取所选文件")
 
-    private fun processImage(file: File, size: Long, longEdgePx: Int): PreparedAttachment {
+    private fun processImage(file: File, fileName: String, size: Long, longEdgePx: Int): PreparedAttachment {
         val bitmap = ImageNormalizer.decodeBounded(file, longEdgePx)
             ?: return PreparedAttachment(
                 localPath = file.absolutePath,
-                fileName = file.name,
+                fileName = fileName,
                 mimeType = "image/jpeg",
                 kind = AttachmentKind.IMAGE,
                 sizeBytes = size,
@@ -120,7 +161,7 @@ class ChatAttachmentPreparer(
         }
         return PreparedAttachment(
             localPath = file.absolutePath,
-            fileName = file.name,
+            fileName = fileName,
             mimeType = "image/jpeg",
             kind = AttachmentKind.IMAGE,
             sizeBytes = file.length(),
@@ -143,7 +184,7 @@ class ChatAttachmentPreparer(
     }
 
     private fun processPlainText(file: File, fileName: String, size: Long): PreparedAttachment {
-        val text = file.readText(Charsets.UTF_8)
+        val text = decodePlainText(file.readBytes())
         return excerpt(file, fileName, "text/plain", AttachmentKind.TEXT, size, text)
     }
 
