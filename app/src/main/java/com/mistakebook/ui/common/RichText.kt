@@ -114,6 +114,18 @@ fun RichText(
             // 缓存键必须是原 key，否则命中不了单条路径写入的同一份缓存
             Triple(key, target, !run && display)
         }
+
+        // **先只交出缓存里已有的部分，再去渲染缺的。**
+        //
+        // 原来是一口气等 `renderAll` 全部返回才 `value = result`，
+        // 于是「10 条公式里 8 条早就命中了缓存」也要陪剩下 2 条一起等——
+        // 用户看到的是**已经能显示的公式在干等**。
+        //
+        // 命中那部分本��就是纯内存查表（[MathRenderer.cachedOf]），
+        // 不抢互斥锁、不进 WebView，所以这一步不会和别的 RichText 排队。
+        val cached = mathRenderer.cachedOf(requests)
+        if (cached.isNotEmpty()) value = cached
+
         // 重试：KaTeX 页面首次 loadUrl 还没光栅化完、或 WebView 被别的
         // RichText 抢着渲染时，本批可能整体返回 null。这些都是**瞬时**故障，
         // 但 `mathKeys` 不变就不会再跑一遍这个 effect——

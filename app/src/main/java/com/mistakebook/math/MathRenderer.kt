@@ -186,12 +186,12 @@ class MathRenderer(context: Context) {
         view.draw(canvas)
         // 判定必须看 alpha：「颜色数 > 1」是假指标，全透明区域照样能有几十种
         // 透明度抖动出来的颜色，一样等于什么都没画出来。
-        val alpha = alphaStats(bitmap)
-        Log.i(
-            TAG,
-            "capture ${width}x$height 不透明=${alpha.opaque}/${alpha.total} 最大alpha=${alpha.maxAlpha} 包围盒=${alpha.box}"
-        )
-        if (alpha.visible == 0) {
+        // 判「有没有画出来」用采样，不用全像素统计。
+        // 全像素统计每次要几百万次 JNI 调用，而这里只需要一个布尔结论。
+        if (isBlankBySampling(bitmap.width, bitmap.height) { x, y ->
+                bitmap.getPixel(x, y) ushr 24
+            }
+        ) {
             bitmap.recycle()
             return null
         }
@@ -326,7 +326,22 @@ class MathRenderer(context: Context) {
         val box: String
     )
 
-    /** 逐像素统计 alpha：颜色数多不代表有内容，全是透明度抖动一样是空白。 */
+    /**
+     * 逐像素统计 alpha。**只供 [diagnose] 排障用。**
+     *
+     * ## 为什么常规渲染路径不能用它
+     *
+     * 它对整张位图逐点 `getPixel`——每次一个 JNI 调用。长卷最坏
+     * `2048 × 4096` = **838 万次**，而且发生在主线程上。
+     * 而它产出的六个字段里，常规路径只用到 `visible == 0` 一个布尔。
+     *
+     * 也就是**为 1 个 bit 的结论，付了几百万次跨语言调用的钱**。
+     * 常规路径改用 [isBlankBySampling]；这里保留完整统计，
+     * 是因为排障时恰恰需要这些数字（「空白」这个症状对应至少五种故障，
+     * 光看现象无法区分，见 [diagnose] 的注释）。
+     *
+     * 颜色数多不代表有内容，全是透明度抖动一样是空白——所以判据是 alpha。
+     */
     private fun alphaStats(bitmap: Bitmap): AlphaInfo {
         val w = bitmap.width
         val h = bitmap.height
@@ -357,7 +372,7 @@ class MathRenderer(context: Context) {
         return AlphaInfo(total, opaque, visible, maxAlpha, box)
     }
 
-    /** 采样统计：不同颜色数、主色（出现最多的颜色）。 */
+/** 采样统计：不同颜色数、主色（出现最多的颜色）。 */
     private fun colorStats(bitmap: Bitmap): Pair<Int, Int> {
         val w = bitmap.width
         val h = bitmap.height
@@ -504,26 +519,29 @@ class MathRenderer(context: Context) {
      * 只等 2 帧、只 draw 一次，然后按各行偏移切图。
      * 帧等待从 O(N) 降到 O(1)，这是唯一量级上的改进。
      *
+     * ## 分批在缓存过滤**之后**
+     *
+     * 原来先按 `items` 分批、再让每批各自过滤缓存，于是「10 条里 8 条命中」
+     * 也会被摊成 2 批、跑 2 次 WebView 往返。改成先滤后分：
+     * 命中项不进 `pending`，批大小是**真正要画的条数**。
+     *
      * @param items `(key, latex, displayMode)`。key 是调用方的缓存键，
      *   与 latex 分开是必要的：行内 `r:` 前缀的公式在 JS 侧要包 `\begin{aligned}`，
      *   但缓存键必须用**原始** key，否则命中不了单条路径写入的缓存。
      * @return key -> 渲染结果；某个失败不影响其他。
      */
+    /** [cachedOf] 的实例版本，供界面直接调用。 */
+    fun cachedOf(
+        items: List<Triple<String, String, Boolean>>
+    ): Map<String, RenderedMath> = cachedOf(cache::get, items)
+
     suspend fun renderAll(
         items: List<Triple<String, String, Boolean>>
     ): Map<String, RenderedMath?> = withContext(Dispatchers.Main) {
         if (items.isEmpty()) return@withContext emptyMap()
-        // 超量分批：一张长卷的位图开销随公式数线性增长，
-        // 一次画 40 个公式会比画 4 批 10 个更容易触发 GC 抖动。
-        if (items.size > BATCH_LIMIT) {
-            val merged = linkedMapOf<String, RenderedMath?>()
-            items.chunked(BATCH_LIMIT).forEach { batch ->
-                merged.putAll(renderAll(batch))
-            }
-            return@withContext merged
-        }
-        val results = linkedMapOf<String, RenderedMath?>()
+
         // 命中缓存的直接给值，不再进 WebView
+        val results = linkedMapOf<String, RenderedMath?>()
         val pending = mutableListOf<Triple<String, String, Boolean>>()
         items.forEach { (key, latex, display) ->
             val hit = cache.get(key)
@@ -534,6 +552,25 @@ class MathRenderer(context: Context) {
             }
         }
         if (pending.isEmpty()) return@withContext results
+
+        // 超量分批：一张长卷的位图开销随公式数线性增长，
+        // 一次画 40 个公式会比画 4 批 10 个更容易触发 GC 抖动。
+        //
+        // 分批放在**缓存过滤之后**：命中项已从 pending 里剔掉了，
+        // 所以这里的批大小是「真正要画的条数」，不会因为缓存命中而被摊薄。
+        splitPending(pending.map { it.first }, BATCH_LIMIT).forEach { batchKeys ->
+            val subset = pending.filter { it.first in batchKeys }
+            results.putAll(renderPending(subset))
+        }
+        return@withContext results
+    }
+
+    /** 只渲染给定的（已剔除缓存命中的）一批。 */
+    private suspend fun renderPending(
+        pending: List<Triple<String, String, Boolean>>
+    ): Map<String, RenderedMath?> {
+        val results = linkedMapOf<String, RenderedMath?>()
+        if (pending.isEmpty()) return results
 
         mutex.withLock {
             try {
@@ -586,7 +623,7 @@ class MathRenderer(context: Context) {
                 pending.forEach { (key, _) -> results[key] = null }
             }
         }
-        results
+        return results
     }
 
     /** 生成「把 N 个公式竖排进一条长卷」的 JS。 */
@@ -615,7 +652,11 @@ class MathRenderer(context: Context) {
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
         view.draw(canvas)
-        if (alphaStats(bitmap).visible == 0) {
+        // 同样是采样判定，理由见 [capture] 里的注释
+        if (isBlankBySampling(bitmap.width, bitmap.height) { x, y ->
+                bitmap.getPixel(x, y) ushr 24
+            }
+        ) {
             bitmap.recycle()
             Log.w(TAG, "批量长卷为空白 ${width}x$height")
             return null
@@ -708,5 +749,124 @@ class MathRenderer(context: Context) {
 
         /** 批量长卷视口上限。12 个公式 × ~200 设备像素 + 余量，4096 绰绰有余。 */
         private const val BATCH_VIEWPORT_HEIGHT = 4096
+
     }
 }
+
+    /**
+ * 取出「能立刻显示」的那部分渲染结果。
+ *
+ * ## 为什么要单独提供
+ *
+ * 界面上「公式出图」和「公式算完」是两件事，但原来只有后者：
+ * `renderAll` 要等**全部**条目都处理完才返回，调用方才能拿到 map。
+ * 于是「10 条里 8 条早就命中缓存」的场景下，
+ * 用户要陪那 8 条一起等剩下 2 条走完 WebView 往返。
+ *
+ * 这个函数只做**纯内存查表**：不渲染、不进 WebView、**不抢互斥锁**，
+ * 所以调用方可以先 `value = cachedOf(...)` 把命中部分立刻画出来，
+ * 未命中的部分走占位，等 `renderAll` 回来再补。
+ *
+ * ## 只收非空
+ *
+ * `null` 是「这条渲染失败」的结论，属于**要重试**的状态。
+ * 提前把 null 钉给界面，会让本可重试成功的公式永远停在源码。
+ * 所以未命中与失败的条目一律**不出现**在结果里，由调用方按缺省处理。
+ *
+ * @param items 与 [MathRenderer.renderAll] 同一形状；只用 key，另两项忽略
+ * @return key -> 已渲染好的结果，按传入顺序；未命中的 key 不出现
+ */
+fun <T : Any> cachedOf(
+    cache: (String) -> T?,
+    items: List<Triple<String, String, Boolean>>
+): Map<String, T> {
+    val out = linkedMapOf<String, T>()
+    items.forEach { (key, _, _) ->
+        // 缓存里存 null 与「没这个 key」语义不同，但对调用方都是「拿不到可用结果」，
+        // 所以一律跳过：null 是「渲染失败、要重试」的结论，
+        // 提前钉给界面会让本可重试成功的公式永远停在源码。
+        cache(key)?.let { out[key] = it }
+    }
+    return out
+}
+
+/**
+ * 把「还没渲染的」那批 key 切成若干批。
+ *
+ * ## 为什么切批放在缓存过滤之后
+ *
+ * 原来 `renderAll` 是**先切批、再让每批各自过滤缓存**。
+ * 于是「10 条里 8 条命中缓存」也被摊成 `6 + 4` 两批，
+ * 两批都要抢一次互斥锁、进一次 WebView——哪怕后一批里全是命中项，
+ * 也要跑一趟才发现「都不用画」。
+ *
+ * 改成先滤后切：命中项不进 `pending`，批大小就是**真正要画的条数**。
+ *
+ * 抽成纯函数是为了能测（见 `CachedOfTest`）。
+ *
+ * @return 每批非空；空输入返回空列表
+ */
+fun splitPending(keys: List<String>, batchLimit: Int): List<List<String>> {
+    if (keys.isEmpty()) return emptyList()
+    val limit = batchLimit.coerceAtLeast(1)
+    val out = ArrayList<List<String>>()
+    var i = 0
+    while (i < keys.size) {
+        out.add(keys.subList(i, minOf(i + limit, keys.size)))
+        i += limit
+    }
+    return out
+}
+
+/**
+ * 采样判断「这张位图到底画没画出东西」。
+ *
+ * ## 为什么是采样而不是逐点
+ *
+ * 这个判据要回答的只有一个问题：**有没有画出来**。
+ * 而原来的 [alphaStats] 为了回答它，把整张图逐点 `getPixel` 了一遍——
+ * 长卷最坏 838 万次 JNI 调用，在主线程上，为一个布尔结论。
+ *
+ * 采样把这一项从「与面积成正比」降到「与网格数成正比」，
+ * 后者最多 `48 × 48 = 2304` 次。**量级上降三个数量级，且不随公式变大而恶化。**
+ *
+ * ## 为什么不会漏判
+ *
+ * 公式框的尺寸是 JS 侧量出来的真实元素尺寸，内容（字形）占框内相当比例，
+ * 不是一条 1px 的细线。48×48 的网格对这类内容几乎不可能整个落空。
+ *
+ * 但**这确实是拿一点理论精度换性能**，不能当成无损替换：
+ * 若真机出现「公式被判空白而不显示」，正确做法是**把网格调密**，
+ * 而不是把全像素统计放回常规路径——那会把两个数量级的收益吐回去。
+ *
+ * @param alphaAt 取某点的 alpha 值（0..255）。抽成参数是因为
+ *   `Bitmap` 在 JVM 单测里是空壳，没法在测试里造出来，
+ *   而**测试里复制一份实现就等于没有测试**。
+ */
+fun isBlankBySampling(
+    width: Int,
+    height: Int,
+    alphaAt: (x: Int, y: Int) -> Int
+): Boolean {
+    if (width <= 0 || height <= 0) return true
+    val stepX = (width / BLANK_SAMPLE_GRID).coerceAtLeast(1)
+    val stepY = (height / BLANK_SAMPLE_GRID).coerceAtLeast(1)
+    var y = 0
+    while (y < height) {
+        var x = 0
+        while (x < width) {
+            if (alphaAt(x, y) > 0) return false
+            x += stepX
+        }
+        y += stepY
+    }
+    return true
+}
+
+/**
+ * 空白判定的采样网格上限。
+ *
+ * 48 是权衡值：公式字形在框内占比高，再密收益已经很小；
+ * 再疏则开始有漏判风险。**真机出现漏判时先调这里。**
+ */
+const val BLANK_SAMPLE_GRID = 48
