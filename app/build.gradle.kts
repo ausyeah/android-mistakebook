@@ -88,11 +88,11 @@ android {
 // 7 = v0.0.6（划开删除修复 + 对话数据层）  8 = v0.0.7（AI 对话）
 // 9 = v0.0.8（导出格式三选一）
 // 10 = v0.0.9（AI 思考过程可折叠）
-        versionCode = 14
+        versionCode = 15
         // 版本号从 v0.0.1 重新开始。
         // 之前 v0.1.0~v0.1.17 的公开 Release 里带着真实的 API Key（明文躺在 DEX 中），
         // 那批产物与 tag 已全部删除，这个编号视为作废、不再复用。
-        versionName = "0.0.17"
+        versionName = "0.0.18"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
