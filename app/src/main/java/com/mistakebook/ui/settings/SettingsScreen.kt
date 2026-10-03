@@ -164,7 +164,11 @@ fun SettingsScreen(container: AppContainer, onBack: () -> Unit) {
                 TestButton(
                     text = stringResource(R.string.settings_test_mineru),
                     loading = state.testingMineru,
-                    onClick = viewModel::testMineru
+                    onClick = viewModel::testMineru,
+                    // 之前漏了这两行：结果在 ViewModel 里算好了、也进了 state，
+                    // 但没人渲染——点「测试 MinerU」按钮右边永远空空如也。
+                    result = state.mineruTestResult,
+                    resultOk = state.mineruTestOk
                 )
             }
 
@@ -182,14 +186,17 @@ fun SettingsScreen(container: AppContainer, onBack: () -> Unit) {
                         onSelect = { viewModel.selectProfile(profile.id) },
                         onDelete = { viewModel.deleteProfile(profile.id) },
                         onSave = viewModel::saveActiveProfile,
+                        onDraftChanged = { viewModel.clearLlmTestResult(profile.id) },
                         onFetchModels = { draft ->
                             // 拉到列表后直接弹选择框，省掉一次多余点击
                             viewModel.fetchModels(draft) { showModels = true }
                         },
                         onTest = viewModel::testLlm,
-                        testing = state.testingLlm,
-                        result = state.llmTestResult,
-                        resultOk = state.llmTestOk,
+                        // 按配置取：之前传的是全局字段，配了第二个模型之后
+                        // 两边显示同一份结果、两边同时转圈
+                        testing = state.isTestingLlm(profile.id),
+                        result = state.llmOutcome(profile.id)?.message,
+                        resultOk = state.llmOutcome(profile.id)?.ok ?: false,
                         fetchingModels = state.loadingModels,
                         pickedModel = state.pickedModel,
                         onPickedModelConsumed = viewModel::consumePickedModel

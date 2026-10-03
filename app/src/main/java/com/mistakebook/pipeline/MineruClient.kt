@@ -126,8 +126,9 @@ class MineruClient(
         val startedAt = System.currentTimeMillis()
         var runningCount = 0
         var first = true
-        // 最后一次观察到的状态，用于超时时的错误文案
-        var lastSeenState = ""
+        // 状态计时器：记录最后一次变化时刻，判断是否停滞。
+        // 抽成对象是为了可测——见 [MineruStallTracker]。
+        val stallTracker = MineruStallTracker()
         while (System.currentTimeMillis() - startedAt < TOTAL_TIMEOUT_MS) {
             val waitMs = when {
                 first -> {
@@ -159,7 +160,11 @@ class MineruClient(
             val rawItems = body.data?.extract_result.orEmpty()
 
             val item = matchItem(rawItems, fileName)
-            if (item != null) lastSeenState = item.state
+            // 观测必须在**任何**使用 lastSeenState 的地方之前完成。
+            // 这里曾经先写 `lastSeenState = item.state` 再去判定停滞，
+            // 导致「状态变了没变」的比较恒为假、计时器永不重置。
+            // 收进 tracker.observe() 之后这个顺序就由类型保证了。
+            val stalled = stallTracker.observe(item?.state, elapsedSec)
 
             if (item != null) {
                 val percent = item.progressPercent()
@@ -189,6 +194,30 @@ class MineruClient(
                 )
             }
 
+            /**
+             * **停滞检测**。
+             *
+             * 用户报告「返回有内容但是迟迟不进入下一步」，诊断信息显示
+             * `state=pending · 返回1项`——请求正确、文件已被认到、匹配的也是
+             * 我们自己的文件，所以**客户端该做的都做了**，剩下的是服务端队列。
+             *
+             * 但干等到 6 分钟超时对用户毫无价值。所以一旦状态长时间不变，
+             * 就立刻给出判断：这不是「还在处理」，而是「服务端没在推进」。
+             *
+             * 只在 [isStallable] 的「尚未开工」状态上判定——
+             * `running` 状态下长时间没变化是正常的（大 PDF 本来就慢）。
+             */
+            if (stalled) {
+                val heldSec = stallTracker.heldFor(elapsedSec)
+                return fail(
+                    ApiErrorKind.TIMEOUT,
+                    "MinerU 停在「${item?.state}」已 ${heldSec / 60} 分钟没有进展。" +
+                        "服务端已收到文件（诊断：返回${rawItems.size}项、文件名已匹配），" +
+                        "所以不是上传问题——通常是 MinerU 队列拥堵。" +
+                        "建议过一会儿点「重试」；若多次如此，换个时间段或检查 MinerU 控制台的额度"
+                )
+            }
+
             when (item?.state) {
                 null -> runningCount++
                 "done" -> {
@@ -208,7 +237,7 @@ class MineruClient(
         // 停在 `pending` 通常是服务端队列长（重试只会更糟），
         // 停在 `running` 更可能是文件太大或内容复杂。
         val waitedSec = (System.currentTimeMillis() - startedAt) / 1000
-        val lastState = lastSeenState.ifBlank { "未知" }
+        val lastState = stallTracker.lastSeenState.ifBlank { "未知" }
         val advice = when (lastState) {
             "pending" -> "服务端队列较长，重试会排到更后面。建议稍后再试，或减少同时提交的任务数。"
             "waiting-file" -> "服务端始终没收到文件，请检查上传时的网络。"
@@ -339,24 +368,6 @@ class MineruClient(
 
     companion object {
         const val PING_TASK_NOT_FOUND = -60012
-        /**
- * 轮询总预算。
- *
- * **不是 300 秒。** 循环条件只在每轮开头检查一次，而单次 HTTP 调用受
- * `HttpFactory.CALL_TIMEOUT_SECONDS = 300` 约束，最坏退避 10s。
- * 于是最坏路径 ≈ 300（预算耗尽）+ 300（单次 call 卡满）+ 10 ≈ **10 分钟**才吐超时。
- * 用户看到的就是「一直在加载」，远超预期。
- */
-const val TOTAL_TIMEOUT_MS = 360_000L
-
-/**
- * `waiting-file` 状态宽限秒数。
- *
- * 超过这个时间还停在这个状态，说明我们上传的文件服务端一直没收到——
- * 那是**我们这边**的问题（上传没落到位），不是队列问题，
- * 继续轮询只是白等，不如立刻报错说清该查什么。
- */
-const val WAITING_FILE_GRACE_SEC = 90L
         const val FIRST_DELAY_MS = 2_000L
         const val POLL_INTERVAL_MS = 3_000L
         val BACKOFF = longArrayOf(3_000L, 5_000L, 8_000L, 10_000L)
@@ -418,6 +429,109 @@ fun matchItem(items: List<ExtractResultItem>, fileName: String): ExtractResultIt
     // 只有一项时它必然是本次的（批量接口对单文件也返回单项）
     if (items.size == 1) return items[0]
     return null
+}
+        /**
+ * 轮询总预算。
+ *
+ * **不是 300 秒。** 循环条件只在每轮开头检查一次，而单次 HTTP 调用受
+ * `HttpFactory.CALL_TIMEOUT_SECONDS = 300` 约束，最坏退避 10s。
+ * 于是最坏路径 ≈ 300（预算耗尽）+ 300（单次 call 卡满）+ 10 ≈ **10 分钟**才吐超时。
+ * 用户看到的就是「一直在加载」，远超预期。
+ */
+const val TOTAL_TIMEOUT_MS = 360_000L
+/**
+ * `waiting-file` 状态宽限秒数。
+ *
+ * 超过这个时间还停在这个状态，说明我们上传的文件服务端一直没收到——
+ * 那是**我们这边**的问题（上传没落到位），不是队列问题，
+ * 继续轮询只是白等，不如立刻报错说清该查什么。
+ */
+const val WAITING_FILE_GRACE_SEC = 90L
+/**
+ * 停滞判定秒数。
+ *
+ * 只对 [STALLABLE_STATES] 里的状态生效。取 150 秒（2.5 分钟）：
+ * 正常情况下 `pending` 不会超过这个时长，而干等到 6 分钟总超时
+ * 对用户毫无价值——他要的是「现在到底行不行」。
+ */
+const val STALL_SEC = 150L
+
+
+/**
+ * 属于「尚未开工」的状态——长时间不变 = 服务端没在推进，可以提前下结论。
+ *
+ * `running` / `converting` **不在其中**：大 PDF 解析几分钟是正常的，
+ * 早判停滞会把本来能成功的任务误杀。
+ *
+ * 用函数而不是顶层 `val`：测试源集无法直接引用顶层 `val`
+ * （只有 `const val` 能跨源集可见），这点已经踩过一次。
+ */
+fun isStallable(state: String): Boolean =
+    state == "pending" || state == "waiting-file" || state.isBlank()
+
+/**
+ * 服务端状态计时器：判断 MinerU 是否**停滞**。
+ *
+ * ## 为什么要做成对象
+ *
+ * 这个类的第一版是散在 `pollResults` 里的两个裸变量：
+ *
+ * ```kotlin
+ * val item = matchItem(rawItems, fileName)
+ * if (item != null) lastSeenState = item.state      // ← 这里先把状态记下了
+ * // ……诊断输出……
+ * if (item != null) {
+ *     if (item.state != lastSeenState) {             // ← 恒为假
+ *         stateChangedAt = elapsedSec                // ← 一次都执行不到
+ *     }
+ * }
+ * ```
+ *
+ * 因为上一行刚把 `lastSeenState` 赋成了当前状态，
+ * 这里的「变了没变」永远是 `false`，**`stateChangedAt` 恒为 0**，
+ * 计时器从头到尾没有重置过。
+ *
+ * 后果不是「停滞检测不生效」，而是**它在错误的时刻生效**：
+ * `pending` 撑 100 秒 → 变成 `waiting-file` → 再过 30 秒，
+ * 就会报「停在 waiting-file 已 2 分钟没有进展」——实际只等了 30 秒。
+ *
+ * 而且这个 bug **注释里写对了、代码写错了**：注释明说「最后一次观察到的
+ * 状态，以及它开始不变的时刻」，实际那一刻从来不会被记录。
+ *
+ * 收进对象之后，「先记再判」的顺序由类型保证，
+ * 且整个计时规则可以脱开网络直接测。
+ *
+ * @param stallSec 停滞阈值秒数，默认 [STALL_SEC]
+ */
+class MineruStallTracker(private val stallSec: Long = STALL_SEC) {
+
+    /** 最后一次匹配上文件时观察到的服务端状态。 */
+    var lastSeenState: String = ""
+        private set
+
+    /** 该状态开始保持不变的绝对时刻（秒）。 */
+    private var changedAtSec: Long = 0L
+
+    /**
+     * 记录一次观测，返回该状态此刻是否已停滞。
+     *
+     * @param state 服务端 state；`null` 表示还没匹配上文件，不参与判定
+     * @param elapsedSec 自提交起经过的秒数
+     */
+    fun observe(state: String?, elapsedSec: Long): Boolean {
+        // 没匹配上文件时不记录：此时「服务端是什么状态」根本无从谈起，
+        // 一旦把 null 记进去，之后匹配上了会误判成「状态刚变」。
+        if (state == null) return false
+        if (state != lastSeenState) {
+            lastSeenState = state
+            changedAtSec = elapsedSec
+        }
+        return isStallable(state) && elapsedSec - changedAtSec > stallSec
+    }
+
+    /** 当前状态已经持续了多少秒。 */
+    fun heldFor(elapsedSec: Long): Long =
+        if (lastSeenState.isEmpty()) 0L else elapsedSec - changedAtSec
 }
 
 class MineruException(message: String) : Exception(message)

@@ -76,6 +76,27 @@ class RecognitionEngine(
         val now = System.currentTimeMillis()
         taskRepository.setStatus(taskId, TaskStatus.UPLOADING, now)
         try {
+            // **已经有识别结果就直接跳到 AI 整理**，不再重跑 MinerU。
+            //
+            // MinerU 的队列拥堵时（用户报告「返回有内容但迟迟不进入下一步」，
+            // 诊断显示 state=pending · 文件名已匹配 —— 服务端确实在排队），
+            // 点「重试」会重新提交一次，既再烧一份额度，又再等一轮。
+            //
+            // markdown 非空说明上一次已经拿到结果（可能是在 LLM 那步失败的），
+            // 这时重跑识别纯属浪费。
+            if (!task.markdown.isNullOrBlank()) {
+                taskRepository.setStage(taskId, "已有识别结果，跳过重新识别…", now)
+                val cached = task.markdown
+                val bundle0 = refineWithLlm(taskId, task, cached, settingsStore.snapshotNow())
+                taskRepository.finish(
+                    id = taskId,
+                    markdown = cached,
+                    refinedJson = DraftBundleCodec.encode(bundle0),
+                    questionCount = bundle0.questions.size,
+                    now = System.currentTimeMillis()
+                )
+                return
+            }
             val settings = settingsStore.snapshotNow()
 
             val markdown = obtainMarkdown(taskId, task, file, settings)

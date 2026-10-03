@@ -248,37 +248,15 @@ class ChatCompletionStream(
         }
 
         val parser = SseLineParser(json)
-        val source = body.source()
-        var finishReason: String? = null
-        var promptTokens = 0
-        var completionTokens = 0
-
-        while (true) {
-            val line = source.readUtf8Line() ?: break
-            when (val event = parser.accept(line)) {
-                null, SseEvent.Ignore -> Unit
-
-                is SseEvent.Chunk -> {
-                    event.thinking.takeIf { it.isNotEmpty() }?.let { emit(RawEvent.Thinking(it)) }
-                    event.text.takeIf { it.isNotEmpty() }?.let { emit(RawEvent.Delta(it)) }
-                    // finish_reason / usage 只在特定帧出现，取**最后一个非空值**
-                    event.finishReason?.let { finishReason = it }
-                    if (event.promptTokens > 0) promptTokens = event.promptTokens
-                    if (event.completionTokens > 0) completionTokens = event.completionTokens
-                }
-
-                SseEvent.Done -> {
-                    emit(RawEvent.Ended(promptTokens, completionTokens, finishReason))
-                    return
-                }
-
-                // 坏帧不中断：可能只是某一行被代理改坏了。累计数量交给上层判断。
-                is SseEvent.Malformed -> Unit
-            }
-        }
-
-        // 读到 EOF 但没收到 [DONE]：不少中转站不发这个哨兵，按正常结束处理。
-        emit(RawEvent.Ended(promptTokens, completionTokens, finishReason))
+        val result = drainSse(
+            readLine = { body.source().readUtf8Line() },
+            parser = parser,
+            onThinking = { emit(RawEvent.Thinking(it)) },
+            onDelta = { emit(RawEvent.Delta(it)) }
+        )
+        // 无论是怎么结束的（[DONE] / EOF / finish_reason），都发一次 Ended。
+        // 上层靠它把消息状态从「生成中」翻成完成。
+        emit(RawEvent.Ended(result.promptTokens, result.completionTokens, result.finishReason))
     }
 
     /** 服务端忽略 stream、直接给 JSON 时走这里。 */
@@ -395,5 +373,117 @@ class ChatCompletionStream(
         const val MAX_TOKENS = 8192
 
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+    }
+}
+
+/**
+ * 这一帧是否意味着**生成已经结束**。
+ *
+ * ## 为什么需要它
+ *
+ * 用户报告：「输出结束了还是终止图标」——内容、表格全都渲染完了，
+ * 右下角却还是「停止」方块，点一下才恢复。
+ *
+ * 界面上那个图标由 `ChatUiState.isStreaming` 决定，而它只在
+ * `collectStream` 的 `finally` 里被置回 `false`。也就是说：
+ * **`collect` 不返回，`finally` 就永远不跑，图标就永远是停止。**
+ *
+ * 原来的收尾只有两条路：`data: [DONE]` 哨兵，或者读到 EOF。
+ * 而实测下来有些服务端**两条都不给**——发完最后一个 delta
+ * （`finish_reason` 已经带上了）就把 HTTP 连接挂着既不发 `[DONE]` 也不关。
+ * 于是 `source.readUtf8Line()` 永久阻塞在等下一行，界面就这么卡住了。
+ *
+ * 按 OpenAI 规范，`finish_reason` 非空就表示这一轮生成结束，
+ * 后面**只可能**再跟一个 usage 帧（`stream_options.include_usage`）。
+ * 早先为了留那一帧而继续读，代价就是「可能永远读不到」——
+ * 而丢掉的 token 用量只写进数据库、**界面上根本不显示**。
+ * 拿一个用户看得见的死等，去换一个他看不见的数字，不划算。
+ *
+ * @param finishReason 该帧携带的 `finish_reason`
+ */
+fun isTerminalFinish(finishReason: String?): Boolean = when (finishReason) {
+    null -> false
+    // 服务端偶尔发空串占位，等于没有
+    "", "null" -> false
+    else -> true
+}
+
+/** 一条 SSE 流读完之后的累计结果。 */
+data class SseStreamResult(
+    val promptTokens: Int = 0,
+    val completionTokens: Int = 0,
+    val finishReason: String? = null,
+
+    /** 因什么而结束的：`done` 哨兵 / `eof` 连接关闭 / `finish_reason` 已到齐。 */
+    val endedBy: String = ""
+)
+
+/**
+ * 把 SSE 流读到结束。
+ *
+ * ## 三条收尾路径
+ *
+ * | 触发 | 场景 |
+ * |---|---|
+ * | `done` | 服务端发了 `data: [DONE]` |
+ * | `eof` | 服务端关了连接（不少中转站不发哨兵） |
+ * | `finish_reason` | **本次修的就是这条** |
+ *
+ * 早先只有前两条。实测有些服务端发完最后一帧（`finish_reason` 已带）就
+ * 把连接**挂着**：既不发 `[DONE]`，也不关。于是下一行 `readUtf8Line()`
+ * 永久阻塞，`collect` 不返回，`ChatViewModel.collectStream` 的 `finally`
+ * 永远不跑——`isStreaming` 一直是 true，右下角就一直显示「停止」。
+ * 用户看到的是「内容早出完了，图标还是停止」。
+ *
+ * ## 为什么把 [readLine] 做成参数
+ *
+ * 「挂住」在真实代码里是 `readUtf8Line()` 阻塞，单测里没法复现。
+ * 抽成注入的 lambda 之后，测试可以用一个**再调用就抛异常**的源来代表
+ * 「服务端不吭声了」——真的挂住时，读到这里就会炸，
+ * 而不是安静地返回、把 bug 放过去。
+ *
+ * @param readLine 读下一行；返回 `null` 表示 EOF。**不返回**即代表连接挂住。
+ */
+fun drainSse(
+    readLine: () -> String?,
+    parser: SseLineParser = SseLineParser(),
+    onThinking: (String) -> Unit = {},
+    onDelta: (String) -> Unit = {}
+): SseStreamResult {
+    var finishReason: String? = null
+    var promptTokens = 0
+    var completionTokens = 0
+
+    while (true) {
+        val line = readLine() ?: return SseStreamResult(
+            promptTokens, completionTokens, finishReason, endedBy = "eof"
+        )
+        val event = parser.accept(line) ?: continue
+        when (event) {
+            is SseEvent.Chunk -> {
+                event.thinking.takeIf { it.isNotEmpty() }?.let(onThinking)
+                event.text.takeIf { it.isNotEmpty() }?.let(onDelta)
+                // finish_reason / usage 只在特定帧出现，取**最后一个非空值**
+                event.finishReason?.let { finishReason = it }
+                if (event.promptTokens > 0) promptTokens = event.promptTokens
+                if (event.completionTokens > 0) completionTokens = event.completionTokens
+
+                // 到了就不再多读一行——多读那一下可能就是永远。
+                if (isTerminalFinish(event.finishReason)) {
+                    return SseStreamResult(
+                        promptTokens, completionTokens, finishReason, endedBy = "finish_reason"
+                    )
+                }
+            }
+
+            SseEvent.Done -> return SseStreamResult(
+                promptTokens, completionTokens, finishReason, endedBy = "done"
+            )
+
+            // 坏帧不中断：可能只是某一行被代理改坏了。累计数量交给上层判断。
+            is SseEvent.Malformed -> Unit
+
+            SseEvent.Ignore -> Unit
+        }
     }
 }

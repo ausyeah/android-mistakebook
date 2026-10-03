@@ -16,13 +16,15 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
+/** 一次「测试连接」的结果：给用户看的话 + 是否成功。 */
+data class TestOutcome(val message: String, val ok: Boolean)
+
 data class SettingsUiState(
     val snapshot: SettingsSnapshot = SettingsSnapshot(),
     val testingMineru: Boolean = false,
-    val testingLlm: Boolean = false,
 
     /**
-     * 各自的测试结果，**刻意不合并成一个字段**。
+     * 各自归属的测试结果，**刻意不合并成一个字段**。
      *
      * 早先只有一对 `testResult` / `testOk`，MinerU 和大模型两个测试共用——
      * 于是点 MinerU 的测试按钮，结果却渲染在大模型那一组的下方
@@ -31,8 +33,23 @@ data class SettingsUiState(
      */
     val mineruTestResult: String? = null,
     val mineruTestOk: Boolean = false,
-    val llmTestResult: String? = null,
-    val llmTestOk: Boolean = false,
+
+    /**
+     * 大模型的测试结果，**按配置 id 归属**。
+     *
+     * 之前这里是单个 `llmTestResult`，而 `ProfileRow` 在
+     * `snapshot.llmProfiles.forEach` 里给**每一个**配置都传了它——
+     * 于是配了第二个模型之后，测第一个的结果会同时显示在两个配置下面，
+     * 点第二个的「测试」按钮，第二个的转圈也同时出现在两个配置上。
+     * 用户报告的「测试结果不对不上按钮」就是这个。
+     *
+     * 用 map 而不是「单条 + id 标记」：每个配置各自留着自己最近一次的结果，
+     * 测完 A 再测 B 不会把 A 的抹掉（那正是最初拆字段要解决的问题）。
+     */
+    val llmTestResults: Map<String, TestOutcome> = emptyMap(),
+
+    /** 正在测试的配置 id；`null` 表示当前没有测试在进行。 */
+    val llmTestingProfileId: String? = null,
     val loadingModels: Boolean = false,
     val models: List<String> = emptyList(),
     val modelsError: String? = null,
@@ -40,25 +57,32 @@ data class SettingsUiState(
     val backupMessage: String? = null
 ) {
     val activeProfile: LlmProfile? get() = snapshot.activeProfile
+
+    /** 有测试在进行（任意配置）。 */
+    val testingLlm: Boolean get() = llmTestingProfileId != null
+
+    /** 某个配置自己的测试结果。 */
+    fun llmOutcome(profileId: String): TestOutcome? = llmTestResults[profileId]
+
+    /** **只有**正在测试的那一行该转圈。 */
+    fun isTestingLlm(profileId: String): Boolean = llmTestingProfileId == profileId
 }
 
 // 测试连接的瞬时状态
 private data class TestState(
     val flags: TestFlags,
-    val llmResult: String?,
-    val llmOk: Boolean
+    val llmTestingId: String?,
+    val llmOutcomes: Map<String, TestOutcome>
 ) {
     val testingMineru: Boolean get() = flags.testingMineru
-    val testingLlm: Boolean get() = flags.testingLlm
     val loadingModels: Boolean get() = flags.loadingModels
     val mineruResult: String? get() = flags.mineruResult
     val mineruOk: Boolean get() = flags.mineruOk
 }
 
-/** 两个「正在测试」标志 + MinerU 的结果 + 拉模型列表的标志。 */
+/** MinerU 的测试标志与结果 + 拉模型列表的标志。 */
 private data class TestFlags(
     val testingMineru: Boolean = false,
-    val testingLlm: Boolean = false,
     val loadingModels: Boolean = false,
     val mineruResult: String? = null,
     val mineruOk: Boolean = false
@@ -69,12 +93,11 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
     private val store: SettingsStore = container.settingsStore
 
     private val testingMineru = MutableStateFlow(false)
-    private val testingLlm = MutableStateFlow(false)
     private val loadingModels = MutableStateFlow(false)
     private val mineruTestResult = MutableStateFlow<String?>(null)
     private val mineruTestOk = MutableStateFlow(false)
-    private val llmTestResult = MutableStateFlow<String?>(null)
-    private val llmTestOk = MutableStateFlow(false)
+    private val llmTestingProfileId = MutableStateFlow<String?>(null)
+    private val llmTestResults = MutableStateFlow<Map<String, TestOutcome>>(emptyMap())
     private val models = MutableStateFlow<List<String>>(emptyList())
     private val modelsError = MutableStateFlow<String?>(null)
     private val pickedModel = MutableStateFlow<String?>(null)
@@ -86,10 +109,10 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
         // 套一层：两个测试各自合成一个，再合成 TestState。
         combine(
             combine(
-                testingMineru, testingLlm, loadingModels,
+                testingMineru, loadingModels,
                 mineruTestResult, mineruTestOk
-            ) { a, b, c, d, e -> TestFlags(a, b, c, d, e) },
-            combine(llmTestResult, llmTestOk) { result, ok -> result to ok }
+            ) { a, b, c, d -> TestFlags(a, b, c, d) },
+            combine(llmTestingProfileId, llmTestResults) { id, map -> id to map }
         ) { flags, llm -> TestState(flags, llm.first, llm.second) },
         combine(models, modelsError, pickedModel) { list, error, picked ->
             Triple(list, error, picked)
@@ -99,12 +122,11 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
         SettingsUiState(
             snapshot = snapshot,
             testingMineru = test.testingMineru,
-            testingLlm = test.testingLlm,
             loadingModels = test.loadingModels,
             mineruTestResult = test.mineruResult,
             mineruTestOk = test.mineruOk,
-            llmTestResult = test.llmResult,
-            llmTestOk = test.llmOk,
+            llmTestResults = test.llmOutcomes,
+            llmTestingProfileId = test.llmTestingId,
             models = modelsPair.first,
             modelsError = modelsPair.second,
             pickedModel = modelsPair.third,
@@ -112,10 +134,17 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), SettingsUiState())
 
-    fun setMineruKey(value: String) = viewModelScope.launch { store.setMineruKey(value) }
+    fun setMineruKey(value: String) = viewModelScope.launch {
+        // 改了 Key 之后，上一次的测试结果就不再成立了（可能刚刚从错的改成对的，
+        // 也可能反过来）。留着旧结果会让人以为新 Key 也测过了。
+        clearMineruTestResult()
+        store.setMineruKey(value)
+    }
 
     fun saveActiveProfile(profile: LlmProfile) = viewModelScope.launch {
         val current = uiState.value.activeProfile ?: return@launch
+        // 配置改了，之前那次测试的结论就不再代表当前配置
+        clearLlmTestResult(current.id)
         store.upsertProfile(profile.copy(id = current.id))
     }
 
@@ -123,7 +152,11 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
         store.upsertProfile(profile)
     }
 
-    fun deleteProfile(id: String) = viewModelScope.launch { store.deleteProfile(id) }
+    fun deleteProfile(id: String) = viewModelScope.launch {
+        // 连同它的测试结论一起删，否则 id 被复用时会显示上一条配置的结果
+        clearLlmTestResult(id)
+        store.deleteProfile(id)
+    }
 
     fun selectProfile(id: String) = viewModelScope.launch { store.setActiveProfileId(id) }
 
@@ -184,13 +217,13 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
      */
     fun testLlm(draft: LlmProfile) {
         viewModelScope.launch {
-            testingLlm.value = true
-            llmTestResult.value = null
+            llmTestingProfileId.value = draft.id
+            // 只清**自己**那条：别的配置刚测出来的结果不该被这次点击抹掉
+            clearLlmTestResult(draft.id)
             // 至少要有域名和 Key 才能测；模型名可以为空（测的就是「能不能拿到模型」）
             if (draft.baseUrl.isBlank() || draft.apiKey.isBlank()) {
-                testingLlm.value = false
-                llmTestOk.value = false
-                llmTestResult.value = "请先填写接口地址和 API Key"
+                llmTestingProfileId.value = null
+                publishLlmResult(draft.id, "请先填写接口地址和 API Key", ok = false)
                 return@launch
             }
             val probe = draft.normalized()
@@ -200,9 +233,12 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
             val listMs = elapsedMs(started)
             val modelCount = (listResult as? ApiResult.Success)?.data?.size ?: 0
             if (listResult is ApiResult.Failure) {
-                testingLlm.value = false
-                llmTestOk.value = false
-                llmTestResult.value = describeError(listResult.error, "连接失败") + "（${listMs}ms）"
+                llmTestingProfileId.value = null
+                publishLlmResult(
+                    draft.id,
+                    describeError(listResult.error, "连接失败") + "（${listMs}ms）",
+                    ok = false
+                )
                 return@launch
             }
             // 第二步：模型本身能否真正出字。模型名为空时跳过——
@@ -214,9 +250,9 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
                 container.llmClient.probeModel(probe)
             }
             val probeMs = elapsedMs(probeStarted)
-            testingLlm.value = false
+            llmTestingProfileId.value = null
 
-            llmTestResult.value = when {
+            val message = when {
                 probe.model.isBlank() -> "接口可达 · 响应 ${listMs}ms · 共 $modelCount 个可用模型" +
                     "（填上模型名可再测首字响应）"
 
@@ -226,8 +262,18 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
                 else -> "接口可达（${listMs}ms，已拉到 $modelCount 个模型），但模型 ${probe.model} " +
                     describeError((probeOutcome as ApiResult.Failure).error, "无响应")
             }
-            llmTestOk.value = probeOutcome is ApiResult.Success && probe.model.isNotBlank()
+            publishLlmResult(draft.id, message, probeOutcome is ApiResult.Success && probe.model.isNotBlank())
         }
+    }
+
+    /**
+     * 记录某个配置自己的测试结果。
+     *
+     * 单独抽出来：结果**必须**跟着 profile id 走。
+     * 之前是一个全局字段，配了第二个模型之后两边会显示同一份结果。
+     */
+    private fun publishLlmResult(profileId: String, message: String, ok: Boolean) {
+        llmTestResults.value = llmTestResults.value + (profileId to TestOutcome(message, ok))
     }
 
     /**
@@ -296,12 +342,15 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
     private fun elapsedMs(startNanos: Long): Long =
         (System.nanoTime() - startNanos) / 1_000_000
 
+    /** 改动 Key / URL 后，旧的测试结论不再成立。 */
     fun clearMineruTestResult() {
         mineruTestResult.value = null
+        mineruTestOk.value = false
     }
 
-    fun clearLlmTestResult() {
-        llmTestResult.value = null
+    /** 清掉**某个配置**的测试结论，别的配置不受影响。 */
+    fun clearLlmTestResult(profileId: String) {
+        llmTestResults.value = llmTestResults.value - profileId
     }
 
     fun clearTrash() {

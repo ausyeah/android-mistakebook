@@ -242,9 +242,15 @@ internal fun TestButton(
      * 而横幅统一渲染在大模型那一组的底部——点 MinerU 的按钮，
      * 结果却显示在几屏之外的另一个分组里，用户根本对不上是哪个按钮的结果。
      * 而且两个测试还会互相覆盖：后测的那个把先测的结果冲掉。
+     *
+     * **没有默认值，是故意的。** 之前写成 `result: String? = null`，
+     * 于是 MinerU 那个调用点漏传了 `result` / `resultOk` 也能编译通过，
+     * 结果 ViewModel 里算好、存进 state 的测试结果**永远没人渲染**——
+     * 点「测试 MinerU」，按钮右边空空如也，没有任何报错。
+     * 去掉默认值后，漏传会直接编译不过。
      */
-    result: String? = null,
-    resultOk: Boolean = false
+    result: String?,
+    resultOk: Boolean
 ) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -454,14 +460,25 @@ internal fun ProfileRow(
     testing: Boolean = false,
 
     /**
+     * 草稿里任何一项被改动时回调。
+     *
+     * 用来作废这个配置上一次测试的结论：改了 Key / URL 却还挂着
+     * 「连接成功」，用户会以为新配置也通了。
+     */
+    onDraftChanged: () -> Unit = {},
+
+    /**
      * 这个配置自己的测试结果。
      *
      * 早先所有结果共用一对字段、统一渲染在大模型分组的**最底部**——
      * 那个位置和「测试」按钮之间隔着输入框与「可用模型」按钮，
      * 用户分不清眼前这行字是自己点的哪个测试的结果。
+     *
+     * 同样**不设默认值**：有默认值时漏传不会报错，
+     * 结果就是「测了但什么都没显示」。
      */
-    result: String? = null,
-    resultOk: Boolean = false,
+    result: String?,
+    resultOk: Boolean,
     fetchingModels: Boolean = false,
     pickedModel: String? = null,
     onPickedModelConsumed: () -> Unit = {}
@@ -486,6 +503,8 @@ internal fun ProfileRow(
     LaunchedEffect(pickedModel) {
         if (!pickedModel.isNullOrBlank()) {
             model = pickedModel
+            // 回填也是改动：换了个模型，之前那次的测试结论不再作数
+            onDraftChanged()
             onPickedModelConsumed()
         }
     }
@@ -521,7 +540,7 @@ internal fun ProfileRow(
             if (selected) {
                 OutlinedTextField(
                     value = name,
-                    onValueChange = { name = it },
+                    onValueChange = { name = it; onDraftChanged() },
                     label = { Text(stringResource(R.string.settings_profile_name)) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
@@ -529,7 +548,7 @@ internal fun ProfileRow(
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(
                     value = baseUrl,
-                    onValueChange = { baseUrl = it },
+                    onValueChange = { baseUrl = it; onDraftChanged() },
                     label = { Text(stringResource(R.string.settings_base_url)) },
                     placeholder = { Text("https://api.deepseek.com") },
                     singleLine = true,
@@ -539,12 +558,12 @@ internal fun ProfileRow(
                 PasswordField(
                     label = stringResource(R.string.settings_api_key),
                     value = apiKey,
-                    onValueChange = { apiKey = it }
+                    onValueChange = { apiKey = it; onDraftChanged() }
                 )
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(
                     value = model,
-                    onValueChange = { model = it },
+                    onValueChange = { model = it; onDraftChanged() },
                     label = { Text(stringResource(R.string.settings_model)) },
                     placeholder = { Text(stringResource(R.string.settings_model_hint)) },
                     singleLine = true,
