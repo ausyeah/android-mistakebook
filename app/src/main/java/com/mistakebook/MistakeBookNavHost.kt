@@ -82,11 +82,20 @@ object Routes {
 fun MistakeBookNavHost(
     container: AppContainer,
     filterDue: Boolean = false,
+    filterDueRequest: Int = 0,
     navController: NavHostController = rememberNavController()
 ) {
     // 错题本页选中后回传给首页筛选。用 remember 而不是导航参数：
     // 筛选状态本来就归 HomeViewModel 管，多带一层参数只会让两边状态不同步。
     var homeNotebookPick by remember { mutableStateOf<Long?>(null) }
+    androidx.compose.runtime.LaunchedEffect(filterDueRequest) {
+        if (filterDueRequest > 0) {
+            navController.navigate(Routes.HOME) {
+                popUpTo(Routes.HOME) { inclusive = false }
+                launchSingleTop = true
+            }
+        }
+    }
 
     NavHost(navController = navController, startDestination = Routes.HOME) {
 
@@ -94,6 +103,7 @@ fun MistakeBookNavHost(
             HomeScreen(
                 container = container,
                 filterDue = filterDue,
+                filterDueRequest = filterDueRequest,
                 pickedNotebookId = homeNotebookPick,
                 onNotebookPicked = { homeNotebookPick = it },
                 onAddByPhoto = { navController.navigate(Routes.CAPTURE) },

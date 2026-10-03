@@ -29,17 +29,20 @@ object PdfTextExtractor {
 
         fun get(key: String): String? = dictionary[key]
 
-        fun ref(key: String): Int? = dictionary[key]?.trim()?.toIntOrNull()
+        fun ref(key: String): Int? =
+            Regex("^(\\d+)\\s+\\d+\\s+R$").matchEntire(dictionary[key]?.trim().orEmpty())
+                ?.groupValues?.get(1)?.toIntOrNull()
 
         fun dictValue(key: String): Map<String, String>? = dictionary[key]?.let { parseDict(it) }
     }
 
     /** 逐页文本；解析失败或图片型 PDF 返回空串。 */
     fun extractAll(bytes: ByteArray): List<String> {
+        val fontToUnicode = mutableMapOf<Int, Map<Int, Char>>()
         val objects = parseObjects(bytes)
         return collectPageObjects(objects)
             .take(MAX_PAGES)
-            .map { page -> extractPageText(page, objects) }
+            .map { page -> extractPageText(page, objects, fontToUnicode) }
             .map { text -> if (text.length > MAX_TOTAL_CHARS) text.take(MAX_TOTAL_CHARS) else text }
     }
 
@@ -53,7 +56,6 @@ object PdfTextExtractor {
         return pages.count { it.trim().length >= MIN_PAGE_CHARS } * 2 >= pages.size
     }
 
-    private val fontToUnicode = mutableMapOf<Int, Map<Int, Char>>()
 
     // ===== 对象表 =====
 
@@ -271,7 +273,11 @@ object PdfTextExtractor {
 
     // ===== 文本抽取 =====
 
-    private fun extractPageText(page: PdfObject, objects: Map<Int, PdfObject>): String {
+    private fun extractPageText(
+        page: PdfObject,
+        objects: Map<Int, PdfObject>,
+        fontToUnicode: MutableMap<Int, Map<Int, Char>>
+    ): String {
         val streamBuilder = StringBuilder()
         page.get("/Contents")?.let { contentRefs ->
             Regex("(\\d+)\\s+\\d+\\s+R").findAll(contentRefs).forEach { match ->
@@ -283,12 +289,17 @@ object PdfTextExtractor {
             page.data?.let { streamBuilder.append(String(it, Charsets.ISO_8859_1)) }
         }
         if (streamBuilder.isEmpty()) return ""
-        return extractText(streamBuilder.toString(), resolvePageFonts(page, objects))
+        return extractText(
+            streamBuilder.toString(),
+            resolvePageFonts(page, objects, fontToUnicode),
+            fontToUnicode
+        )
     }
 
     private fun resolvePageFonts(
         page: PdfObject,
-        objects: Map<Int, PdfObject>
+        objects: Map<Int, PdfObject>,
+        fontToUnicode: MutableMap<Int, Map<Int, Char>>
     ): Map<String, Int> {
         val result = mutableMapOf<String, Int>()
         val fontsRaw = page.dictValue("/Resources")?.get("/Font") ?: return result
@@ -297,12 +308,16 @@ object PdfTextExtractor {
                 ?: return@forEach
             result[name] = number
             val cmap = objects[number]?.ref("/ToUnicode")?.let { objects[it]?.data } ?: return@forEach
-            registerToUnicode(number, String(cmap, Charsets.ISO_8859_1))
+            registerToUnicode(number, String(cmap, Charsets.ISO_8859_1), fontToUnicode)
         }
         return result
     }
 
-    private fun extractText(content: String, fonts: Map<String, Int>): String {
+    private fun extractText(
+        content: String,
+        fonts: Map<String, Int>,
+        fontToUnicode: Map<Int, Map<Int, Char>>
+    ): String {
         val out = StringBuilder()
         var fontNumber: Int? = null
         var inText = false
@@ -311,6 +326,7 @@ object PdfTextExtractor {
         fun appendString(text: String) {
             out.append(decodeString(text, fontNumber?.let { fontToUnicode[it] }))
         }
+
 
         while (index < content.length) {
             val c = content[index]
@@ -350,17 +366,16 @@ object PdfTextExtractor {
                 content.startsWith("Tj", index) || content.startsWith("TJ", index) -> index += 2
 
                 content.startsWith("Tf", index) -> {
-                    var cursor = index + 2
-                    while (cursor < content.length && content[cursor].isWhitespace()) cursor++
-                    val slash = content.indexOf('/', cursor)
-                    if (slash >= 0) {
-                        var stop = slash + 1
-                        while (stop < content.length &&
-                            (content[stop].isLetterOrDigit() || content[stop] == '#')
-                        ) stop++
-                        fonts[content.substring(slash, stop)]?.let { fontNumber = it }
+                    var cursor = index
+                    while (cursor > 0 && content[cursor - 1].isWhitespace()) cursor--
+                    while (cursor > 0 && !content[cursor - 1].isWhitespace()) cursor--
+                    while (cursor > 0 && content[cursor - 1].isWhitespace()) cursor--
+                    val fontEnd = cursor
+                    while (cursor > 0 && !content[cursor - 1].isWhitespace()) cursor--
+                    if (cursor < fontEnd) {
+                        fonts[content.substring(cursor, fontEnd)]?.let { fontNumber = it }
                     }
-                    index = cursor
+                    index += 2
                 }
 
                 content.startsWith("Td", index) || content.startsWith("TD", index) ||
@@ -454,7 +469,11 @@ object PdfTextExtractor {
         return builder.toString()
     }
 
-    private fun registerToUnicode(objectNumber: Int, cmap: String) {
+    private fun registerToUnicode(
+        objectNumber: Int,
+        cmap: String,
+        fontToUnicode: MutableMap<Int, Map<Int, Char>>
+    ) {
         fontToUnicode[objectNumber] = parseToUnicodeCmap(cmap)
     }
 

@@ -8,7 +8,7 @@ import com.mistakebook.domain.ChatRole
  * ## 规则
  *
  * - 永远保留：system + 题目上下文 + **最新一轮**
- * - 历史预算：最近 [MAX_HISTORY_ROUNDS] 轮 / [MAX_HISTORY_CHARS] 字符
+ * - 历史预算：最近 [MAX_HISTORY_ROUNDS] 轮 / [MAX_HISTORY_CHARS] 字符（约 60K token 级别的混合文本余量）
  * - 超预算时**从最旧的完整轮次整轮丢弃**——不能只丢半轮，
  *   丢掉用户的问题却留着它的回答，模型会对着一个没有问题的回答继续胡扯
  * - 丢弃后在 UI 显示「已省略 N 条早期对话」
@@ -22,11 +22,11 @@ import com.mistakebook.domain.ChatRole
  */
 object ChatContextAssembler {
 
-    /** 历史部分的字符预算（不含 system 与题目上下文）。 */
-    const val MAX_HISTORY_CHARS = 8000
+    /** 历史部分的字符预算（不含 system 与题目上下文）。按混合中英文文本保守折算，约覆盖 60K token。 */
+    const val MAX_HISTORY_CHARS = 240_000
 
-    /** 历史部分的轮数上限。 */
-    const val MAX_HISTORY_ROUNDS = 8
+    /** 历史部分的轮数上限，避免极短消息无限增长请求。 */
+    const val MAX_HISTORY_ROUNDS = 64
 
     /**
      * 整个请求最多带几张历史图片。

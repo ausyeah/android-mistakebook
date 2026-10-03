@@ -105,6 +105,7 @@ import kotlinx.coroutines.launch
 fun HomeScreen(
     container: AppContainer,
     filterDue: Boolean = false,
+    filterDueRequest: Int = 0,
     pickedNotebookId: Long? = null,
     onNotebookPicked: (Long?) -> Unit = {},
     onAddByPhoto: () -> Unit,
@@ -130,8 +131,8 @@ fun HomeScreen(
 ) {
     val viewModel: HomeViewModel = containerViewModel(container) { HomeViewModel(it) }
     val state by viewModel.uiState.collectAsState()
-    LaunchedEffect(filterDue) {
-        if (filterDue) viewModel.setDueOnly(true)
+    LaunchedEffect(filterDue, filterDueRequest) {
+        if (filterDue || filterDueRequest > 0) viewModel.setDueOnly(true)
     }
     // 错题本页选完回来时应用筛选
     // 错题本页选完回来时应用筛选。

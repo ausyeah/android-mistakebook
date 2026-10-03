@@ -84,7 +84,7 @@ object ReviewScheduler {
             .build()
         WorkManager.getInstance(context).enqueueUniquePeriodicWork(
             ReviewWorker.WORK_NAME,
-            ExistingPeriodicWorkPolicy.KEEP,
+            ExistingPeriodicWorkPolicy.CANCEL_AND_REENQUEUE,
             request
         )
     }

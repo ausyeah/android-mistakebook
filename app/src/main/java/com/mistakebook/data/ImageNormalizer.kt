@@ -108,24 +108,31 @@ object ImageNormalizer {
      * 直接 `decodeFile` 一张 4000×3000 的照片就是 48MB，
      * 连续处理多张必被 OOM——必须先算 inSampleSize。
      */
-    private fun decodeBounded(file: File): Bitmap? {
+    internal fun calculateSampleSize(width: Int, height: Int, maxLongEdge: Int): Int {
+        if (width <= 0 || height <= 0) return 1
+        val targetEdge = maxLongEdge.coerceAtLeast(1)
+        val sampledEdgeLimit = targetEdge.toDouble() * 1.5
+        val longEdge = maxOf(width, height).toLong()
+        var sample = 1
+        while (longEdge / sample > sampledEdgeLimit) sample *= 2
+        return sample
+    }
+
+    fun decodeBounded(file: File, maxLongEdge: Int = MAX_LONG_EDGE): Bitmap? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(file.absolutePath, bounds)
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
 
-        var sample = 1
-        while (maxOf(bounds.outWidth, bounds.outHeight) / sample > MAX_LONG_EDGE * 2) {
-            sample *= 2
-        }
+        val targetEdge = maxLongEdge.coerceAtLeast(1)
         val options = BitmapFactory.Options().apply {
-            inSampleSize = sample
+            inSampleSize = calculateSampleSize(bounds.outWidth, bounds.outHeight, targetEdge)
             inPreferredConfig = Bitmap.Config.ARGB_8888
         }
         val bitmap = BitmapFactory.decodeFile(file.absolutePath, options) ?: return null
 
         val longEdge = maxOf(bitmap.width, bitmap.height)
-        if (longEdge <= MAX_LONG_EDGE) return bitmap
-        val ratio = MAX_LONG_EDGE.toFloat() / longEdge
+        if (longEdge <= targetEdge) return bitmap
+        val ratio = targetEdge.toFloat() / longEdge
         val scaled = Bitmap.createScaledBitmap(
             bitmap,
             (bitmap.width * ratio).toInt().coerceAtLeast(1),

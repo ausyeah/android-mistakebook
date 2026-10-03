@@ -13,7 +13,7 @@ object MarkdownParser {
         data class Quote(val text: String) : Block
         data class Table(val rows: List<List<String>>) : Block
         data class Image(val path: String, val alt: String) : Block
-        data class Math(val latex: String, val display: Boolean) : Block
+        data class Math(val latex: String, val display: Boolean, val complete: Boolean = true) : Block
         data class Code(val text: String) : Block
         data object Rule : Block
     }
@@ -203,7 +203,7 @@ object MarkdownParser {
         // 它就永远不显示。两种都不可接受：有内容就渲染。
         displayMath?.let { open ->
             val latex = open.toString().trim()
-            if (latex.isNotEmpty()) blocks += Block.Math(latex, true)
+            if (latex.isNotEmpty()) blocks += Block.Math(latex, display = true, complete = false)
         }
         if (inCode && code.isNotBlank()) blocks += Block.Code(code.toString().trimEnd())
     }

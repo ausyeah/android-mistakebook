@@ -388,23 +388,7 @@ class EditViewModel(
             return container.questionRepository.save(draft.toDomainDraft(markdown), now)
         }
         val domain = draft.toDomainDraft(markdown)
-        val updated = existing.copy(
-            imagePath = domain.imagePath,
-            subjectId = domain.subjectId,
-            stem = domain.stem,
-            // Question 实体里选项是序列化后的字符串，不是列表
-            optionsJson = kotlinx.serialization.json.Json.encodeToString(
-                kotlinx.serialization.builtins.ListSerializer(
-                    com.mistakebook.domain.Option.serializer()
-                ),
-                domain.options
-            ),
-            answer = domain.answer,
-            analysis = domain.analysis,
-            title = domain.title,
-            errorReason = domain.errorReason,
-            difficulty = domain.difficulty
-        )
+        val updated = existing.applyRecognitionDraft(domain)
         container.questionRepository.overwrite(updated, domain.figurePaths, domain.knowledgePoints)
         return questionId
     }

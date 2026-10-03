@@ -48,4 +48,44 @@ class PdfTextExtractorTest {
     fun `recognises text pdf`() {
         assertTrue(PdfTextExtractor.isTextPdf(pdf))
     }
+    @Test
+    fun `toUnicode mapping is isolated per document`() {
+        val mappedPdf = singlePagePdf(withToUnicode = true)
+        val plainPdf = singlePagePdf(withToUnicode = false)
+
+        assertTrue(PdfTextExtractor.extractAll(mappedPdf).single().contains("\u4E2D"))
+        assertTrue(PdfTextExtractor.extractAll(plainPdf).single().contains("A"))
+    }
+
+    private fun singlePagePdf(withToUnicode: Boolean): ByteArray {
+        val toUnicodeRef = if (withToUnicode) "/ToUnicode 7 0 R" else ""
+        val cmapObject = if (withToUnicode) {
+            """
+                7 0 obj << /Length 32 >>
+                stream
+                1 beginbfchar
+                <41> <4E2D>
+                endbfchar
+                endstream
+                endobj
+            """.trimIndent()
+        } else {
+            ""
+        }
+        return """
+            %PDF-1.4
+            1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+            2 0 obj << /Type /Pages /Kids [ 3 0 R ] /Count 1 >> endobj
+            3 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >> endobj
+            4 0 obj << /Length 30 >>
+            stream
+            BT /F1 12 Tf (A) Tj ET
+            endstream
+            endobj
+            5 0 obj << /Type /Font $toUnicodeRef >> endobj
+            $cmapObject
+            trailer << /Root 1 0 R >>
+            %%EOF
+        """.trimIndent().toByteArray(java.nio.charset.StandardCharsets.ISO_8859_1)
+    }
 }

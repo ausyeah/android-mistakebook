@@ -1,7 +1,7 @@
 package com.mistakebook.pipeline
 
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
+import com.mistakebook.data.ImageNormalizer
 import com.mistakebook.data.prefs.LlmProfile
 import com.mistakebook.net.ApiError
 import com.mistakebook.net.ApiErrorKind
@@ -165,31 +165,23 @@ class LlmClient(private val api: LlmApi) {
 
     /** 长边压到 [longEdgePx]，JPEG q80，转 base64 data URL。 */
     private fun encodeImage(file: File, longEdgePx: Int): ChatContentPart? {
-        val bitmap = BitmapFactory.decodeFile(file.absolutePath) ?: return null
-        val scaled = scaleDown(bitmap, longEdgePx)
-        val stream = ByteArrayOutputStream()
-        scaled.compress(Bitmap.CompressFormat.JPEG, 80, stream)
-        val base64 = android.util.Base64.encodeToString(
-            stream.toByteArray(),
-            android.util.Base64.NO_WRAP
-        )
-        return ChatContentPart(
-            type = ChatContentPart.TYPE_IMAGE,
-            imageUrl = ImageUrl(url = "data:image/jpeg;base64,$base64")
-        )
+        val bitmap = ImageNormalizer.decodeBounded(file, longEdgePx) ?: return null
+        return try {
+            val stream = ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 80, stream)
+            val base64 = android.util.Base64.encodeToString(
+                stream.toByteArray(),
+                android.util.Base64.NO_WRAP
+            )
+            ChatContentPart(
+                type = ChatContentPart.TYPE_IMAGE,
+                imageUrl = ImageUrl(url = "data:image/jpeg;base64,$base64")
+            )
+        } finally {
+            bitmap.recycle()
+        }
     }
 
-    private fun scaleDown(bitmap: Bitmap, longEdgePx: Int): Bitmap {
-        val longEdge = maxOf(bitmap.width, bitmap.height)
-        if (longEdge <= longEdgePx) return bitmap
-        val ratio = longEdgePx.toFloat() / longEdge
-        return Bitmap.createScaledBitmap(
-            bitmap,
-            (bitmap.width * ratio).toInt().coerceAtLeast(1),
-            (bitmap.height * ratio).toInt().coerceAtLeast(1),
-            true
-        )
-    }
 
     /** 设置页「测试连接」：GET {base}/models，HTTP 200 即有效。 */
     suspend fun listModels(profile: LlmProfile): ApiResult<List<String>> {

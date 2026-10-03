@@ -158,23 +158,7 @@ class QuestionEditViewModel(
             } else {
                 draft.subjectId ?: question.subjectId
             }
-            val updated = question.copy(
-                subjectId = subjectId,
-                notebookId = draft.notebookId,
-                title = draft.title.trim(),
-                stem = draft.stem.trim(),
-                optionsJson = kotlinx.serialization.json.Json.encodeToString(
-                    kotlinx.serialization.builtins.ListSerializer(
-                        com.mistakebook.domain.Option.serializer()
-                    ),
-                    draft.options
-                ),
-                answer = draft.answer.trim(),
-                analysis = draft.analysis.trim(),
-                errorReason = draft.errorReason,
-                difficulty = draft.difficulty,
-                note = draft.note.trim()
-            )
+            val updated = question.applyEditedQuestion(draft, subjectId)
             container.questionRepository.update(updated, draft.knowledgePoints)
             _uiState.value = _uiState.value.copy(saved = true)
             onSaved()

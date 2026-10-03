@@ -123,27 +123,26 @@ class ChatContextAssemblerTest {
 
     @Test
     fun `超过轮数上限时丢最旧的整轮`() {
-        val history = (1L..20L).map { id ->
+        val totalRounds = ChatContextAssembler.MAX_HISTORY_ROUNDS + 2
+        val history = (1L..(totalRounds * 2)).map { id ->
             if (id % 2 == 1L) user(id, "问$id") else assistant(id, "答$id")
         }
         val result = assemble(history)
-        assertEquals(8, result.keptRounds)
+        assertEquals(ChatContextAssembler.MAX_HISTORY_ROUNDS, result.keptRounds)
         assertEquals(2, result.omittedCount)
-        assertEquals(16, result.body().size)
-        // 保留的是最近 8 轮 = id 5..20
+        assertEquals(ChatContextAssembler.MAX_HISTORY_ROUNDS * 2, result.body().size)
         assertTrue(result.body().any { it.id == 5L })
         assertTrue(result.body().none { it.id == 1L || it.id == 2L })
     }
 
     @Test
     fun `丢的是整轮不是半轮`() {
-        // 反向用例：只丢助手消息、留着用户问题是最糟的——模型会对着半个问题发挥。
-        val history = (1L..20L).map { id ->
+        val totalRounds = ChatContextAssembler.MAX_HISTORY_ROUNDS + 2
+        val history = (1L..(totalRounds * 2)).map { id ->
             if (id % 2 == 1L) user(id, "问$id") else assistant(id, "答$id")
         }
         val result = assemble(history)
         val keptIds = result.body().map { it.id }.toSet()
-        // 每个保留的用户消息后面必须跟着它的回答
         keptIds.filter { it % 2 == 1L }.forEach { userId ->
             assertTrue("用户 $userId 的回答被丢了", keptIds.contains(userId + 1))
         }
@@ -153,8 +152,7 @@ class ChatContextAssemblerTest {
 
     @Test
     fun `超字符预算时丢最旧的整轮`() {
-        // 每轮 2 * 1904 = 3808 字符。2 轮 7616 装得下，3 轮 11424 装不下。
-        val big = "x".repeat(1900)
+        val big = "x".repeat(ChatContextAssembler.MAX_HISTORY_CHARS / 6)
         val history = listOf(
             user(1, "问1$big"), assistant(2, "答1$big"),
             user(3, "问3$big"), assistant(4, "答4$big"),
@@ -170,13 +168,13 @@ class ChatContextAssemblerTest {
     fun `附件文本计入字符预算`() {
         // 反向用例：只算正文不算附件，预算会形同虚设。
         val sameHistory: List<OutgoingMessage> = listOf(
-            OutgoingMessage(id = 1, role = ChatRole.USER, text = "问", attachmentText = "y".repeat(5000)),
+            OutgoingMessage(id = 1, role = ChatRole.USER, text = "问", attachmentText = "y".repeat(ChatContextAssembler.MAX_HISTORY_CHARS / 2 + 1)),
             assistant(2, "答"),
-            OutgoingMessage(id = 3, role = ChatRole.USER, text = "问3", attachmentText = "y".repeat(5000)),
+            OutgoingMessage(id = 3, role = ChatRole.USER, text = "问3", attachmentText = "y".repeat(ChatContextAssembler.MAX_HISTORY_CHARS / 2 + 1)),
             assistant(4, "答4")
         )
         val withAttachment = assemble(sameHistory)
-        // 每轮 5000+ 字符，2 轮就超 8000 -> 只留最新一轮
+        // 两条附件文本合计超过预算，因此只保留最新一轮。
         assertEquals(1, withAttachment.keptRounds)
         assertEquals(1, withAttachment.omittedCount)
 
@@ -205,7 +203,7 @@ class ChatContextAssemblerTest {
     @Test
     fun `最新一轮永远保留即使超预算`() {
         // 灾难场景：用户刚发的问题被自己发出去的历史挤掉。
-        val huge = "x".repeat(20_000)
+        val huge = "x".repeat(ChatContextAssembler.MAX_HISTORY_CHARS / 2 + 1)
         val history = listOf(
             user(1, "旧问$huge"), assistant(2, "旧答$huge"),
             user(3, "旧问3$huge"), assistant(4, "旧答4$huge")
@@ -217,7 +215,7 @@ class ChatContextAssemblerTest {
 
     @Test
     fun `本次新输入无论多大都发送`() {
-        val huge = "x".repeat(50_000)
+        val huge = "x".repeat(ChatContextAssembler.MAX_HISTORY_CHARS + 1)
         val result = assemble(listOf(user(1, "旧问"), assistant(2, "旧答")), pendingText = "新的超长问题$huge")
         assertEquals(listOf(ChatContextAssembler.ID_PENDING), result.body().map { it.id })
         assertEquals(1, result.omittedCount)
@@ -288,19 +286,16 @@ class ChatContextAssemblerTest {
 
     @Test
     fun `省略数在有无新输入两种情况下都正确`() {
-        val history = (1L..20L).map { id ->
+        val historyRounds = ChatContextAssembler.MAX_HISTORY_ROUNDS + 2
+        val history = (1L..(historyRounds * 2)).map { id ->
             if (id % 2 == 1L) user(id, "问$id") else assistant(id, "答$id")
         }
-        // 10 轮历史，轮数上限 8 -> 丢 2 轮
         val withoutPending = assemble(history)
-        assertEquals(8, withoutPending.keptRounds)
+        assertEquals(ChatContextAssembler.MAX_HISTORY_ROUNDS, withoutPending.keptRounds)
         assertEquals(2, withoutPending.omittedCount)
 
         val withPending = assemble(history, pendingText = "新问题")
-        // 11 轮（10 历史 + 新输入），上限 8 -> 只留最新 8 轮，
-        // 其中 1 轮是新输入，所以历史保留 7 轮、丢 3 轮。
-        // 关键：新输入占了一个名额，省略数要跟着涨，否则 UI 会少报一条。
-        assertEquals(8, withPending.keptRounds)
+        assertEquals(ChatContextAssembler.MAX_HISTORY_ROUNDS, withPending.keptRounds)
         assertEquals(3, withPending.omittedCount)
         assertEquals(ChatContextAssembler.ID_PENDING, withPending.body().last().id)
     }

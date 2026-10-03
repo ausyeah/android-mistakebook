@@ -2,10 +2,10 @@ package com.mistakebook.data.chat
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.OpenableColumns
 import com.mistakebook.data.AppFiles
+import com.mistakebook.data.ImageNormalizer
 import com.mistakebook.data.local.entities.ChatAttachment
 import com.mistakebook.data.pdf.PdfTextExtractor
 import com.mistakebook.domain.AttachmentKind
@@ -102,7 +102,7 @@ class ChatAttachmentPreparer(
     }
 
     private fun processImage(file: File, size: Long, longEdgePx: Int): PreparedAttachment {
-        val bitmap = BitmapFactory.decodeFile(file.absolutePath)
+        val bitmap = ImageNormalizer.decodeBounded(file, longEdgePx)
             ?: return PreparedAttachment(
                 localPath = file.absolutePath,
                 fileName = file.name,
@@ -111,14 +111,13 @@ class ChatAttachmentPreparer(
                 sizeBytes = size,
                 errorMessage = "无法解码这张图片"
             )
-        val scaled = scaleDown(bitmap, longEdgePx)
-        // createScaledBitmap 在需要缩放时返回新 Bitmap，原图可以立刻释放；
-        // 不缩放时返回的是同一个对象，不能 recycle——那会把 scaled 一起废掉。
-        if (scaled !== bitmap) bitmap.recycle()
-        val width = scaled.width
-        val height = scaled.height
-        compress(scaled, file)
-        scaled.recycle()
+        val width = bitmap.width
+        val height = bitmap.height
+        try {
+            compress(bitmap, file)
+        } finally {
+            bitmap.recycle()
+        }
         return PreparedAttachment(
             localPath = file.absolutePath,
             fileName = file.name,
@@ -130,17 +129,6 @@ class ChatAttachmentPreparer(
         )
     }
 
-    private fun scaleDown(bitmap: Bitmap, longEdgePx: Int): Bitmap {
-        val longEdge = maxOf(bitmap.width, bitmap.height)
-        if (longEdge <= longEdgePx || longEdgePx <= 0) return bitmap
-        val ratio = longEdgePx.toFloat() / longEdge
-        return Bitmap.createScaledBitmap(
-            bitmap,
-            (bitmap.width * ratio).toInt().coerceAtLeast(1),
-            (bitmap.height * ratio).toInt().coerceAtLeast(1),
-            true
-        )
-    }
 
     private fun compress(bitmap: Bitmap, target: File) {
         target.outputStream().use { out ->
@@ -165,11 +153,8 @@ class ChatAttachmentPreparer(
     }
 
     /**
-     * 统一处理「抽出来的文本」：截断入库。
-     *
-     * 截断到 [MAX_EXCERPT_CHARS] 而不是塞全文，两个原因：
-     * 长文档全文入库会让表膨胀；而上下文预算总共才 8000 字符，
-     * 一条附件吃掉大半就等于把历史对话全挤掉了。
+     * 统一处理「抽出来的文本」：优先保留完整内容，最多限制为 [MAX_EXCERPT_CHARS] 字符。
+     * 长文档仍不能独占整段会话上下文，但短于上限的题目、讲义和源码不再被过早截断。
      */
     private fun excerpt(
         file: File,
@@ -241,12 +226,7 @@ class ChatAttachmentPreparer(
 
         const val DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
-        /**
-         * 抽出的文本最多入库多少字符。
-         *
-         * 取 4000：够模型看清文档在讲什么，又不会让一条附件把
-         * 8000 字符的上下文预算吃掉一半以上。
-         */
-        const val MAX_EXCERPT_CHARS = 4000
+        /** 单个文本附件最多保留 20,000 字符，避免极大文件占满会话上下文。 */
+        const val MAX_EXCERPT_CHARS = 20_000
     }
 }

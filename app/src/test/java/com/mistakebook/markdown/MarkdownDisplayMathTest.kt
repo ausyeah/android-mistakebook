@@ -50,6 +50,7 @@ class MarkdownDisplayMathTest {
         assertEquals("应产出一个公式块", 1, blocks.size)
         assertEquals("x = 1", blocks[0].latex)
         assertTrue("独立公式", blocks[0].display)
+        assertTrue("闭合公式", blocks[0].complete)
     }
 
     @Test
@@ -129,17 +130,15 @@ class MarkdownDisplayMathTest {
     // ------------------------------------------------------- 流式（半截状态）
 
     /**
-     * 流式输出时正文尾端正停在 `$$x = ` 这种半截状态，之后每个新 chunk
-     * 都会重跑整个解析。
-     *
-     * 丢弃未闭合块的话：这条公式在生成期间永远不显示，生成结束才突然冒出来；
-     * 模型真没写闭合符的话，就永远不显示。有内容就渲染。
+     * 流式输出时正文尾端会停在 `$$x = ` 这种半截状态。
+     * 它仍产出未闭合公式块，但标记为不完整：界面先显示源码，闭合后再交给 KaTeX 渲染。
      */
     @Test
-    fun `未闭合的美元对也渲染`() {
+    fun `未闭合公式保留源码预览`() {
         val blocks = mathBlocks("推导：\n$$\nx = \\frac{1}{2")
         assertEquals("半截公式也要出块", 1, blocks.size)
         assertTrue("内容保留", blocks[0].latex.contains("\\frac{1}{2"))
+        assertEquals(false, blocks[0].complete)
     }
 
     @Test

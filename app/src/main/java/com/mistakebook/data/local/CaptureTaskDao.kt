@@ -47,7 +47,7 @@ interface CaptureTaskDao {
     suspend fun updateStatus(id: Long, status: TaskStatus, message: String?, now: Long)
 
     @Query(
-        "UPDATE capture_tasks SET status = :status, errorMessage = :message, errorKind = :kind, updatedAt = :now WHERE id = :id"
+        "UPDATE capture_tasks SET status = :status, errorMessage = :message, errorKind = :kind, updatedAt = :now WHERE id = :id AND status != 'DONE'"
     )
     suspend fun updateFailure(
         id: Long,

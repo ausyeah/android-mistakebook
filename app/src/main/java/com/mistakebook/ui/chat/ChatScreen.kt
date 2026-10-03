@@ -148,10 +148,9 @@ fun ChatScreen(
         if (questionId != null) R.string.chat_title_question else R.string.chat_title_free
     )
 
-    // 内容版本号：流式时用最后一条消息的正文长度，否则只有消息条数变化时才会触发跟随
-    val contentKey = remember(state.messages) {
-        val last = state.messages.lastOrNull()
-        (state.messages.size to (last?.content?.length ?: 0))
+    // Room 消息数量及内存预览长度共同驱动滚动跟随，预览更新频率低于模型 delta。
+    val contentKey = remember(state.messages.size, state.streamingMessageId, state.streamingContent?.length) {
+        Triple(state.messages.size, state.streamingMessageId, state.streamingContent?.length)
     }
     val coordinator = rememberAutoScrollEffect(listState, contentKey)
 
@@ -374,7 +373,15 @@ private fun MessageList(
     // 「已省略 N 条早期对话」插在最上面：被丢的永远是最旧的轮次
     val items: List<ChatListItem> = buildList {
         if (state.omittedCount > 0) add(ChatListItem.OmittedNotice(state.omittedCount))
-        state.messages.forEach { add(ChatListItem.Message(it)) }
+        state.messages.forEach { message ->
+            val preview = state.streamingContent
+            val visibleMessage = if (message.id == state.streamingMessageId && preview != null) {
+                message.copy(content = preview)
+            } else {
+                message
+            }
+            add(ChatListItem.Message(visibleMessage))
+        }
     }
 
     LazyColumn(

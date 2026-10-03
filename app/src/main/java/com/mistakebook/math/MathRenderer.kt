@@ -39,7 +39,6 @@ import kotlin.math.abs
  */
 /**
  * 一次渲染的产物：位图 + 该位图实际使用的字号（设备像素）。
- *
  * fontPx 是排版的关键：调用方必须按「目标字号 / fontPx」等比缩放，
  * 这样公式里的字母数字才和正文中文**同号**。若改成按包围盒高度缩放，
  * 公式之间会大小失衡（单字母被撑得巨大、长分式被压扁），观感很不协调。
@@ -710,7 +709,7 @@ class MathRenderer(context: Context) {
     companion object {
         private const val TAG = "MathRenderer"
         private const val ASSET_URL = "file:///android_asset/katex/math.html"
-        private const val CACHE_BYTES = 12 * 1024 * 1024
+        private const val CACHE_BYTES = 24 * 1024 * 1024
         private const val MAX_BITMAP_EDGE = 2048
         private const val PAGE_LOAD_TIMEOUT_MS = 8_000L
         private const val TOLERANCE = 12

@@ -70,6 +70,9 @@ data class ChatUiState(
     val questionId: Long? = null,
     val title: String = "",
     val messages: List<ChatMessage> = emptyList(),
+    /** 当前助手消息的内存预览；Room 仍以较低频率持久化完整内容。 */
+    val streamingMessageId: Long? = null,
+    val streamingContent: String? = null,
 
     /**
      * 消息 id -> 该消息里图片的 data URL 列表。
@@ -130,12 +133,11 @@ sealed interface ChatEvent {
 /**
  * 对话页 ViewModel。
  *
- * ## 为什么流式内容直接写库、不在 state 里另存一份
+ * ## 流式预览与持久化
  *
- * 另存一份就得把「库里的列表」和「内存里的流式文本」合并，
- * 而合并两份来源正是本项目栽过多次的坑（顺序依赖、重组不刷新）。
- * 改成**节流写库**后，UI 的消息列表永远只有 Room 一个来源。
- * 代价是 ≤[WRITE_THROTTLE_MS] 的显示延迟——肉眼察觉不到。
+ * 当前助手消息保留一份内存预览，最多每 [PREVIEW_THROTTLE_MS] 更新一次；UI 只用它覆盖这一条消息。
+ * Room 仍按 [WRITE_THROTTLE_MS] 节流写入，生成结束或取消时再强制落下剩余内容。
+ * 这样既能及时显示 token，也避免每个 delta 都触发数据库 Flow 与整列列表重组。
  */
 class ChatViewModel(
     private val repository: ChatRepository,
@@ -330,6 +332,8 @@ class ChatViewModel(
         val assistantId = repository.insertStreamingAssistantMessage(sessionId, profile.model)
         _state.value = _state.value.copy(
             isStreaming = true,
+            streamingMessageId = assistantId,
+            streamingContent = "",
             omittedCount = context.omittedCount,
             canRetry = false,
             truncated = false
@@ -363,17 +367,29 @@ class ChatViewModel(
 
         val buffer = StringBuilder()
         val thinking = StringBuilder()
+        val fullAnswer = StringBuilder()
+        val fullThinking = StringBuilder()
         var lastWriteAt = 0L
+        var lastPreviewAt = 0L
         var status = MessageStatus.DONE
         var errorText: String? = null
         var promptTokens = 0
         var completionTokens = 0
         var wasTruncated = false
-
         fun joinThinkingAndAnswer(answer: String, thought: String): String = when {
             thought.isBlank() -> answer
             answer.isBlank() -> ChatThinking.tags(thought)
             else -> ChatThinking.tags(thought) + "\n\n" + answer
+        }
+
+        suspend fun publishPreview() {
+            val now = System.currentTimeMillis()
+            if (now - lastPreviewAt < PREVIEW_THROTTLE_MS) return
+            lastPreviewAt = now
+            _state.value = _state.value.copy(
+                streamingMessageId = assistantId,
+                streamingContent = joinThinkingAndAnswer(fullAnswer.toString(), fullThinking.toString())
+            )
         }
 
         /**
@@ -402,21 +418,16 @@ class ChatViewModel(
                     is ChatStreamEvent.Thinking -> {
                         if (event.text.isNotEmpty()) {
                             thinking.append(event.text)
-                            // **思考阶段也必须刷。**
-                            //
-                            // 早先只有 Delta 分支会 flush，而推理模型的输出顺序是
-                            // 「全部思考 → 才开始正文」——于是整个思考阶段一个字符都不显示，
-                            // 要等第一条正文到达才一次性冒出来。而那时正文已开始，
-                            // ThinkingBlock 的 streaming 判定（正文非空即视为结束）
-                            // 已经把它折叠了，用户永远看不到「边生成边思考」。
-                            //
-                            // 这正是用户要的：思考中展开、结束收起。
+                            fullThinking.append(event.text)
+                            publishPreview()
                             if (System.currentTimeMillis() - lastWriteAt >= WRITE_THROTTLE_MS) flush()
                         }
                     }
 
                     is ChatStreamEvent.Delta -> {
                         buffer.append(event.text)
+                        fullAnswer.append(event.text)
+                        publishPreview()
                         if (System.currentTimeMillis() - lastWriteAt >= WRITE_THROTTLE_MS) flush()
                     }
 
@@ -461,8 +472,10 @@ class ChatViewModel(
             // StateFlow 写入不是挂起函数，取消态下依然能执行
             _state.value = _state.value.copy(
                 isStreaming = false,
+                streamingMessageId = null,
+                streamingContent = null,
                 truncated = wasTruncated,
-                    truncatedMessageId = if (wasTruncated) truncatedMessageId else null,
+                truncatedMessageId = if (wasTruncated) truncatedMessageId else null,
                 canRetry = status == MessageStatus.FAILED
             )
             errorText?.let { _events.trySend(ChatEvent.Error(it)) }
@@ -591,6 +604,7 @@ class ChatViewModel(
          * 再密就纯属浪费，因为用户分辨不出「每 50ms 更新」和「每 500ms 更新」。
          */
         const val WRITE_THROTTLE_MS = 500L
+        const val PREVIEW_THROTTLE_MS = 120L
 
         const val FINISH_REASON_LENGTH = "length"
 

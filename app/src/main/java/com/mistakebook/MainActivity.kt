@@ -56,6 +56,8 @@ private fun ProbeRichTextScreen(mathRenderer: com.mistakebook.math.MathRenderer)
 // 单 Activity 宿主：Navigation-Compose 驱动全部页面。
 class MainActivity : ComponentActivity() {
 
+    private val dueFilterRequest = androidx.compose.runtime.mutableIntStateOf(0)
+
     private val notificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
@@ -96,7 +98,9 @@ class MainActivity : ComponentActivity() {
                 snapshot.reminderMinute
             )
         }
-        val filterDue = intent?.getBooleanExtra(EXTRA_FILTER_DUE, false) == true
+        if (intent?.getBooleanExtra(EXTRA_FILTER_DUE, false) == true) {
+            dueFilterRequest.intValue += 1
+        }
         val probeRender = BuildConfig.DEBUG && intent?.getBooleanExtra(EXTRA_PROBE_RENDER, false) == true
         setContent {
             MistakeBookTheme {
@@ -104,10 +108,18 @@ class MainActivity : ComponentActivity() {
                     if (probeRender) {
                         ProbeRichTextScreen(container.mathRenderer)
                     } else {
-                        MistakeBookNavHost(container = container, filterDue = filterDue)
+                        MistakeBookNavHost(container = container, filterDueRequest = dueFilterRequest.intValue)
                     }
                 }
             }
+        }
+    }
+
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.getBooleanExtra(EXTRA_FILTER_DUE, false)) {
+            dueFilterRequest.intValue += 1
         }
     }
 

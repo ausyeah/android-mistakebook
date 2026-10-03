@@ -207,18 +207,20 @@ class ChatCompletionStream(
             }
 
             override fun onResponse(call: Call, response: Response) {
-                try {
-                    if (!finished) readBody(response) { trySend(it) }
-                } catch (t: Throwable) {
-                    if (t is CancellationException) throw t
-                    if (!finished) {
-                        finished = true
-                        trySend(RawEvent.Failed(HttpFactory.throwableError(t)))
-                    }
-                } finally {
-                    if (!finished) {
-                        finished = true
-                        close()
+                response.use { received ->
+                    try {
+                        if (!finished) readBody(received) { trySend(it) }
+                    } catch (t: Throwable) {
+                        if (t is CancellationException) throw t
+                        if (!finished) {
+                            finished = true
+                            trySend(RawEvent.Failed(HttpFactory.throwableError(t)))
+                        }
+                    } finally {
+                        if (!finished) {
+                            finished = true
+                            close()
+                        }
                     }
                 }
             }
@@ -370,7 +372,8 @@ class ChatCompletionStream(
          * 真撞上限时会有 [FINISH_REASON_LENGTH]，界面挂常驻的「已截断」标记，
          * 而不是静默给一段残缺回答。
          */
-        const val MAX_TOKENS = 8192
+        /** 单次回答上限；长题目需要完整推导，仍由 finish_reason=length 标记真实截断。 */
+        const val MAX_TOKENS = 16_384
 
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     }

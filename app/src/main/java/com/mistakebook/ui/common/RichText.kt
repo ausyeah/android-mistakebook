@@ -238,14 +238,23 @@ fun RichText(
                         .background(MaterialTheme.colorScheme.surfaceVariant)
                 )
 
-                is MarkdownParser.Block.Math -> MathImage(
-                    latex = block.latex,
-                    rendered = mathCache["d:${block.latex}"],
-                    targetFontPx = targetFontPx,
-                    display = true,
-                    centered = true,
-                    color = color
-                )
+                is MarkdownParser.Block.Math -> if (block.complete) {
+                    MathImage(
+                        latex = block.latex,
+                        rendered = mathCache["d:${block.latex}"],
+                        targetFontPx = targetFontPx,
+                        display = true,
+                        centered = true,
+                        color = color
+                    )
+                } else {
+                    Text(
+                        text = "\$\$${block.latex}",
+                        style = style,
+                        color = color,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
 
                 MarkdownParser.Block.Rule -> HorizontalDivider(
                     modifier = Modifier.padding(vertical = 4.dp)
@@ -259,7 +268,7 @@ private fun collectMathKeys(blocks: List<MarkdownParser.Block>): List<String> {
     val keys = linkedSetOf<String>()
     blocks.forEach { block ->
         when (block) {
-            is MarkdownParser.Block.Math -> keys += "d:${block.latex}"
+            is MarkdownParser.Block.Math -> if (block.complete) keys += "d:${block.latex}"
             is MarkdownParser.Block.Paragraph -> keys += segmentMathKeys(block.text)
             is MarkdownParser.Block.ListItem -> keys += segmentMathKeys(block.text)
             is MarkdownParser.Block.Quote -> keys += segmentMathKeys(block.text)
