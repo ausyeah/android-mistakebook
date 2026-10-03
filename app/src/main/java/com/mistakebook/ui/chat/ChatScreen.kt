@@ -494,13 +494,16 @@ private fun MessageBubble(
 
                 // 思考过程与正文用 `<think>` 标记存在同一列里，界面拆开渲染。
                 // 正文为空但有思考时也要渲染思考块，否则就是一个空气泡。
-                val (thinking, answer) = remember(message.content) {
-                    ChatThinking.split(message.content)
+                // streaming 传进去：流式时未闭合的标记还是思考，
+                // 结束后就是模型漏写了结束标记（后面是答案、不是思考）。
+                val isStreaming = message.status == MessageStatus.STREAMING
+                val (thinking, answer) = remember(message.content, isStreaming) {
+                    ChatThinking.split(message.content, isStreaming)
                 }
                 if (thinking.isNotBlank()) {
                     ThinkingBlock(
                         text = thinking,
-                        streaming = message.status == MessageStatus.STREAMING && answer.isBlank()
+                        streaming = isStreaming && answer.isBlank()
                     )
                     if (answer.isNotBlank()) Spacer(Modifier.height(8.dp))
                 }

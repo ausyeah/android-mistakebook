@@ -37,20 +37,98 @@ object ChatThinking {
     /**
      * 把一条消息拆成「思考 / 正文」。
      *
+     * ## 为什么不能只找第一对标记
+     *
+     * 截图里的真实输出（用户报告）：
+     *
+     * ```
+     * <think> user is asking for my suggestions ... framework-level </think>
+     * <think> report that acknowledges it lacks ... 错题 </think>
+     * <think> 分类表，阅读错题日志）
+     * ...
+     * Good aspects:
+     * - Clear structure
+     * ```
+     *
+     * 三个特征叠加，导致原实现全错：
+     *
+     * 1. **模型在 `content` 流里自带字面量标记**（而不是放在 `reasoning_content`），
+     *    所以标记会**原样出现在界面上**。用户看到的是一串 `<think>` 噪声。
+     * 2. **标记有多对**。只拆第一对的话，后面的标记留在正文里继续显示。
+     * 3. **存在未闭合的标记**（`<think> 分类表，阅读错题日志）`）。
+     *    它之后的正常正文会被当成思考吞掉——
+     *    而用户真正想看的答案，恰恰在那后面。
+     *
+     * 所以改成**逐段扫描**：标记内的归思考，标记外的归正文，
+     * 标记本身一律剥离。这样不管有几对、有没有闭合，都不会漏出标签。
+     *
      * @param thinking 空串表示这条消息没有思考过程。
      * @param answer 去掉标记后的正文。
      */
-    fun split(raw: String): Pair<String, String> {
-        val open = raw.indexOf(OPEN)
-        if (open < 0) return "" to raw.trim()
-        val bodyStart = open + OPEN.length
-        val close = raw.indexOf(CLOSE, bodyStart)
-        // 没有闭合标记：整段都当思考。这比把思考混进正文安全——
-        // 正文是可以被复制走的，混进去会让复制出来的东西莫名其妙。
-        if (close < 0) return raw.substring(bodyStart).trim() to ""
-        val thought = raw.substring(bodyStart, close).trim()
-        val answer = raw.substring(close + CLOSE.length).trim()
-        return thought to answer
+    fun split(raw: String, streaming: Boolean = false): Pair<String, String> {
+        if (raw.isEmpty()) return "" to ""
+
+        val thinking = StringBuilder()
+        val answer = StringBuilder()
+        var cursor = 0
+        // 当前是否处于标记内。未闭合的标记会一直是 true——
+        // 那时剩余内容全算思考，与「宁可多显示」的原意一致。
+        var inThinking = false
+
+        while (cursor < raw.length) {
+            val open = raw.indexOf(OPEN, cursor)
+            val close = raw.indexOf(CLOSE, cursor)
+
+            when {
+                // 下一个是开始标记
+                open >= 0 && (close < 0 || open < close) -> {
+                    if (!inThinking) {
+                        answer.append(raw, cursor, open)
+                        inThinking = true
+                    }
+                    cursor = open + OPEN.length
+                }
+
+                // 下一个是结束标记
+                close >= 0 -> {
+                    if (inThinking) {
+                        thinking.append(raw, cursor, close)
+                        cursor = close + CLOSE.length
+                        inThinking = false
+                    } else {
+                        // **孤立的结束标记**：不在任何 `<think>` 里。
+                        //
+                        // 模型偶尔会漏写开始标记，这时 `</think>` 是正文的**一部分**，
+                        // 不是控制符。原样保留才对——剥掉它会让用户看到的内容少一块。
+                        //
+                        // 注意 [cursor, close) 之间那段**也要 append**，
+                        // 否则标记之前的正文会被吞掉（`只有</think>没有开始`
+                        // 会变成 `没有开始`）。
+                        answer.append(raw, cursor, close + CLOSE.length)
+                        cursor = close + CLOSE.length
+                    }
+                }
+
+                // 后面再没有标记了
+                else -> {
+                    // 尾部还开着 `<think>`——是**流式到一半**还是**模型漏写结束标记**，
+                    // 光看文本分不出来，但两者的正确处理完全相反：
+                    // - 流式中：后面确实还是推理，归思考（用户要看到「正在想什么」）
+                    // - 已结束：模型忘了闭合，后面多半是**答案**。
+                    //   归思考的话，用户展开一个巨大的思考块却找不到答案——
+                    //   那正是截图里的现象。
+                    if (inThinking && !streaming) {
+                        answer.append(raw, cursor, raw.length)
+                    } else if (inThinking) {
+                        thinking.append(raw, cursor, raw.length)
+                    } else {
+                        answer.append(raw, cursor, raw.length)
+                    }
+                    cursor = raw.length
+                }
+            }
+        }
+        return thinking.toString().trim() to answer.toString().trim()
     }
 
     /** 标记之间与标记之后各留一个换行，纯粹为了显示时各占一行。 */

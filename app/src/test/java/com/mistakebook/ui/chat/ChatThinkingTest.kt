@@ -13,7 +13,7 @@ import org.junit.Test
  */
 class ChatThinkingTest {
 
-    private fun split(raw: String) = ChatThinking.split(raw)
+    private fun split(raw: String, streaming: Boolean = false) = ChatThinking.split(raw, streaming)
 
     // ------------------------------------------------------------ 基本
 
@@ -50,7 +50,8 @@ class ChatThinkingTest {
         // 模型中途断流，标记只写了一半。
         // 宁可多显示成思考，也不能让思考混进正文——正文是可以被复制走的，
         // 混进去会让复制出来的东西莫名其妙。
-        val (thinking, answer) = split("\n<think>想了半天还没想完")
+        // 显式传 streaming=true：断流就是流式中，此时后面确实还是思考
+        val (thinking, answer) = split("\n<think>想了半天还没想完", streaming = true)
         assertEquals("想了半天还没想完", thinking)
         assertEquals("", answer)
     }
@@ -83,12 +84,21 @@ class ChatThinkingTest {
     }
 
     @Test
-    fun `多个闭合标记取第一个`() {
-        // 流式写入时可能重复追加。取第一个才不会把后面的正文吃进思考。
+    fun `多对标记全部合并`() {
+        // 原来这条测试要求「取第一个」，理由是「流式写入时可能重复追加」。
+        //
+        // 但用户截图证明那样是错的：真实输出里有**好几对**标记，
+        // 只拆第一对的话，后面的标记会原样留在正文里显示给用户。
+        //
+        // 所以改成全部合并：所有思考都保留（用户能看到完整推理），
+        // 所有标记都不泄漏。
         val raw = "\n<think>思考</think>正文\n\n<think>又是思考</think>"
         val (thinking, answer) = split(raw)
-        assertEquals("思考", thinking)
+        assertTrue("第一段思考要保留", thinking.contains("思考"))
+        assertTrue("第二段思考也要保留", thinking.contains("又是思考"))
         assertTrue("答案里不该丢内容", answer.contains("正文"))
+        assertFalse("正文不该有字面量标记", answer.contains("<think>"))
+        assertFalse("正文不该有字面量标记", answer.contains("</think>"))
     }
 
     @Test
