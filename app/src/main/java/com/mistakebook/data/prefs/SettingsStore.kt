@@ -251,6 +251,17 @@ class SettingsStore(context: Context) {
         appContext.settingsDataStore.edit { it.remove(key) }
     }
 
+    val homeQuestionOrder: Flow<List<Long>> = appContext.settingsDataStore.data.map { prefs ->
+        val raw = prefs[KEY_HOME_QUESTION_ORDER].orEmpty()
+        runCatching { json.decodeFromString<List<Long>>(raw) }.getOrDefault(emptyList())
+    }
+
+    suspend fun saveHomeQuestionOrder(ids: List<Long>) {
+        appContext.settingsDataStore.edit { prefs ->
+            prefs[KEY_HOME_QUESTION_ORDER] = json.encodeToString(ids.distinct())
+        }
+    }
+
     /**
      * 键里带长度是为了降低哈希碰撞概率：光靠 `hashCode()`，
      * 两张不同路径的图片撞进同一个键的概率不为零，撞了就互相覆盖裁剪状态。
@@ -314,5 +325,6 @@ class SettingsStore(context: Context) {
         val KEY_REMINDER_HOUR = intPreferencesKey("reminder_hour")
         val KEY_REMINDER_MINUTE = intPreferencesKey("reminder_minute")
         val KEY_ACTIVE_PROFILE = stringPreferencesKey("active_llm_profile")
+        val KEY_HOME_QUESTION_ORDER = stringPreferencesKey("home_question_order")
     }
 }

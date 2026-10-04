@@ -7,6 +7,9 @@ import com.mistakebook.data.local.entities.Subject
 import com.mistakebook.data.repos.QuestionRepository
 import com.mistakebook.di.AppContainer
 import com.mistakebook.domain.MasteryStatus
+import com.mistakebook.ui.common.mergeVisibleOrder
+import com.mistakebook.ui.common.orderByIds
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.delay
@@ -79,6 +82,7 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
     private val page = MutableStateFlow(0)
     private val dueOnly = MutableStateFlow(false)
     private val localDateRefreshes = MutableSharedFlow<Unit>(replay = 1, extraBufferCapacity = 1)
+    private val questionOrder = MutableStateFlow<List<Long>>(emptyList())
 
     private val today = merge(
         currentLocalDateFlow(),
@@ -86,6 +90,12 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
     )
         .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.Eagerly, LocalDate.now())
+    init {
+        viewModelScope.launch {
+            container.settingsStore.homeQuestionOrder.collect { questionOrder.value = it }
+        }
+    }
+
 
     private data class Query(
         val status: MasteryStatus?,
@@ -184,6 +194,9 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
         .combine(container.notebookRepository.observeAll()) { state, notebooks ->
             state.copy(notebooks = notebooks)
         }
+        .combine(questionOrder) { state, order ->
+            state.copy(questions = orderByIds(state.questions, order) { it.id })
+        }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), HomeUiState())
 
     fun setStatus(status: MasteryStatus?) {
@@ -220,7 +233,12 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
             page.value = page.value + 1
         }
     }
-
+    fun saveVisibleQuestionOrder(ids: List<Long>) {
+        if (ids.isEmpty()) return
+        val merged = mergeVisibleOrder(questionOrder.value, ids)
+        questionOrder.value = merged
+        viewModelScope.launch { container.settingsStore.saveHomeQuestionOrder(merged) }
+    }
     fun delete(question: Question) {
         viewModelScope.launch {
             repository.softDelete(question.id)

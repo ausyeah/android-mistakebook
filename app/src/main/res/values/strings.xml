@@ -181,8 +181,9 @@
 
     <!-- 打印 -->
     <string name="print_title">打印错题</string>
-    <string name="print_select_all">全选</string>
+    <string name="print_select_all">全选当前结果</string>
     <string name="print_select_invert">反选</string>
+    <string name="reorder_drag_handle">长按拖动调整顺序</string>
     <string name="print_options">打印选项</string>
     <string name="print_include_image">包含题目原图</string>
     <string name="print_show_answer">显示答案与解析</string>

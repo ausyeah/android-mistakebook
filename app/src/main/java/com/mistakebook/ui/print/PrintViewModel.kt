@@ -14,6 +14,8 @@ import com.mistakebook.print.ExportOptions
 import com.mistakebook.print.ExportPublisher
 import com.mistakebook.print.ExportResult
 import com.mistakebook.print.HtmlExporter
+import com.mistakebook.ui.common.mergeVisibleOrder
+import com.mistakebook.ui.common.orderByIds
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -42,7 +44,7 @@ data class PrintUiState(
     val error: String? = null
 ) {
     val allSelected: Boolean
-        get() = questions.isNotEmpty() && selected.size == questions.size
+        get() = questions.isNotEmpty() && questions.all { it.id in selected }
 
     val subjectNames: Map<Long, String>
         get() = subjects.associate { it.id to it.name }
@@ -68,6 +70,8 @@ class PrintViewModel(private val container: AppContainer) : ViewModel() {
     private val keyword = MutableStateFlow("")
 
     private val selected = MutableStateFlow<Set<Long>>(emptySet())
+    private val selectedOrder = MutableStateFlow<List<Long>>(emptyList())
+    private val questionOrder = MutableStateFlow<List<Long>>(emptyList())
     private val includeImage = MutableStateFlow(false)
     private val showAnswer = MutableStateFlow(false)
     private val blankRedo = MutableStateFlow(true)
@@ -97,13 +101,18 @@ class PrintViewModel(private val container: AppContainer) : ViewModel() {
                         status = st,
                         keyword = kw
                     ),
-                    page = 0
+                    page = 0,
+                    pageSize = Int.MAX_VALUE
                 )
             }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
+    private val orderedQuestions: StateFlow<List<Question>> = combine(questions, questionOrder) { list, order ->
+        orderByIds(list, order) { it.id }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
     val uiState: StateFlow<PrintUiState> = combine(
-        questions,
+        orderedQuestions,
         combine(container.subjectRepository.observeAll(), selected) { subjects, sel -> subjects to sel },
         combine(includeImage, showAnswer) { image, answer -> image to answer },
         combine(blankRedo, blankHeight, generating) { redo, height, working ->
@@ -143,17 +152,39 @@ class PrintViewModel(private val container: AppContainer) : ViewModel() {
 
     fun toggleSelect(id: Long) {
         val current = selected.value
-        selected.value = if (id in current) current - id else current + id
+        if (id in current) {
+            selected.value = current - id
+            selectedOrder.value = selectedOrder.value.filterNot { it == id }
+        } else {
+            selected.value = current + id
+            selectedOrder.value = selectedOrder.value + id
+        }
     }
 
     fun selectAll(ids: List<Long>) {
-        selected.value = ids.toSet()
+        selected.value = selected.value + ids
+        selectedOrder.value = (selectedOrder.value + ids).distinct()
+    }
+
+    fun deselectAll(ids: List<Long>) {
+        val deselected = ids.toSet()
+        selected.value = selected.value - deselected
+        selectedOrder.value = selectedOrder.value.filterNot { it in deselected }
     }
 
     fun invertSelection(ids: List<Long>) {
         val current = selected.value
-        selected.value = ids.filterNot { it in current }.toSet()
+        val visible = ids.toSet()
+        val added = ids.filterNot { it in current }
+        val next = (current.filterNot { it in visible } + added).toSet()
+        selected.value = next
+        selectedOrder.value = selectedOrder.value.filter { it in next } + added
     }
+
+    fun setQuestionOrder(ids: List<Long>) {
+        questionOrder.value = mergeVisibleOrder(questionOrder.value, ids)
+    }
+
 
     fun setIncludeImage(value: Boolean) {
         includeImage.value = value
@@ -188,7 +219,8 @@ class PrintViewModel(private val container: AppContainer) : ViewModel() {
         error.value = null
         result.value = null
         viewModelScope.launch {
-            val questions = state.selected.mapNotNull { id ->
+            val exportOrder = (questionOrder.value + state.questions.map { it.id } + selectedOrder.value).distinct()
+            val questions = exportOrder.filter { it in state.selected }.mapNotNull { id ->
                 container.questionRepository.findById(id)
             }
             if (questions.isEmpty()) {

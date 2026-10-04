@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -72,6 +73,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -100,6 +102,9 @@ import com.mistakebook.ui.common.ErrorReasonChip
 import com.mistakebook.ui.common.Format
 import com.mistakebook.ui.common.QuestionThumb
 import com.mistakebook.ui.common.SubjectDot
+import com.mistakebook.ui.common.ReorderDragHandle
+import com.mistakebook.ui.common.moveItem
+import com.mistakebook.ui.common.orderByIds
 import com.mistakebook.ui.common.containerViewModel
 import com.mistakebook.ui.theme.Danger
 import kotlinx.coroutines.launch
@@ -135,6 +140,48 @@ fun HomeScreen(
 ) {
     val viewModel: HomeViewModel = containerViewModel(container) { HomeViewModel(it) }
     val state by viewModel.uiState.collectAsState()
+    val questionListState = rememberLazyListState()
+    var arrangedQuestionIds by remember { mutableStateOf<List<Long>?>(null) }
+    var draggedQuestionId by remember { mutableStateOf<Long?>(null) }
+    var dragOffsetPx by remember { mutableFloatStateOf(0f) }
+    val displayQuestions = remember(state.questions, arrangedQuestionIds) {
+        arrangedQuestionIds?.let { orderByIds(state.questions, it) { question -> question.id } }
+            ?: state.questions
+    }
+
+    fun beginQuestionDrag(id: Long) {
+        draggedQuestionId = id
+        dragOffsetPx = 0f
+        arrangedQuestionIds = displayQuestions.map { it.id }
+    }
+
+    fun updateQuestionDrag(delta: Float) {
+        val draggedId = draggedQuestionId ?: return
+        dragOffsetPx += delta
+        val layout = questionListState.layoutInfo
+        val draggedItem = layout.visibleItemsInfo.firstOrNull { it.key == draggedId } ?: return
+        val center = draggedItem.offset + draggedItem.size / 2f + dragOffsetPx
+        val target = layout.visibleItemsInfo.firstOrNull { item ->
+            val top = item.offset.toFloat()
+            val key = item.key as? Long
+            key != null && center >= top && center < top + item.size
+        } ?: return
+        val targetId = target.key as? Long ?: return
+        val order = arrangedQuestionIds ?: displayQuestions.map { it.id }
+        val fromIndex = order.indexOf(draggedId)
+        val toIndex = order.indexOf(targetId)
+        if (fromIndex >= 0 && toIndex >= 0 && fromIndex != toIndex) {
+            arrangedQuestionIds = moveItem(order, fromIndex, toIndex)
+            dragOffsetPx = 0f
+        }
+    }
+
+    fun finishQuestionDrag() {
+        arrangedQuestionIds?.let(viewModel::saveVisibleQuestionOrder)
+        draggedQuestionId = null
+        dragOffsetPx = 0f
+    }
+
 
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner, viewModel) {
@@ -325,18 +372,23 @@ fun HomeScreen(
                 )
 
                 else -> LazyColumn(
+                    state = questionListState,
                     modifier = Modifier.fillMaxSize(),
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(
                         start = 12.dp, end = 12.dp, top = 4.dp, bottom = 96.dp
                     ),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    items(state.questions, key = { it.id }) { question ->
+                    items(displayQuestions, key = { it.id }) { question ->
                         val subjectName = state.subjects.firstOrNull { it.id == question.subjectId }?.name
                         SwipeableQuestionCard(
                             question = question,
                             subjectName = subjectName,
                             dueToday = state.dueCount > 0 && isDue(question),
+                            dragging = draggedQuestionId == question.id,
+                            onReorderStart = { beginQuestionDrag(question.id) },
+                            onReorder = ::updateQuestionDrag,
+                            onReorderEnd = ::finishQuestionDrag,
                             onClick = { onOpenQuestion(question.id) },
                             onDelete = {
                                 viewModel.delete(question)
@@ -354,7 +406,6 @@ fun HomeScreen(
                         )
                     }
                     item {
-                        // 触底加载下一页（每页 30）
                         LaunchedEffect(state.questions.size) {
                             viewModel.loadMore()
                         }
@@ -549,6 +600,10 @@ private fun SwipeableQuestionCard(
     question: Question,
     subjectName: String?,
     dueToday: Boolean,
+    dragging: Boolean,
+    onReorderStart: () -> Unit,
+    onReorder: (Float) -> Unit,
+    onReorderEnd: () -> Unit,
     onClick: () -> Unit,
     onDelete: () -> Unit
 ) {
@@ -648,13 +703,12 @@ private fun SwipeableQuestionCard(
                 question = question,
                 subjectName = subjectName,
                 dueToday = dueToday,
+                dragging = dragging,
+                onReorderStart = onReorderStart,
+                onReorder = onReorder,
+                onReorderEnd = onReorderEnd,
                 onClick = {
-                    // 已划开时先收回，不进详情——否则「想点垃圾桶」会变成「打开题目」
-                    if (revealed) {
-                        close()
-                    } else {
-                        onClick()
-                    }
+                    if (revealed) close() else onClick()
                 }
             )
         }
@@ -666,6 +720,10 @@ private fun QuestionCard(
     question: Question,
     subjectName: String?,
     dueToday: Boolean,
+    dragging: Boolean,
+    onReorderStart: () -> Unit,
+    onReorder: (Float) -> Unit,
+    onReorderEnd: () -> Unit,
     onClick: () -> Unit
 ) {
     Card(
@@ -681,7 +739,7 @@ private fun QuestionCard(
                 modifier = Modifier.size(72.dp)
             )
             Spacer(Modifier.width(10.dp))
-            Column(modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     SubjectDot(subjectName = subjectName)
                     Spacer(Modifier.width(6.dp))
@@ -722,6 +780,12 @@ private fun QuestionCard(
                     )
                 }
             }
+            ReorderDragHandle(
+                dragging = dragging,
+                onDragStart = onReorderStart,
+                onDrag = onReorder,
+                onDragEnd = onReorderEnd
+            )
         }
     }
 }

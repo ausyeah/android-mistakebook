@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.AlertDialog
@@ -46,6 +47,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -64,6 +66,9 @@ import com.mistakebook.ui.common.Format
 import com.mistakebook.ui.common.QuestionThumb
 import com.mistakebook.ui.common.containerViewModel
 import com.mistakebook.ui.settings.BlankHeightRow
+import com.mistakebook.ui.common.ReorderDragHandle
+import com.mistakebook.ui.common.moveItem
+import com.mistakebook.ui.common.orderByIds
 import com.mistakebook.print.ExportFormat
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.BorderStroke
@@ -81,6 +86,47 @@ fun PrintScreen(container: AppContainer, onBack: () -> Unit) {
     // 三条文案原本都写死了「PDF」，选了 HTML 也显示「生成 PDF」。
     val formatName = stringResource(state.format.shortLabelRes)
     val context = LocalContext.current
+    val questionListState = rememberLazyListState()
+    var arrangedQuestionIds by remember { mutableStateOf<List<Long>?>(null) }
+    var draggedQuestionId by remember { mutableStateOf<Long?>(null) }
+    var dragOffsetPx by remember { mutableFloatStateOf(0f) }
+    val displayQuestions = remember(state.questions, arrangedQuestionIds) {
+        arrangedQuestionIds?.let { orderByIds(state.questions, it) { question -> question.id } }
+            ?: state.questions
+    }
+
+    fun beginQuestionDrag(id: Long) {
+        draggedQuestionId = id
+        dragOffsetPx = 0f
+        arrangedQuestionIds = displayQuestions.map { it.id }
+    }
+
+    fun updateQuestionDrag(delta: Float) {
+        val draggedId = draggedQuestionId ?: return
+        dragOffsetPx += delta
+        val layout = questionListState.layoutInfo
+        val draggedItem = layout.visibleItemsInfo.firstOrNull { it.key == draggedId } ?: return
+        val center = draggedItem.offset + draggedItem.size / 2f + dragOffsetPx
+        val target = layout.visibleItemsInfo.firstOrNull { item ->
+            val top = item.offset.toFloat()
+            val key = item.key as? Long
+            key != null && center >= top && center < top + item.size
+        } ?: return
+        val targetId = target.key as? Long ?: return
+        val order = arrangedQuestionIds ?: displayQuestions.map { it.id }
+        val fromIndex = order.indexOf(draggedId)
+        val toIndex = order.indexOf(targetId)
+        if (fromIndex >= 0 && toIndex >= 0 && fromIndex != toIndex) {
+            arrangedQuestionIds = moveItem(order, fromIndex, toIndex)
+            dragOffsetPx = 0f
+        }
+    }
+
+    fun finishQuestionDrag() {
+        arrangedQuestionIds?.let(viewModel::setQuestionOrder)
+        draggedQuestionId = null
+        dragOffsetPx = 0f
+    }
 
     Scaffold(
         topBar = {
@@ -133,7 +179,10 @@ fun PrintScreen(container: AppContainer, onBack: () -> Unit) {
                 onSubjectChange = viewModel::setSubject,
                 onStatusChange = viewModel::setStatus,
                 onKeywordChange = viewModel::setKeyword,
-                onSelectAll = { viewModel.selectAll(state.questions.map { it.id }) },
+                onSetAll = { checked ->
+                    val ids = state.questions.map { it.id }
+                    if (checked) viewModel.selectAll(ids) else viewModel.deselectAll(ids)
+                },
                 onInvert = { viewModel.invertSelection(state.questions.map { it.id }) }
             )
 
@@ -155,20 +204,25 @@ fun PrintScreen(container: AppContainer, onBack: () -> Unit) {
                 )
             } else {
                 LazyColumn(
+                    state = questionListState,
                     modifier = Modifier.fillMaxSize(),
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(
                         start = 12.dp, end = 12.dp, bottom = 96.dp
                     ),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    itemsIndexed(state.questions, key = { _, item -> item.id }) { index, question ->
+                    itemsIndexed(displayQuestions, key = { _, item -> item.id }) { index, question ->
                         val subjectName = state.subjectNames[question.subjectId]
                         PrintRow(
                             question = question,
                             subjectName = subjectName,
                             index = index + 1,
                             checked = question.id in state.selected,
-                            onToggle = { viewModel.toggleSelect(question.id) }
+                            dragging = draggedQuestionId == question.id,
+                            onToggle = { viewModel.toggleSelect(question.id) },
+                            onReorderStart = { beginQuestionDrag(question.id) },
+                            onReorder = ::updateQuestionDrag,
+                            onReorderEnd = ::finishQuestionDrag
                         )
                     }
                 }
@@ -248,7 +302,11 @@ private fun PrintRow(
     /** 打印清单里的连续序号，和 PDF 卡片上的编号一致，方便对照漏题。 */
     index: Int,
     checked: Boolean,
-    onToggle: () -> Unit
+    dragging: Boolean,
+    onToggle: () -> Unit,
+    onReorderStart: () -> Unit,
+    onReorder: (Float) -> Unit,
+    onReorderEnd: () -> Unit
 ) {
     Card(
         shape = MaterialTheme.shapes.small,
@@ -285,6 +343,12 @@ private fun PrintRow(
                     maxLines = 2
                 )
             }
+            ReorderDragHandle(
+                dragging = dragging,
+                onDragStart = onReorderStart,
+                onDrag = onReorder,
+                onDragEnd = onReorderEnd
+            )
         }
     }
 }
@@ -296,22 +360,31 @@ private fun PrintFilters(
     onSubjectChange: (Long?) -> Unit,
     onStatusChange: (MasteryStatus?) -> Unit,
     onKeywordChange: (String) -> Unit,
-    onSelectAll: () -> Unit,
+    onSetAll: (Boolean) -> Unit,
     onInvert: () -> Unit
 ) {
     Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            SubjectDropdown(
-                subjects = state.subjects,
-                selectedId = state.subjectId,
-                onSelect = onSubjectChange,
-                modifier = Modifier.weight(1f)
+        SubjectDropdown(
+            subjects = state.subjects,
+            selectedId = state.subjectId,
+            onSelect = onSubjectChange,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Checkbox(
+                checked = state.allSelected,
+                onCheckedChange = onSetAll,
+                enabled = state.questions.isNotEmpty()
             )
-            Spacer(Modifier.width(8.dp))
-            TextButton(onClick = onSelectAll) { Text(stringResource(R.string.print_select_all)) }
-            TextButton(onClick = onInvert) { Text(stringResource(R.string.print_select_invert)) }
+            Text(stringResource(R.string.print_select_all), style = MaterialTheme.typography.labelLarge)
+            Spacer(Modifier.weight(1f))
+            TextButton(onClick = onInvert, enabled = state.questions.isNotEmpty()) {
+                Text(stringResource(R.string.print_select_invert))
+            }
         }
-        Spacer(Modifier.height(4.dp))
         Row(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically
